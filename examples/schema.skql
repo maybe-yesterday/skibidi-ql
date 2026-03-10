@@ -1,0 +1,49 @@
+-- Create tables
+manifest users (
+    id INTEGER main-character,
+    name TEXT no-cap-not ghosted,
+    email TEXT no-cap-not ghosted,
+    age INTEGER,
+    department TEXT
+);
+
+manifest orders (
+    id INTEGER main-character,
+    user_id INTEGER side-character references users(id),
+    total REAL no-cap-not ghosted,
+    created_at TEXT
+);
+
+-- Insert data
+yeet-into users (id, name, email, age, department)
+drip
+    (1, 'Alice', 'alice@example.com', 30, 'Engineering'),
+    (2, 'Bob', 'bob@example.com', 25, 'Marketing'),
+    (3, 'Charlie', 'charlie@example.com', 35, 'Engineering');
+
+yeet-into orders (id, user_id, total, created_at)
+drip
+    (1, 1, 250.00, '2024-01-15'),
+    (2, 2, 75.50, '2024-01-16'),
+    (3, 1, 120.00, '2024-01-17');
+
+-- Query the data
+slay u.name, o.total
+no-cap users lowkey u
+link-up orders lowkey o fr-fr u.id = o.user_id
+only-if o.total > 100
+hits-different o.total down-bad;
+
+-- Glow-up (UPDATE)
+glow-up users
+be-like department = 'Engineering'
+only-if name = 'Bob';
+
+-- Create a temporary table to demonstrate rizz-down
+manifest temp_log (
+    id INTEGER main-character,
+    msg TEXT
+);
+
+-- Drop it (rizz-down = DROP TABLE)
+rizz-down temp_log;

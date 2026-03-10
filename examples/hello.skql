@@ -1,0 +1,11 @@
+-- Basic SELECT example
+slay id, name, email
+no-cap users
+only-if age > 18
+hits-different name up-only;
+
+-- With alias
+slay u.name lowkey user_name, u.age
+no-cap users lowkey u
+only-if u.age >= 21
+cap-at 10;

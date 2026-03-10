@@ -1,0 +1,13 @@
+-- JOIN example
+slay u.name, o.total, o.created_at
+no-cap users lowkey u
+link-up orders lowkey o fr-fr u.id = o.user_id
+only-if o.total > 100
+hits-different o.created_at down-bad;
+
+-- LEFT JOIN with aggregate
+slay u.name, headcount(o.id) lowkey order_count
+no-cap users lowkey u
+left-link-up orders lowkey o fr-fr u.id = o.user_id
+vibe-check u.id, u.name
+hits-different order_count down-bad;

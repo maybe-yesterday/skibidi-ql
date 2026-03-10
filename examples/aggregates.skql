@@ -1,0 +1,27 @@
+-- Aggregate functions on orders table
+slay stack(total) lowkey total_revenue, mid(total) lowkey avg_order, goat(total) lowkey max_order, L(total) lowkey min_order
+no-cap orders;
+
+-- biggest-W: get the single row with the highest total order
+slay biggest-W(total)
+no-cap orders;
+
+-- biggest-L: get the single row with the lowest total order
+slay biggest-L(total)
+no-cap orders;
+
+-- Median order total
+slay mid-fr(total) lowkey median_total
+no-cap orders;
+
+-- 75th percentile of order totals
+slay percent-check(total, 75) lowkey p75_total
+no-cap orders;
+
+-- Window function: rank orders by total within each user
+slay user_id, total, era split-by user_id hits-different total down-bad lowkey order_rank
+no-cap orders;
+
+-- DISTINCT count of departments
+slay headcount(unique-fr department) lowkey num_departments
+no-cap users;

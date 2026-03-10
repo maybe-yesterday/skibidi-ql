@@ -1,0 +1,30 @@
+# Build
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Binaries
+skibidi
+*.o
+*.a
+*.so
+
+# Database & catalog
+*.db
+.skibidi_catalog.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Deps (if vendored externally)
+vendor/nlohmann/
+
+# Logs
+*.log
