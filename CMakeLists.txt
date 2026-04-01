@@ -28,3 +28,7 @@ target_include_directories(skibidi PRIVATE
 target_link_libraries(skibidi PRIVATE ${SQLite3_LIBRARIES})
 
 target_compile_options(skibidi PRIVATE -Wall -Wextra -Wpedantic)
+
+# Tests
+enable_testing()
+add_subdirectory(test)

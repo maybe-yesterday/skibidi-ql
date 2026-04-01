@@ -87,7 +87,7 @@ brew install cmake sqlite3 pkg-config
 
 ```bash
 mkdir build && cd build
-cmake ..
+cmake .. && cd ..
 make -j$(nproc)
 ```
 
