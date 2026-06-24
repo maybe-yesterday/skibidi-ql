@@ -1,28 +1,9 @@
 # SkibidiQL
 
-A standalone educational relational database for the SkibidiQL query language.
+A standalone relational database for the SkibidiQL query language.
 It includes its own persistent page storage, heap files, buffer pool, B+ tree
 indexes, relational execution engine, and transactions. SQLite is optional and
 used only as a compatibility and benchmark backend.
-
-## Native Engine Highlight
-
-The native backend follows the shape of a CSE 444/SimpleDB-style course engine:
-
-- 4 KiB slotted pages and variable-width typed tuples
-- Persistent heap files with an LRU buffer pool
-- Rebuildable B+ tree primary-key indexes
-- Indexed lookups, heap scans, hash joins, nested-loop joins, grouping,
-  aggregates, sorting, limits, left joins, and window ranking
-- 1,024-row column batches for filters, projections, and common aggregates
-- Projection-aware tuple decoding that skips unreferenced fields without
-  allocating their text/blob payloads
-- Fixed-type integer, real, text, boolean, and blob vectors with bit-packed
-  null masks
-- Statistics-backed dynamic-programming join enumeration for inner equi-joins
-- Primary-key, non-null, and foreign-key enforcement
-- Atomic statement rollback and explicit `.begin`, `.commit`, `.rollback`
-- A schema-aware compiled-plan cache
 
 No SQLite library is required for the default build or runtime.
 
@@ -38,13 +19,7 @@ Matched Release-build results against prepared, file-backed SQLite on the same
 | Filtered grouped sum | 100 | 2,348.8 ms | 340.8 ms | SQLite 6.9x faster | 7.7 / 5.3 MiB |
 | Skewed three-table join | 10 | 626.1 ms | 74.8 ms | SQLite 8.4x faster | 16.9 / 5.5 MiB |
 
-The vectorized scan is about 3.9x faster than the original 6.05-second
-row-at-a-time result. In a direct before/after run, projected decoding and typed
-vectors reduced filtered-scan time by 29% and grouped-aggregate time by 15%.
-Cost-based join ordering plus shared immutable row schemas cut the join from
-1.11 seconds to 0.63 seconds and peak RSS from about 36 MiB to 17 MiB. These
-remain educational-engine measurements, not production database claims. See
-[Benchmarks](#benchmarks) for reproduction.
+See [Benchmarks](#benchmarks) for reproduction.
 
 ## Language Reference
 
@@ -436,32 +411,9 @@ Source Text
     - Compatibility execution and comparative benchmarks
 ```
 
-### Key Design Decisions
+### Caveats
 
-1. **Hyphenated keywords**: The lexer reads `[a-zA-Z_][a-zA-Z0-9_-]*` greedily. Since every hyphenated keyword is globally unique (no two keywords share the same full string), a simple hash map lookup suffices for keyword identification.
-
-2. **Longest-match**: Because hyphens are consumed as part of the token word, `no-cap-not` is always read as one token and looked up as a single key, beating `no-cap` automatically.
-
-3. **Analytics rewrites**: `mid-fr`, `percent-check`, `biggest-W`, and `biggest-L` are detected at the SELECT statement codegen level and rewritten to CTE-based or ORDER BY-based SQL patterns.
-
-4. **Catalog persistence**: Each native database directory contains its own
-   `catalog.json`, alongside the table heap files.
-
-5. **Cache correctness**: DDL statements are never cached. Cache keys include
-   the complete schema fingerprint, so equivalent schemas can reuse SQL while
-   different schemas cannot collide.
-
-6. **Authoritative heap storage**: Heap pages are the source of truth. B+ tree
-   indexes are rebuildable access paths, so an index can be discarded without
-   losing table data.
-
-7. **Educational transactions**: Statements are atomic. Explicit transactions
-   use a database snapshot for rollback, providing single-process serializable
-   behavior without implementing production WAL recovery.
-
-### Current Engine Boundaries
-
-This is a complete course-scale engine, not yet a production database:
+This is NOT yet a production database:
 
 - Transactions are single-process and snapshot-backed; there is no WAL,
   crash recovery, or concurrent lock manager yet.
