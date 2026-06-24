@@ -76,7 +76,7 @@ struct TestRegistrar {
 #define ASSERT_THROW(expr, ExcType)                                           \
     do {                                                                      \
         bool _threw = false;                                                  \
-        try { (void)(expr); }                                                 \
+        try { expr; }                                                         \
         catch (const ExcType&) { _threw = true; }                            \
         catch (...) {}                                                        \
         if (!_threw) {                                                        \
@@ -89,7 +89,7 @@ struct TestRegistrar {
 
 #define ASSERT_NO_THROW(expr)                                                 \
     do {                                                                      \
-        try { (void)(expr); }                                                 \
+        try { expr; }                                                         \
         catch (const std::exception& _e) {                                   \
             std::ostringstream _ss;                                           \
             _ss << __FILE__ << ":" << __LINE__                               \

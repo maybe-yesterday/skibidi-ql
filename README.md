@@ -1,6 +1,50 @@
 # SkibidiQL
 
-A serious compiler for the SkibidiQL query language - a Gen-Z flavored SQL dialect that transpiles to standard SQL and executes on SQLite.
+A standalone educational relational database for the SkibidiQL query language.
+It includes its own persistent page storage, heap files, buffer pool, B+ tree
+indexes, relational execution engine, and transactions. SQLite is optional and
+used only as a compatibility and benchmark backend.
+
+## Native Engine Highlight
+
+The native backend follows the shape of a CSE 444/SimpleDB-style course engine:
+
+- 4 KiB slotted pages and variable-width typed tuples
+- Persistent heap files with an LRU buffer pool
+- Rebuildable B+ tree primary-key indexes
+- Indexed lookups, heap scans, hash joins, nested-loop joins, grouping,
+  aggregates, sorting, limits, left joins, and window ranking
+- 1,024-row column batches for filters, projections, and common aggregates
+- Projection-aware tuple decoding that skips unreferenced fields without
+  allocating their text/blob payloads
+- Fixed-type integer, real, text, boolean, and blob vectors with bit-packed
+  null masks
+- Statistics-backed dynamic-programming join enumeration for inner equi-joins
+- Primary-key, non-null, and foreign-key enforcement
+- Atomic statement rollback and explicit `.begin`, `.commit`, `.rollback`
+- A schema-aware compiled-plan cache
+
+No SQLite library is required for the default build or runtime.
+
+## Performance Highlight
+
+Matched Release-build results against prepared, file-backed SQLite on the same
+10,000 rows and warm caches:
+
+| Workload | Iterations | Native | SQLite | Result | Peak RSS (native / SQLite) |
+|---|---:|---:|---:|---|---:|
+| Primary-key lookup | 10,000 | 77.5 ms | 892.2 ms | Native 11.5x faster | 8.1 / 5.2 MiB |
+| Filtered count scan | 100 | 1,535.7 ms | 66.9 ms | SQLite 23.0x faster | 7.6 / 5.0 MiB |
+| Filtered grouped sum | 100 | 2,348.8 ms | 340.8 ms | SQLite 6.9x faster | 7.7 / 5.3 MiB |
+| Skewed three-table join | 10 | 626.1 ms | 74.8 ms | SQLite 8.4x faster | 16.9 / 5.5 MiB |
+
+The vectorized scan is about 3.9x faster than the original 6.05-second
+row-at-a-time result. In a direct before/after run, projected decoding and typed
+vectors reduced filtered-scan time by 29% and grouped-aggregate time by 15%.
+Cost-based join ordering plus shared immutable row schemas cut the join from
+1.11 seconds to 0.63 seconds and peak RSS from about 36 MiB to 17 MiB. These
+remain educational-engine measurements, not production database claims. See
+[Benchmarks](#benchmarks) for reproduction.
 
 ## Language Reference
 
@@ -65,33 +109,44 @@ A serious compiler for the SkibidiQL query language - a Gen-Z flavored SQL diale
 
 - CMake >= 3.14
 - g++ with C++17 support
-- SQLite3 development libraries
-- pkg-config
+
+SQLite and pkg-config are needed only when building the optional compatibility
+backend.
 
 On Ubuntu/Debian:
 ```bash
-sudo apt-get install cmake g++ libsqlite3-dev pkg-config
+sudo apt-get install cmake g++
 ```
 
 On Fedora:
 ```bash
-sudo dnf install cmake gcc-c++ sqlite-devel pkgconf
+sudo dnf install cmake gcc-c++
 ```
 
 On macOS (Homebrew):
 ```bash
-brew install cmake sqlite3 pkg-config
+brew install cmake
 ```
 
 ### Build
 
 ```bash
-mkdir build && cd build
-cmake .. && cd ..
-make -j$(nproc)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+ctest --test-dir build --build-config Release --output-on-failure
 ```
 
-The compiled binary will be at `build/skibidi`.
+The compiled binary will be at `build/skibidi` (or
+`build/Release/skibidi.exe` with a multi-config generator).
+
+To additionally build SQLite compatibility tests and comparison benchmarks:
+
+```bash
+cmake -S . -B build-sqlite \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSKIBIDI_WITH_SQLITE=ON
+cmake --build build-sqlite --config Release
+```
 
 ## Usage
 
@@ -102,8 +157,8 @@ The compiled binary will be at `build/skibidi`.
 ```
 
 ```
-SkibidiQL REPL v1.0.0
-Type your SkibidiQL queries (end with ';') or 'exit' to quit.
+SkibidiQL REPL v2.0.0 (native engine)
+End queries with ';' or type 'exit'.
 
 skibidi> slay name, age no-cap users only-if age > 18;
 skibidi> exit
@@ -115,11 +170,25 @@ skibidi> exit
 ./build/skibidi --file examples/schema.skql
 ```
 
-### Use a Persistent Database
+### Use a Persistent Native Database
 
 ```bash
-./build/skibidi --db mydata.db --file examples/schema.skql
+./build/skibidi --db mydata --file examples/schema.skql
 ```
+
+`mydata/` contains the native catalog and table heap files.
+
+### Transactions
+
+The native REPL supports explicit transactions:
+
+```text
+skibidi> .begin
+skibidi> yeet-into users drip (1, 'Ada');
+skibidi> .commit
+```
+
+Use `.rollback` to restore the database to its state at `.begin`.
 
 ### Transpile Only (No Execution)
 
@@ -134,6 +203,28 @@ skibidi> exit
 ```
 
 Verbose mode prints the token stream, AST, optimizer report, and generated SQL for each statement.
+
+### Compilation Cache
+
+The REPL keeps a bounded LRU cache of compiled SQL. Cache keys include a stable
+catalog fingerprint, so schema changes cannot reuse stale optimized SQL.
+
+```bash
+./build/skibidi --cache-entries 256 --cache-stats
+./build/skibidi --no-cache
+```
+
+The default limit is 128 entries and 4 MiB of estimated cache storage.
+
+When the optional SQLite backend is built, SQLite prepared statements are also
+cached:
+
+```bash
+./build/skibidi --statement-cache-entries 256 --cache-stats
+./build/skibidi --no-statement-cache
+```
+
+Use a Release build for performance measurements.
 
 ### Read from stdin
 
@@ -291,15 +382,20 @@ Source Text
     v
 [Metadata Catalog] (metadata.h / metadata.cpp)
     - Tracks schema in .skibidi_catalog.json
-    - Updated on CREATE TABLE / DROP TABLE
+    - Updated after successful CREATE TABLE / DROP TABLE execution
     - Validates column references (best-effort)
+    - Exposes revision and schema fingerprint metadata
     |
     v
 [Optimizer] (optimizer.h / optimizer.cpp)
     - Pass 1: Constant folding (2 + 3 -> 5)
-    - Pass 2: Predicate pushdown analysis
-    - Pass 3: Projection pruning analysis
-    - Pass 4: Dead code elimination (WHERE 1=0)
+    - Pass 2: Metadata-aware rewrites
+      - COUNT(non-null column) -> COUNT(*)
+      - Remove DISTINCT when a guaranteed non-null primary key is projected
+      - Add LIMIT 1 and remove ORDER BY for primary-key point lookups
+    - Pass 3: Predicate pushdown analysis
+    - Pass 4: Projection pruning analysis
+    - Pass 5: Dead code elimination (WHERE 1=0)
     |
     v
 [Code Generator] (codegen.h / codegen.cpp)
@@ -308,9 +404,36 @@ Source Text
     - Handles special rewrites (mid-fr, percent-check, biggest-W/L)
     |
     v
-[SQLite Execution] (main.cpp)
-    - Executes generated SQL via sqlite3 C API
-    - Prints results in key=value format
+[Compilation Cache] (cache.h / compiler.h)
+    - Stores generated SQL and optimizer reports
+    - Bounded by entry count and estimated memory
+    - Uses LRU eviction and catalog-aware keys
+    |
+    v
+[Native Physical Engine] (native_engine.h / native_engine.cpp)
+    - Indexed and heap access paths
+    - Typed column vectors with bit-packed null masks
+    - Vectorized filters, projections, groups, and common aggregates
+    - Statistics cache and dynamic-programming inner-join enumeration
+    - Smaller-side hash builds, nested-loop fallback, sorts, windows, limits
+    - Constraint checking and transaction rollback
+    |
+    v
+[Storage Engine] (native_storage.h / native_storage.cpp)
+    - Typed tuple serialization
+    - Projection-aware decoding that skips unreferenced payloads
+    - 4 KiB slotted pages
+    - Persistent heap files
+    - LRU buffer pool with dirty-page flushing
+    |
+    v
+[B+ Tree] (native_index.h / native_index.cpp)
+    - Primary-key point and range access
+    - Rebuilt lazily from authoritative heap data
+    |
+    v
+[Optional SQLite Backend] (executor.h / executor.cpp)
+    - Compatibility execution and comparative benchmarks
 ```
 
 ### Key Design Decisions
@@ -321,4 +444,79 @@ Source Text
 
 3. **Analytics rewrites**: `mid-fr`, `percent-check`, `biggest-W`, and `biggest-L` are detected at the SELECT statement codegen level and rewritten to CTE-based or ORDER BY-based SQL patterns.
 
-4. **Catalog persistence**: Schema is persisted in a JSON file (`.skibidi_catalog.json`) in the working directory, surviving across REPL sessions.
+4. **Catalog persistence**: Each native database directory contains its own
+   `catalog.json`, alongside the table heap files.
+
+5. **Cache correctness**: DDL statements are never cached. Cache keys include
+   the complete schema fingerprint, so equivalent schemas can reuse SQL while
+   different schemas cannot collide.
+
+6. **Authoritative heap storage**: Heap pages are the source of truth. B+ tree
+   indexes are rebuildable access paths, so an index can be discarded without
+   losing table data.
+
+7. **Educational transactions**: Statements are atomic. Explicit transactions
+   use a database snapshot for rollback, providing single-process serializable
+   behavior without implementing production WAL recovery.
+
+### Current Engine Boundaries
+
+This is a complete course-scale engine, not yet a production database:
+
+- Transactions are single-process and snapshot-backed; there is no WAL,
+  crash recovery, or concurrent lock manager yet.
+- Primary-key B+ trees are rebuilt lazily and are not separately persisted.
+- Inner equi-joins use cost-based left-deep enumeration. Outer joins and
+  non-equality joins retain source order.
+- Heap pages still store row-oriented tuples. The decoder materializes only
+  referenced fields into typed column batches, but the engine does not yet use
+  a columnar storage format, SIMD intrinsics, or generated machine code.
+
+Those boundaries are intentionally isolated behind the storage and execution
+interfaces, making WAL, locking, persisted indexes/statistics, broader
+vectorization, and JIT compilation natural next layers.
+
+## Benchmarks
+
+The native benchmark requires no SQLite:
+
+```bash
+cmake --build build --config Release --target skibidi_native_benchmark
+./build/skibidi_native_benchmark --workload point
+./build/skibidi_native_benchmark --workload scan --iterations 100
+./build/skibidi_native_benchmark --workload aggregate --iterations 100
+```
+
+Available native workloads are `point`, `scan`, and `aggregate`. Output is JSON
+and includes access-path counters such as table scans and index lookups.
+
+The optional SQLite build also provides comparative modes:
+
+```bash
+cmake --build build-sqlite --config Release --target skibidi_benchmark
+python benchmarks/run_benchmarks.py \
+  --binary build-sqlite/benchmarks/skibidi_benchmark \
+  --workload point
+```
+
+That suite compares normal SQL, prepared SQL, uncached SkibidiQL, cached
+SkibidiQL, and cached SkibidiQL with prepared-statement reuse.
+
+For a matched native-engine comparison, build and run:
+
+```bash
+cmake --build build-sqlite --config Release \
+  --target skibidi_engine_comparison
+python benchmarks/compare_engines.py \
+  --binary build-sqlite/benchmarks/skibidi_engine_comparison \
+  --rows 10000 --repeats 3
+```
+
+The comparison uses separate processes, persistent database files, prepared
+SQLite statements, one warm-up execution, and identical point, scan,
+aggregation, and skewed three-table join workloads. JSON for an individual run:
+
+```bash
+./build-sqlite/benchmarks/skibidi_engine_comparison \
+  --engine native --workload join --rows 10000 --iterations 10
+```

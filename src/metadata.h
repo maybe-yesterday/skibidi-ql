@@ -1,8 +1,9 @@
 #pragma once
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 #include <unordered_map>
-#include "nlohmann/json.hpp"
 
 struct ColumnMeta {
     std::string name;
@@ -22,6 +23,9 @@ class Catalog {
 public:
     static constexpr const char* CATALOG_FILE = ".skibidi_catalog.json";
 
+    explicit Catalog(std::string filePath = CATALOG_FILE)
+        : filePath_(std::move(filePath)) {}
+
     void load();
     void save();
 
@@ -34,7 +38,14 @@ public:
     std::string validateColumnRef(const std::string& table, const std::string& col) const;
 
     std::vector<std::string> tableNames() const;
+    std::uint64_t revision() const { return revision_; }
+    std::uint64_t schemaFingerprint() const { return schemaFingerprint_; }
 
 private:
     std::unordered_map<std::string, TableMeta> tables;
+    std::string filePath_;
+    std::uint64_t revision_ = 0;
+    std::uint64_t schemaFingerprint_ = 1469598103934665603ULL;
+
+    void recomputeFingerprint();
 };

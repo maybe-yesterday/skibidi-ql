@@ -1,20 +1,40 @@
 #include "optimizer.h"
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <stdexcept>
 
-Optimizer::Optimizer(bool verbose) : verbose_(verbose) {}
+namespace {
+
+bool isGuaranteedNonNull(const ColumnMeta& column) {
+    std::string type = column.type;
+    std::transform(type.begin(), type.end(), type.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::toupper(ch));
+                   });
+    return column.not_null ||
+           (column.primary_key && type == "INTEGER");
+}
+
+} // namespace
+
+Optimizer::Optimizer(bool verbose, const Catalog* catalog)
+    : verbose_(verbose), catalog_(catalog) {}
 
 std::unique_ptr<ASTNode> Optimizer::optimize(std::unique_ptr<ASTNode> ast, OptimizationReport& report) {
     // Pass 1: constant folding
     ast = foldConstants(std::move(ast), report);
 
-    // Pass 2: predicate pushdown (analysis only)
+    // Pass 2: metadata-aware rewrites
+    applyMetadataOptimizations(ast.get(), report);
+
+    // Pass 3: predicate pushdown (analysis only)
     pushdownPredicates(ast.get(), report);
 
-    // Pass 3: projection pruning (analysis only)
+    // Pass 4: projection pruning (analysis only)
     pruneProjections(ast.get(), report);
 
-    // Pass 4: dead code elimination
+    // Pass 5: dead code elimination
     eliminateDeadCode(ast.get(), report);
 
     return ast;
@@ -195,7 +215,178 @@ std::unique_ptr<ASTNode> Optimizer::foldConstants(std::unique_ptr<ASTNode> node,
 }
 
 // -----------------------------------------------------------------------
-// Pass 2: Predicate pushdown (analysis/annotation)
+// Pass 2: Metadata-aware rewrites
+// -----------------------------------------------------------------------
+const ColumnMeta* Optimizer::resolveBaseColumn(
+    const SelectStmt* select,
+    const ColumnRef* column) const {
+    if (!catalog_ || !select || !column || !select->joins.empty()) return nullptr;
+
+    if (!column->table.empty() &&
+        column->table != select->fromTable &&
+        column->table != select->fromAlias) {
+        return nullptr;
+    }
+
+    const auto* table = catalog_->getTable(select->fromTable);
+    if (!table) return nullptr;
+    for (const auto& metadata : table->columns) {
+        if (metadata.name == column->column) return &metadata;
+    }
+    return nullptr;
+}
+
+bool Optimizer::projectsPrimaryKey(const SelectStmt* select) const {
+    if (!catalog_ || !select || !select->joins.empty()) return false;
+    const auto* table = catalog_->getTable(select->fromTable);
+    if (!table) return false;
+
+    for (const auto& expression : select->columns) {
+        if (auto* wildcard = dynamic_cast<const Wildcard*>(expression.get())) {
+            if (wildcard->table.empty() ||
+                wildcard->table == select->fromTable ||
+                wildcard->table == select->fromAlias) {
+                for (const auto& column : table->columns) {
+                    if (column.primary_key &&
+                        isGuaranteedNonNull(column)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if (auto* column = dynamic_cast<const ColumnRef*>(expression.get())) {
+            const auto* metadata = resolveBaseColumn(select, column);
+            if (metadata && metadata->primary_key &&
+                isGuaranteedNonNull(*metadata)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool Optimizer::wherePinsPrimaryKey(
+    const SelectStmt* select,
+    const ASTNode* expression) const {
+    auto* binary = dynamic_cast<const BinaryOp*>(expression);
+    if (!binary) return false;
+
+    if (binary->op == "AND") {
+        return wherePinsPrimaryKey(select, binary->left.get()) ||
+               wherePinsPrimaryKey(select, binary->right.get());
+    }
+    if (binary->op != "=") return false;
+
+    const auto* leftColumn =
+        dynamic_cast<const ColumnRef*>(binary->left.get());
+    const auto* rightColumn =
+        dynamic_cast<const ColumnRef*>(binary->right.get());
+    const bool leftLiteral =
+        dynamic_cast<const Literal*>(binary->left.get()) != nullptr;
+    const bool rightLiteral =
+        dynamic_cast<const Literal*>(binary->right.get()) != nullptr;
+
+    if (leftColumn && rightLiteral) {
+        const auto* metadata = resolveBaseColumn(select, leftColumn);
+        return metadata && metadata->primary_key;
+    }
+    if (rightColumn && leftLiteral) {
+        const auto* metadata = resolveBaseColumn(select, rightColumn);
+        return metadata && metadata->primary_key;
+    }
+    return false;
+}
+
+bool Optimizer::hasSetProducingExpression(const SelectStmt* select) const {
+    for (const auto& expression : select->columns) {
+        if (dynamic_cast<const WindowFunc*>(expression.get())) return true;
+        if (auto* function =
+                dynamic_cast<const FunctionCall*>(expression.get())) {
+            const std::string& name = function->name;
+            if (name == "headcount" || name == "stack" || name == "mid" ||
+                name == "goat" || name == "L" || name == "mid-fr" ||
+                name == "percent-check") {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void Optimizer::rewriteNonNullCounts(SelectStmt* select,
+                                     ASTNode* expression,
+                                     OptimizationReport& r) {
+    if (!expression) return;
+
+    if (auto* function = dynamic_cast<FunctionCall*>(expression)) {
+        if (function->name == "headcount" && !function->distinct &&
+            function->args.size() == 1) {
+            auto* column =
+                dynamic_cast<ColumnRef*>(function->args.front().get());
+            const auto* metadata = resolveBaseColumn(select, column);
+            if (metadata && isGuaranteedNonNull(*metadata)) {
+                auto wildcard = std::make_unique<Wildcard>();
+                wildcard->line = column->line;
+                wildcard->col = column->col;
+                function->args.front() = std::move(wildcard);
+                r.add("Metadata optimization: COUNT(" + metadata->name +
+                      ") rewritten to COUNT(*) because the column is non-null");
+            }
+        }
+        for (auto& argument : function->args) {
+            rewriteNonNullCounts(select, argument.get(), r);
+        }
+        return;
+    }
+    if (auto* binary = dynamic_cast<BinaryOp*>(expression)) {
+        rewriteNonNullCounts(select, binary->left.get(), r);
+        rewriteNonNullCounts(select, binary->right.get(), r);
+        return;
+    }
+    if (auto* unary = dynamic_cast<UnaryOp*>(expression)) {
+        rewriteNonNullCounts(select, unary->operand.get(), r);
+    }
+}
+
+void Optimizer::applyMetadataOptimizations(ASTNode* node,
+                                           OptimizationReport& r) {
+    if (!catalog_ || !node) return;
+    auto* select = dynamic_cast<SelectStmt*>(node);
+    if (!select || select->joins.size() > 0 ||
+        !catalog_->hasTable(select->fromTable)) {
+        return;
+    }
+
+    for (auto& expression : select->columns) {
+        rewriteNonNullCounts(select, expression.get(), r);
+    }
+    rewriteNonNullCounts(select, select->having.get(), r);
+
+    if (select->distinct && projectsPrimaryKey(select)) {
+        select->distinct = false;
+        r.add("Metadata optimization: removed redundant DISTINCT because "
+              "the projection contains the primary key");
+    }
+
+    if (select->where &&
+        wherePinsPrimaryKey(select, select->where.get()) &&
+        select->groupBy.empty() && !select->having &&
+        !hasSetProducingExpression(select)) {
+        if (!select->orderBy.empty()) {
+            select->orderBy.clear();
+            r.add("Metadata optimization: removed ORDER BY from a "
+                  "primary-key point lookup");
+        }
+        if (!select->limit) {
+            select->limit = Literal::makeInt(1, select->line, select->col);
+            r.add("Metadata optimization: added LIMIT 1 to a "
+                  "primary-key point lookup");
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Pass 3: Predicate pushdown (analysis/annotation)
 // -----------------------------------------------------------------------
 void Optimizer::pushdownPredicates(ASTNode* node, OptimizationReport& r) {
     if (!node) return;
@@ -217,7 +408,7 @@ void Optimizer::pushdownPredicates(ASTNode* node, OptimizationReport& r) {
 }
 
 // -----------------------------------------------------------------------
-// Pass 3: Projection pruning (analysis)
+// Pass 4: Projection pruning (analysis)
 // -----------------------------------------------------------------------
 void Optimizer::pruneProjections(ASTNode* node, OptimizationReport& r) {
     if (!node) return;
@@ -242,7 +433,7 @@ void Optimizer::pruneProjections(ASTNode* node, OptimizationReport& r) {
 }
 
 // -----------------------------------------------------------------------
-// Pass 4: Dead code elimination
+// Pass 5: Dead code elimination
 // -----------------------------------------------------------------------
 void Optimizer::eliminateDeadCode(ASTNode* node, OptimizationReport& r) {
     if (!node) return;

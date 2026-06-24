@@ -5,15 +5,22 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
+CTestTestfile.cmake
 
 # Binaries
 skibidi
 *.o
+*.obj
 *.a
+*.lib
 *.so
+*.exe
+*.pdb
 
 # Database & catalog
 *.db
+*.heap
+.skibidi_db/
 .skibidi_catalog.json
 
 # IDE

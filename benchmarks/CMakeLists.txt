@@ -1,0 +1,16 @@
+add_executable(skibidi_native_benchmark native_benchmark.cpp)
+target_link_libraries(skibidi_native_benchmark PRIVATE skibidi_core)
+skibidi_warnings(skibidi_native_benchmark)
+
+if(SKIBIDI_WITH_SQLITE)
+    add_executable(skibidi_benchmark benchmark.cpp)
+    target_link_libraries(skibidi_benchmark PRIVATE skibidi_core)
+    skibidi_warnings(skibidi_benchmark)
+
+    add_executable(skibidi_engine_comparison engine_comparison.cpp)
+    target_link_libraries(skibidi_engine_comparison PRIVATE skibidi_core)
+    if(WIN32)
+        target_link_libraries(skibidi_engine_comparison PRIVATE Psapi)
+    endif()
+    skibidi_warnings(skibidi_engine_comparison)
+endif()
