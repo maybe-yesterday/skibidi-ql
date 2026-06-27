@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <cmath>
 #include <fstream>
 #include <iterator>
@@ -30,6 +31,57 @@ struct TupleKeyHash {
 struct TupleKeyEqual {
     bool operator()(const Tuple& left, const Tuple& right) const {
         return left == right;
+    }
+};
+
+class BloomFilter {
+public:
+    explicit BloomFilter(std::size_t expectedValues) {
+        std::size_t bits = 64;
+        const std::size_t wanted =
+            std::max<std::size_t>(64, expectedValues * 12);
+        while (bits < wanted) bits <<= 1;
+        bitMask_ = bits - 1;
+        words_.assign((bits + 63) / 64, 0);
+    }
+
+    void add(const Value& value) {
+        const auto hash = value.hash();
+        set(hash);
+        set(hash + mix(hash));
+        set(hash + mix(hash ^ 0x9e3779b97f4a7c15ULL));
+    }
+
+    bool mayContain(const Value& value) const {
+        const auto hash = value.hash();
+        return test(hash) &&
+               test(hash + mix(hash)) &&
+               test(hash + mix(hash ^ 0x9e3779b97f4a7c15ULL));
+    }
+
+private:
+    std::vector<std::uint64_t> words_;
+    std::size_t bitMask_ = 63;
+
+    static std::size_t mix(std::size_t value) {
+        value ^= value >> 33;
+        value *= static_cast<std::size_t>(0xff51afd7ed558ccdULL);
+        value ^= value >> 33;
+        value *= static_cast<std::size_t>(0xc4ceb9fe1a85ec53ULL);
+        value ^= value >> 33;
+        return value | 1U;
+    }
+
+    void set(std::size_t hash) {
+        const auto bit = hash & bitMask_;
+        words_[bit / 64] |=
+            static_cast<std::uint64_t>(1) << (bit % 64);
+    }
+
+    bool test(std::size_t hash) const {
+        const auto bit = hash & bitMask_;
+        return (words_[bit / 64] &
+                (static_cast<std::uint64_t>(1) << (bit % 64))) != 0;
     }
 };
 
@@ -70,6 +122,305 @@ std::int64_t integerLiteral(const ASTNode* expression,
         return static_cast<std::int64_t>(literal->fval);
     }
     return fallback;
+}
+
+template <typename T>
+T readRawPod(const std::uint8_t* data,
+             std::size_t length,
+             std::size_t& offset) {
+    if (offset + sizeof(T) > length) {
+        throw std::runtime_error("Corrupt tuple payload");
+    }
+    T value{};
+    std::memcpy(&value, data + offset, sizeof(T));
+    offset += sizeof(T);
+    return value;
+}
+
+struct RawField {
+    ValueType type = ValueType::Null;
+    bool isNull = true;
+    std::int64_t integer = 0;
+    double real = 0.0;
+    bool boolean = false;
+    std::string text;
+    Value::Blob blob;
+
+    bool numeric() const {
+        return !isNull &&
+               (type == ValueType::Integer ||
+                type == ValueType::Real ||
+                type == ValueType::Boolean);
+    }
+
+    double asReal() const {
+        if (type == ValueType::Real) return real;
+        if (type == ValueType::Integer) {
+            return static_cast<double>(integer);
+        }
+        if (type == ValueType::Boolean) return boolean ? 1.0 : 0.0;
+        throw std::runtime_error("Raw field is not numeric");
+    }
+
+    Value toValue() const {
+        if (isNull) return Value::null();
+        switch (type) {
+            case ValueType::Integer:
+                return Value(integer);
+            case ValueType::Real:
+                return Value(real);
+            case ValueType::Text:
+                return Value(text);
+            case ValueType::Boolean:
+                return Value(boolean);
+            case ValueType::Blob:
+                return Value(blob);
+            case ValueType::Null:
+                return Value::null();
+        }
+        return Value::null();
+    }
+};
+
+Value literalValue(const Literal& literal) {
+    switch (literal.kind) {
+        case LiteralKind::INT:
+            return Value(static_cast<std::int64_t>(literal.ival));
+        case LiteralKind::FLOAT:
+            return Value(literal.fval);
+        case LiteralKind::STRING:
+            return Value(literal.sval);
+        case LiteralKind::NUL:
+            return Value::null();
+        case LiteralKind::BOOL:
+            return Value(literal.bval);
+    }
+    return Value::null();
+}
+
+void decodeRawProjectedInto(
+    const std::uint8_t* data,
+    std::size_t length,
+    const std::vector<std::size_t>& columns,
+    std::vector<RawField>& fields) {
+    fields.clear();
+    if (columns.empty()) return;
+
+    std::size_t offset = 0;
+    const std::uint16_t count =
+        readRawPod<std::uint16_t>(data, length, offset);
+    if (!columns.empty() &&
+        (columns.back() >= count ||
+         !std::is_sorted(columns.begin(), columns.end()) ||
+             std::adjacent_find(columns.begin(), columns.end()) !=
+             columns.end())) {
+        throw std::runtime_error("Invalid projected tuple columns");
+    }
+
+    fields.resize(columns.size());
+    std::size_t projected = 0;
+    for (std::uint16_t index = 0; index < count; ++index) {
+        if (offset >= length) {
+            throw std::runtime_error("Corrupt tuple type tag");
+        }
+        const auto type = static_cast<ValueType>(data[offset++]);
+        const bool materialize =
+            projected < columns.size() &&
+            columns[projected] == index;
+        RawField field;
+        field.type = type;
+        field.isNull = type == ValueType::Null;
+        switch (type) {
+            case ValueType::Null:
+                break;
+            case ValueType::Integer:
+                field.integer =
+                    readRawPod<std::int64_t>(data, length, offset);
+                break;
+            case ValueType::Real:
+                field.real = readRawPod<double>(data, length, offset);
+                break;
+            case ValueType::Boolean:
+                if (offset >= length) {
+                    throw std::runtime_error(
+                        "Corrupt boolean tuple field");
+                }
+                field.boolean = data[offset++] != 0;
+                break;
+            case ValueType::Text: {
+                const auto textLength =
+                    readRawPod<std::uint32_t>(data, length, offset);
+                if (offset + textLength > length) {
+                    throw std::runtime_error(
+                        "Corrupt text tuple field");
+                }
+                if (materialize) {
+                    field.text.assign(
+                        reinterpret_cast<const char*>(data + offset),
+                        textLength);
+                }
+                offset += textLength;
+                break;
+            }
+            case ValueType::Blob: {
+                const auto blobLength =
+                    readRawPod<std::uint32_t>(data, length, offset);
+                if (offset + blobLength > length) {
+                    throw std::runtime_error(
+                        "Corrupt blob tuple field");
+                }
+                if (materialize) {
+                    field.blob.assign(data + offset,
+                                      data + offset + blobLength);
+                }
+                offset += blobLength;
+                break;
+            }
+            default:
+                throw std::runtime_error("Unknown tuple field type");
+        }
+        if (materialize) {
+            fields[projected] = std::move(field);
+            ++projected;
+            if (projected == columns.size()) break;
+        }
+    }
+}
+
+RawField decodeRawColumn(const std::uint8_t* data,
+                         std::size_t length,
+                         std::size_t column) {
+    std::size_t offset = 0;
+    const std::uint16_t count =
+        readRawPod<std::uint16_t>(data, length, offset);
+    if (column >= count) {
+        throw std::runtime_error("Invalid projected tuple column");
+    }
+
+    for (std::uint16_t index = 0; index < count; ++index) {
+        if (offset >= length) {
+            throw std::runtime_error("Corrupt tuple type tag");
+        }
+        const auto type = static_cast<ValueType>(data[offset++]);
+        const bool materialize = index == column;
+        RawField field;
+        field.type = type;
+        field.isNull = type == ValueType::Null;
+        switch (type) {
+            case ValueType::Null:
+                break;
+            case ValueType::Integer:
+                field.integer =
+                    readRawPod<std::int64_t>(data, length, offset);
+                break;
+            case ValueType::Real:
+                field.real = readRawPod<double>(data, length, offset);
+                break;
+            case ValueType::Boolean:
+                if (offset >= length) {
+                    throw std::runtime_error(
+                        "Corrupt boolean tuple field");
+                }
+                field.boolean = data[offset++] != 0;
+                break;
+            case ValueType::Text: {
+                const auto textLength =
+                    readRawPod<std::uint32_t>(data, length, offset);
+                if (offset + textLength > length) {
+                    throw std::runtime_error(
+                        "Corrupt text tuple field");
+                }
+                if (materialize) {
+                    field.text.assign(
+                        reinterpret_cast<const char*>(data + offset),
+                        textLength);
+                }
+                offset += textLength;
+                break;
+            }
+            case ValueType::Blob: {
+                const auto blobLength =
+                    readRawPod<std::uint32_t>(data, length, offset);
+                if (offset + blobLength > length) {
+                    throw std::runtime_error(
+                        "Corrupt blob tuple field");
+                }
+                if (materialize) {
+                    field.blob.assign(data + offset,
+                                      data + offset + blobLength);
+                }
+                offset += blobLength;
+                break;
+            }
+            default:
+                throw std::runtime_error("Unknown tuple field type");
+        }
+        if (materialize) return field;
+    }
+    throw std::runtime_error("Invalid projected tuple column");
+}
+
+int compareRawToValue(const RawField& left, const Value& right) {
+    if (left.isNull || right.isNull()) {
+        if (left.isNull && right.isNull()) return 0;
+        return left.isNull ? -1 : 1;
+    }
+    if (left.numeric() && right.isNumeric()) {
+        const double l = left.asReal();
+        const double r = right.asReal();
+        return l < r ? -1 : (l > r ? 1 : 0);
+    }
+    return left.toValue().compare(right);
+}
+
+bool comparisonMatches(const std::string& op, int order) {
+    if (op == "=") return order == 0;
+    if (op == "!=") return order != 0;
+    if (op == "<") return order < 0;
+    if (op == ">") return order > 0;
+    if (op == "<=") return order <= 0;
+    if (op == ">=") return order >= 0;
+    throw std::runtime_error("Unsupported comparison operator: " + op);
+}
+
+bool isLoneWolfName(const std::string& name) {
+    return name == "LONE-WOLF" || name == "lone-wolf";
+}
+
+bool isSimpleAggregateName(const std::string& name) {
+    return name == "headcount" || name == "stack" || name == "mid" ||
+           name == "goat" || name == "L" || isLoneWolfName(name);
+}
+
+std::int64_t countLoneWolves(const std::vector<double>& samples) {
+    if (samples.size() < 2) return 0;
+    double sum = 0.0;
+    double sumSquares = 0.0;
+    for (const double value : samples) {
+        sum += value;
+        sumSquares += value * value;
+    }
+    const double count = static_cast<double>(samples.size());
+    const double mean = sum / count;
+    const double variance = std::max(0.0, sumSquares / count - mean * mean);
+    const double sigma = std::sqrt(variance);
+    if (sigma == 0.0) return 0;
+    std::int64_t outliers = 0;
+    const double threshold = sigma * 3.0;
+    for (const double value : samples) {
+        if (std::fabs(value - mean) > threshold) ++outliers;
+    }
+    return outliers;
+}
+
+std::string normalizeColumnPredicateOp(std::string op,
+                                       bool columnOnLeft) {
+    if (columnOnLeft) return op;
+    if (op == "<") return ">";
+    if (op == ">") return "<";
+    if (op == "<=") return ">=";
+    if (op == ">=") return "<=";
+    return op;
 }
 
 } // namespace
@@ -283,6 +634,7 @@ void NativeEngine::rollbackTransaction() {
         throw std::runtime_error("No transaction is active");
     }
     bufferPool_.discardAll();
+    mappedHeaps_.clear();
     std::error_code error;
     std::filesystem::remove_all(root_, error);
     if (error) throw std::runtime_error(error.message());
@@ -336,11 +688,15 @@ void NativeEngine::flush() {
 NativeEngineStats NativeEngine::stats() const {
     auto result = stats_;
     result.residentPages = bufferPool_.residentPages();
+    result.bufferCapacityPages = bufferPool_.capacityPages();
+    result.bufferPageReads = bufferPool_.pageReads();
+    result.bufferEvictions = bufferPool_.evictions();
     return result;
 }
 
 void NativeEngine::resetStats() {
     stats_ = {};
+    bufferPool_.resetStats();
 }
 
 NativeQueryResult NativeEngine::executeCreate(
@@ -406,6 +762,7 @@ NativeQueryResult NativeEngine::executeCreate(
         catalog_.save();
         primaryIndexes_.erase(statement.table);
         tableStatistics_.erase(statement.table);
+        invalidateMappedHeap(statement.table);
     } catch (...) {
         file.drop();
         catalog_.removeTable(statement.table);
@@ -439,6 +796,7 @@ NativeQueryResult NativeEngine::executeDrop(const DropStmt& statement) {
     if (std::filesystem::exists(path)) bytes = readFile(path);
 
     try {
+        invalidateMappedHeap(statement.table);
         heap(statement.table).drop();
         primaryIndexes_.erase(statement.table);
         tableStatistics_.erase(statement.table);
@@ -461,6 +819,7 @@ NativeQueryResult NativeEngine::executeInsert(
     if (!table) throw std::runtime_error("Unknown table: " + statement.table);
 
     auto file = heap(statement.table);
+    invalidateMappedHeap(statement.table);
     file.flush();
     const auto path = tablePath(statement.table);
     const auto before = std::filesystem::exists(path)
@@ -519,6 +878,7 @@ NativeQueryResult NativeEngine::executeInsert(
         }
         file.flush();
         tableStatistics_.erase(statement.table);
+        invalidateMappedHeap(statement.table);
     } catch (...) {
         primaryIndexes_.erase(statement.table);
         bufferPool_.invalidateFile(path);
@@ -535,6 +895,7 @@ NativeQueryResult NativeEngine::executeUpdate(
     const auto* table = catalog_.getTable(statement.table);
     if (!table) throw std::runtime_error("Unknown table: " + statement.table);
     auto file = heap(statement.table);
+    invalidateMappedHeap(statement.table);
     file.flush();
     const auto path = tablePath(statement.table);
     const auto before = readFile(path);
@@ -574,6 +935,7 @@ NativeQueryResult NativeEngine::executeUpdate(
         file.flush();
         primaryIndexes_.erase(statement.table);
         tableStatistics_.erase(statement.table);
+        invalidateMappedHeap(statement.table);
     } catch (...) {
         bufferPool_.invalidateFile(path);
         restoreFile(path, before);
@@ -590,6 +952,7 @@ NativeQueryResult NativeEngine::executeDelete(
         throw std::runtime_error("Unknown table: " + statement.table);
     }
     auto file = heap(statement.table);
+    invalidateMappedHeap(statement.table);
     file.flush();
     const auto path = tablePath(statement.table);
     const auto before = readFile(path);
@@ -613,6 +976,7 @@ NativeQueryResult NativeEngine::executeDelete(
         file.flush();
         primaryIndexes_.erase(statement.table);
         tableStatistics_.erase(statement.table);
+        invalidateMappedHeap(statement.table);
     } catch (...) {
         bufferPool_.invalidateFile(path);
         restoreFile(path, before);
@@ -628,8 +992,15 @@ NativeQueryResult NativeEngine::executeSelect(
     if (!primaryKeyPredicate(statement.fromTable,
                              statement.fromAlias,
                              statement.where.get())) {
+        if (auto direct = executeDirectAggregateSelect(statement)) {
+            return std::move(*direct);
+        }
         if (auto vectorized = executeVectorizedSelect(statement)) {
             return std::move(*vectorized);
+        }
+        if (auto rowIdSeek =
+                executeRowIdSeekJoinAggregateSelect(statement)) {
+            return std::move(*rowIdSeek);
         }
     }
 
@@ -691,14 +1062,23 @@ NativeQueryResult NativeEngine::executeSelect(
 
         if (leftKey && rightKey) {
             std::unordered_multimap<Value, const EvalRow*, ValueHash> index;
+            BloomFilter bloom(right.size());
+            ++stats_.bloomFilterBuilds;
             for (const auto& rightRow : right) {
                 Value key = resolveColumn(*rightKey, rightRow);
-                if (!key.isNull()) index.emplace(std::move(key), &rightRow);
+                if (!key.isNull()) {
+                    bloom.add(key);
+                    index.emplace(std::move(key), &rightRow);
+                }
             }
             for (const auto& leftRow : rows) {
                 Value key = resolveColumn(*leftKey, leftRow);
                 bool matched = false;
                 if (!key.isNull()) {
+                    ++stats_.bloomFilterChecks;
+                    if (!bloom.mayContain(key)) {
+                        ++stats_.bloomFilterRejects;
+                    } else {
                     const auto range = index.equal_range(key);
                     ++stats_.hashJoinProbes;
                     for (auto match = range.first;
@@ -712,6 +1092,7 @@ NativeQueryResult NativeEngine::executeSelect(
                             match->second->values.end());
                         joined.push_back(std::move(combined));
                         matched = true;
+                    }
                     }
                 }
                 if (!matched && join.type == JoinType::LEFT) {
@@ -809,6 +1190,208 @@ NativeQueryResult NativeEngine::executeSelect(
     const bool grouped = !statement.groupBy.empty() ||
                          selectHasAggregate(statement);
     if (grouped) {
+        auto tryStreamingAggregation =
+            [&]() -> std::optional<std::vector<OutputRow>> {
+            if (statement.having || statement.distinct ||
+                !statement.orderBy.empty() || statement.limit ||
+                statement.offset) {
+                return std::nullopt;
+            }
+
+            enum class StreamAggregateKind {
+                Count, Sum, Average, Max, Min, LoneWolf
+            };
+            struct StreamProjection {
+                bool aggregate = false;
+                const ASTNode* expression = nullptr;
+                StreamAggregateKind kind = StreamAggregateKind::Count;
+                const ASTNode* argument = nullptr;
+                bool countWildcard = false;
+            };
+            struct StreamAggregateState {
+                std::int64_t count = 0;
+                double sum = 0.0;
+                bool allIntegers = true;
+                std::optional<Value> extremum;
+                std::vector<double> samples;
+            };
+            struct StreamGroupState {
+                Tuple representatives;
+                std::vector<StreamAggregateState> aggregates;
+            };
+
+            std::vector<StreamProjection> projections;
+            projections.reserve(statement.columns.size());
+            for (const auto& column : statement.columns) {
+                const auto* function =
+                    dynamic_cast<const FunctionCall*>(column.get());
+                if (!function) {
+                    if (hasAggregate(column.get())) return std::nullopt;
+                    projections.push_back(
+                        StreamProjection{false, column.get()});
+                    continue;
+                }
+                if (function->distinct ||
+                    !isSimpleAggregateName(function->name)) {
+                    return std::nullopt;
+                }
+                StreamProjection projection;
+                projection.aggregate = true;
+                projection.expression = column.get();
+                if (function->name == "headcount") {
+                    projection.kind = StreamAggregateKind::Count;
+                    projection.countWildcard =
+                        function->args.empty() ||
+                        dynamic_cast<const Wildcard*>(
+                            function->args.front().get());
+                } else if (function->name == "stack") {
+                    projection.kind = StreamAggregateKind::Sum;
+                } else if (function->name == "mid") {
+                    projection.kind = StreamAggregateKind::Average;
+                } else if (function->name == "goat") {
+                    projection.kind = StreamAggregateKind::Max;
+                } else if (function->name == "L") {
+                    projection.kind = StreamAggregateKind::Min;
+                } else if (isLoneWolfName(function->name)) {
+                    projection.kind = StreamAggregateKind::LoneWolf;
+                }
+                if (!projection.countWildcard) {
+                    if (function->args.size() != 1) return std::nullopt;
+                    projection.argument = function->args.front().get();
+                }
+                projections.push_back(projection);
+            }
+
+            std::unordered_map<Tuple, StreamGroupState,
+                               TupleKeyHash, TupleKeyEqual> groups;
+            auto initialize = [&](StreamGroupState& group) {
+                if (!group.representatives.empty() ||
+                    !group.aggregates.empty()) {
+                    return;
+                }
+                group.representatives.resize(
+                    projections.size(), Value::null());
+                group.aggregates.resize(projections.size());
+            };
+            if (statement.groupBy.empty()) {
+                initialize(groups[{}]);
+            }
+
+            for (const auto& row : rows) {
+                Tuple key;
+                key.reserve(statement.groupBy.size());
+                for (const auto& expression : statement.groupBy) {
+                    key.push_back(eval(expression.get(), row));
+                }
+                auto& group = groups[key];
+                initialize(group);
+                for (std::size_t index = 0;
+                     index < projections.size();
+                     ++index) {
+                    const auto& projection = projections[index];
+                    if (!projection.aggregate) {
+                        if (group.representatives[index].isNull()) {
+                            group.representatives[index] =
+                                eval(projection.expression, row);
+                        }
+                        continue;
+                    }
+
+                    auto& state = group.aggregates[index];
+                    if (projection.countWildcard) {
+                        ++state.count;
+                        continue;
+                    }
+                    Value value = eval(projection.argument, row);
+                    if (value.isNull()) continue;
+                    if (projection.kind == StreamAggregateKind::Count) {
+                        ++state.count;
+                        continue;
+                    }
+                    if (projection.kind == StreamAggregateKind::Sum ||
+                        projection.kind == StreamAggregateKind::Average ||
+                        projection.kind == StreamAggregateKind::LoneWolf) {
+                        if (!value.isNumeric()) {
+                            throw std::runtime_error(
+                                "Numeric aggregate on non-number");
+                        }
+                        ++state.count;
+                        const double numeric = value.asReal();
+                        state.sum += numeric;
+                        state.allIntegers =
+                            state.allIntegers &&
+                            value.type() == ValueType::Integer;
+                        if (projection.kind ==
+                            StreamAggregateKind::LoneWolf) {
+                            state.samples.push_back(numeric);
+                        }
+                        continue;
+                    }
+                    ++state.count;
+                    if (!state.extremum) {
+                        state.extremum = std::move(value);
+                        continue;
+                    }
+                    const int comparison =
+                        value.compare(*state.extremum);
+                    if ((projection.kind == StreamAggregateKind::Max &&
+                         comparison > 0) ||
+                        (projection.kind == StreamAggregateKind::Min &&
+                         comparison < 0)) {
+                        state.extremum = std::move(value);
+                    }
+                }
+            }
+
+            std::vector<OutputRow> streamed;
+            streamed.reserve(groups.size());
+            for (auto& item : groups) {
+                initialize(item.second);
+                OutputRow row;
+                row.values.reserve(projections.size());
+                for (std::size_t index = 0;
+                     index < projections.size();
+                     ++index) {
+                    const auto& projection = projections[index];
+                    if (!projection.aggregate) {
+                        row.values.push_back(
+                            item.second.representatives[index]);
+                        continue;
+                    }
+                    const auto& state = item.second.aggregates[index];
+                    if (projection.kind == StreamAggregateKind::Count) {
+                        row.values.push_back(Value(state.count));
+                    } else if (projection.kind ==
+                               StreamAggregateKind::LoneWolf) {
+                        row.values.push_back(
+                            Value(countLoneWolves(state.samples)));
+                    } else if (state.count == 0) {
+                        row.values.push_back(Value::null());
+                    } else if (projection.kind ==
+                               StreamAggregateKind::Average) {
+                        row.values.push_back(Value(
+                            state.sum /
+                            static_cast<double>(state.count)));
+                    } else if (projection.kind ==
+                               StreamAggregateKind::Sum) {
+                        row.values.push_back(state.allIntegers
+                            ? Value(static_cast<std::int64_t>(state.sum))
+                            : Value(state.sum));
+                    } else {
+                        row.values.push_back(
+                            state.extremum.value_or(Value::null()));
+                    }
+                }
+                streamed.push_back(std::move(row));
+            }
+            ++stats_.streamingAggregateQueries;
+            stats_.streamingAggregateRows += rows.size();
+            return streamed;
+        };
+
+        if (auto streamed = tryStreamingAggregation()) {
+            output = std::move(*streamed);
+        } else {
         std::unordered_map<Tuple, std::vector<EvalRow>,
                            TupleKeyHash, TupleKeyEqual> groups;
         if (statement.groupBy.empty()) {
@@ -835,6 +1418,7 @@ NativeQueryResult NativeEngine::executeSelect(
             row.orderKeys = orderKeysGrouped(
                 statement, groupRows, result.columns, row.values);
             output.push_back(std::move(row));
+        }
         }
     } else {
         for (const auto& source : rows) {
@@ -885,6 +1469,624 @@ NativeQueryResult NativeEngine::executeSelect(
          ++index) {
         result.rows.push_back(std::move(output[index].values));
     }
+    return result;
+}
+
+std::optional<NativeQueryResult>
+NativeEngine::executeRowIdSeekJoinAggregateSelect(
+    const SelectStmt& statement) {
+    if (statement.joins.empty() || statement.distinct ||
+        statement.where || statement.having || !statement.orderBy.empty() ||
+        statement.limit || statement.offset ||
+        !selectHasAggregate(statement)) {
+        return std::nullopt;
+    }
+    for (const auto& join : statement.joins) {
+        if (join.type != JoinType::INNER) return std::nullopt;
+    }
+    for (const auto& expression : statement.columns) {
+        if (dynamic_cast<const Wildcard*>(expression.get())) {
+            return std::nullopt;
+        }
+    }
+
+    const auto* baseMetadata = catalog_.getTable(statement.fromTable);
+    if (!baseMetadata) {
+        throw std::runtime_error(
+            "Unknown table: " + statement.fromTable);
+    }
+
+    const auto matchesRelation =
+        [](const std::string& qualifier,
+           const std::string& table,
+           const std::string& alias) {
+        return !qualifier.empty() &&
+               (qualifier == table ||
+                (!alias.empty() && qualifier == alias));
+    };
+    const auto columnIndex =
+        [](const TableMeta& metadata,
+           const std::string& columnName) -> std::optional<std::size_t> {
+        auto found = std::find_if(
+            metadata.columns.begin(), metadata.columns.end(),
+            [&](const ColumnMeta& column) {
+                return column.name == columnName;
+            });
+        if (found == metadata.columns.end()) return std::nullopt;
+        return static_cast<std::size_t>(
+            std::distance(metadata.columns.begin(), found));
+    };
+    const auto primaryKeyIndex =
+        [](const TableMeta& metadata) -> std::optional<std::size_t> {
+        auto found = std::find_if(
+            metadata.columns.begin(), metadata.columns.end(),
+            [](const ColumnMeta& column) {
+                return column.primary_key;
+            });
+        if (found == metadata.columns.end()) return std::nullopt;
+        return static_cast<std::size_t>(
+            std::distance(metadata.columns.begin(), found));
+    };
+
+    struct JoinSeekPlan {
+        std::string table;
+        std::string alias;
+        const TableMeta* metadata = nullptr;
+        std::size_t primaryKeyColumn = 0;
+        std::size_t baseKeyColumn = 0;
+        std::set<std::size_t> requiredSet;
+        std::vector<std::size_t> requiredColumns;
+        std::vector<std::size_t> fieldPositions;
+    };
+
+    std::vector<JoinSeekPlan> joins;
+    joins.reserve(statement.joins.size());
+    for (const auto& join : statement.joins) {
+        const auto* joinMetadata = catalog_.getTable(join.table);
+        if (!joinMetadata) {
+            throw std::runtime_error("Unknown table: " + join.table);
+        }
+        const auto primary = primaryKeyIndex(*joinMetadata);
+        if (!primary) return std::nullopt;
+
+        const auto* equality =
+            dynamic_cast<const BinaryOp*>(join.condition.get());
+        if (!equality || equality->op != "=") return std::nullopt;
+        const auto* left =
+            dynamic_cast<const ColumnRef*>(equality->left.get());
+        const auto* right =
+            dynamic_cast<const ColumnRef*>(equality->right.get());
+        if (!left || !right) return std::nullopt;
+
+        const auto baseAlias = statement.fromAlias;
+        const bool leftBase = matchesRelation(
+            left->table, statement.fromTable, baseAlias);
+        const bool rightBase = matchesRelation(
+            right->table, statement.fromTable, baseAlias);
+        const bool leftJoin =
+            matchesRelation(left->table, join.table, join.alias);
+        const bool rightJoin =
+            matchesRelation(right->table, join.table, join.alias);
+
+        const ColumnRef* baseColumn = nullptr;
+        const ColumnRef* joinedColumn = nullptr;
+        if (leftBase && rightJoin) {
+            baseColumn = left;
+            joinedColumn = right;
+        } else if (rightBase && leftJoin) {
+            baseColumn = right;
+            joinedColumn = left;
+        } else {
+            return std::nullopt;
+        }
+
+        const auto baseKey = columnIndex(*baseMetadata, baseColumn->column);
+        const auto joinedKey = columnIndex(
+            *joinMetadata, joinedColumn->column);
+        if (!baseKey || !joinedKey || *joinedKey != *primary) {
+            return std::nullopt;
+        }
+
+        JoinSeekPlan plan;
+        plan.table = join.table;
+        plan.alias = join.alias;
+        plan.metadata = joinMetadata;
+        plan.primaryKeyColumn = *primary;
+        plan.baseKeyColumn = *baseKey;
+        joins.push_back(std::move(plan));
+    }
+
+    enum class SourceKind { Base, Join };
+    struct ColumnAccess {
+        SourceKind source = SourceKind::Base;
+        std::size_t join = 0;
+        std::size_t column = 0;
+    };
+    const auto sameColumn =
+        [](const ColumnAccess& left, const ColumnAccess& right) {
+        return left.source == right.source &&
+               left.join == right.join &&
+               left.column == right.column;
+    };
+
+    auto resolveColumn =
+        [&](const ColumnRef& column) -> std::optional<ColumnAccess> {
+        if (!column.table.empty()) {
+            if (matchesRelation(column.table,
+                                statement.fromTable,
+                                statement.fromAlias)) {
+                const auto index =
+                    columnIndex(*baseMetadata, column.column);
+                if (!index) return std::nullopt;
+                return ColumnAccess{SourceKind::Base, 0, *index};
+            }
+            for (std::size_t joinIndex = 0;
+                 joinIndex < joins.size();
+                 ++joinIndex) {
+                if (!matchesRelation(column.table,
+                                     joins[joinIndex].table,
+                                     joins[joinIndex].alias)) {
+                    continue;
+                }
+                const auto index = columnIndex(
+                    *joins[joinIndex].metadata, column.column);
+                if (!index) return std::nullopt;
+                return ColumnAccess{SourceKind::Join,
+                                    joinIndex,
+                                    *index};
+            }
+            return std::nullopt;
+        }
+
+        std::optional<ColumnAccess> result;
+        if (const auto index =
+                columnIndex(*baseMetadata, column.column)) {
+            result = ColumnAccess{SourceKind::Base, 0, *index};
+        }
+        for (std::size_t joinIndex = 0;
+             joinIndex < joins.size();
+             ++joinIndex) {
+            if (const auto index = columnIndex(
+                    *joins[joinIndex].metadata, column.column)) {
+                if (result) return std::nullopt;
+                result = ColumnAccess{SourceKind::Join,
+                                      joinIndex,
+                                      *index};
+            }
+        }
+        return result;
+    };
+
+    std::set<std::size_t> baseRequiredSet;
+    auto requireColumn = [&](const ColumnAccess& column) {
+        if (column.source == SourceKind::Base) {
+            baseRequiredSet.insert(column.column);
+        } else {
+            joins[column.join].requiredSet.insert(column.column);
+        }
+    };
+    for (const auto& join : joins) {
+        baseRequiredSet.insert(join.baseKeyColumn);
+    }
+
+    std::vector<ColumnAccess> groupColumns;
+    groupColumns.reserve(statement.groupBy.size());
+    for (const auto& expression : statement.groupBy) {
+        const auto* column =
+            dynamic_cast<const ColumnRef*>(expression.get());
+        if (!column) return std::nullopt;
+        auto access = resolveColumn(*column);
+        if (!access) return std::nullopt;
+        requireColumn(*access);
+        groupColumns.push_back(*access);
+    }
+
+    enum class AggregateKind { Count, Sum, Average, Max, Min, LoneWolf };
+    struct AggregatePlan {
+        AggregateKind kind = AggregateKind::Count;
+        std::optional<ColumnAccess> argument;
+    };
+    struct ProjectionPlan {
+        bool aggregate = false;
+        std::optional<ColumnAccess> representative;
+        AggregatePlan aggregatePlan;
+    };
+
+    std::vector<ProjectionPlan> projections;
+    projections.reserve(statement.columns.size());
+    bool hasAggregateProjection = false;
+    for (const auto& expression : statement.columns) {
+        if (const auto* function =
+                dynamic_cast<const FunctionCall*>(expression.get())) {
+            if (function->distinct ||
+                !isSimpleAggregateName(function->name)) {
+                return std::nullopt;
+            }
+            ProjectionPlan projection;
+            projection.aggregate = true;
+            hasAggregateProjection = true;
+            if (function->name == "headcount") {
+                projection.aggregatePlan.kind = AggregateKind::Count;
+            } else if (function->name == "stack") {
+                projection.aggregatePlan.kind = AggregateKind::Sum;
+            } else if (function->name == "mid") {
+                projection.aggregatePlan.kind = AggregateKind::Average;
+            } else if (function->name == "goat") {
+                projection.aggregatePlan.kind = AggregateKind::Max;
+            } else if (function->name == "L") {
+                projection.aggregatePlan.kind = AggregateKind::Min;
+            } else if (isLoneWolfName(function->name)) {
+                projection.aggregatePlan.kind = AggregateKind::LoneWolf;
+            }
+
+            const bool countWildcard =
+                function->name == "headcount" &&
+                (function->args.empty() ||
+                 dynamic_cast<const Wildcard*>(
+                     function->args.front().get()));
+            if (!countWildcard) {
+                if (function->args.size() != 1) return std::nullopt;
+                const auto* argument =
+                    dynamic_cast<const ColumnRef*>(
+                        function->args.front().get());
+                if (!argument) return std::nullopt;
+                auto access = resolveColumn(*argument);
+                if (!access) return std::nullopt;
+                requireColumn(*access);
+                projection.aggregatePlan.argument = *access;
+            }
+            projections.push_back(std::move(projection));
+            continue;
+        }
+
+        const auto* column =
+            dynamic_cast<const ColumnRef*>(expression.get());
+        if (!column || hasAggregate(expression.get())) {
+            return std::nullopt;
+        }
+        auto access = resolveColumn(*column);
+        if (!access) return std::nullopt;
+        bool groupedColumn = false;
+        for (const auto& groupColumn : groupColumns) {
+            if (sameColumn(*access, groupColumn)) {
+                groupedColumn = true;
+                break;
+            }
+        }
+        if (!groupedColumn) return std::nullopt;
+        requireColumn(*access);
+        ProjectionPlan projection;
+        projection.representative = *access;
+        projections.push_back(std::move(projection));
+    }
+    if (!hasAggregateProjection) return std::nullopt;
+
+    const std::size_t missing =
+        std::numeric_limits<std::size_t>::max();
+    const std::vector<std::size_t> baseRequiredColumns(
+        baseRequiredSet.begin(), baseRequiredSet.end());
+    std::vector<std::size_t> baseFieldPositions(
+        baseMetadata->columns.size(), missing);
+    for (std::size_t index = 0;
+         index < baseRequiredColumns.size();
+         ++index) {
+        baseFieldPositions[baseRequiredColumns[index]] = index;
+    }
+    for (auto& join : joins) {
+        join.requiredColumns.assign(
+            join.requiredSet.begin(), join.requiredSet.end());
+        join.fieldPositions.assign(
+            join.metadata->columns.size(), missing);
+        for (std::size_t index = 0;
+             index < join.requiredColumns.size();
+             ++index) {
+            join.fieldPositions[join.requiredColumns[index]] = index;
+        }
+    }
+
+    struct AggregateState {
+        std::int64_t count = 0;
+        double sum = 0.0;
+        bool allIntegers = true;
+        std::optional<Value> extremum;
+        std::vector<double> samples;
+    };
+    struct GroupState {
+        Tuple representatives;
+        std::vector<AggregateState> aggregates;
+    };
+
+    std::unordered_map<Tuple, GroupState,
+                       TupleKeyHash, TupleKeyEqual> groups;
+    auto initializeGroup = [&](GroupState& group) {
+        if (!group.representatives.empty() ||
+            !group.aggregates.empty()) {
+            return;
+        }
+        group.representatives.resize(
+            projections.size(), Value::null());
+        group.aggregates.resize(projections.size());
+    };
+    if (groupColumns.empty()) {
+        initializeGroup(groups[{}]);
+    }
+
+    std::vector<RawField> baseFields;
+    baseFields.reserve(baseRequiredColumns.size());
+    std::vector<std::vector<RawField>> joinedFields(joins.size());
+    for (std::size_t joinIndex = 0;
+         joinIndex < joins.size();
+         ++joinIndex) {
+        joinedFields[joinIndex].reserve(
+            joins[joinIndex].requiredColumns.size());
+    }
+
+    auto fieldAt =
+        [&](const ColumnAccess& column) -> const RawField& {
+        if (column.source == SourceKind::Base) {
+            const auto position = baseFieldPositions[column.column];
+            if (position == missing || position >= baseFields.size()) {
+                throw std::runtime_error(
+                    "Rowid-seek join base column was not decoded");
+            }
+            return baseFields[position];
+        }
+        const auto& join = joins[column.join];
+        const auto position = join.fieldPositions[column.column];
+        if (position == missing ||
+            position >= joinedFields[column.join].size()) {
+            throw std::runtime_error(
+                "Rowid-seek join column was not decoded");
+        }
+        return joinedFields[column.join][position];
+    };
+
+    auto makeOutput = [&](GroupState& group) {
+        initializeGroup(group);
+        Tuple output;
+        output.reserve(projections.size());
+        for (std::size_t index = 0;
+             index < projections.size();
+             ++index) {
+            const auto& projection = projections[index];
+            if (!projection.aggregate) {
+                output.push_back(group.representatives[index]);
+                continue;
+            }
+            const auto& aggregate = projection.aggregatePlan;
+            const auto& state = group.aggregates[index];
+            if (aggregate.kind == AggregateKind::Count) {
+                output.push_back(Value(state.count));
+            } else if (aggregate.kind == AggregateKind::LoneWolf) {
+                output.push_back(Value(countLoneWolves(state.samples)));
+            } else if (state.count == 0) {
+                output.push_back(Value::null());
+            } else if (aggregate.kind == AggregateKind::Average) {
+                output.push_back(Value(
+                    state.sum / static_cast<double>(state.count)));
+            } else if (aggregate.kind == AggregateKind::Sum) {
+                output.push_back(state.allIntegers
+                    ? Value(static_cast<std::int64_t>(state.sum))
+                    : Value(state.sum));
+            } else {
+                output.push_back(
+                    state.extremum.value_or(Value::null()));
+            }
+        }
+        return output;
+    };
+
+    auto joinDomainProvesEmpty = [&]() {
+        for (const auto& join : joins) {
+            ++stats_.joinDomainFiltersChecked;
+            const auto& baseRange = ensureColumnRange(
+                statement.fromTable,
+                baseMetadata->columns[join.baseKeyColumn].name);
+            const auto& joinRange = ensureColumnRange(
+                join.table,
+                join.metadata->columns[join.primaryKeyColumn].name);
+            if (!baseRange.present || !joinRange.present) return true;
+            if (baseRange.max.compare(joinRange.min) < 0 ||
+                baseRange.min.compare(joinRange.max) > 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (joinDomainProvesEmpty()) {
+        ++stats_.joinDomainScansSkipped;
+        stats_.joinDomainRowsSkipped +=
+            tableStatistics_[statement.fromTable].rowCount;
+        NativeQueryResult result;
+        result.columns = outputNames(statement, nullptr);
+        if (groupColumns.empty()) {
+            result.rows.push_back(makeOutput(groups[{}]));
+        }
+        ++stats_.rowIdSeekJoinQueries;
+        return result;
+    }
+
+    std::vector<MappedHeapFile*> joinMappedFiles;
+    joinMappedFiles.reserve(joins.size());
+    for (const auto& join : joins) {
+        joinMappedFiles.push_back(&mappedHeap(join.table));
+    }
+
+    auto decodeJoinRow =
+        [&](std::size_t joinIndex,
+            RowId rowId) {
+        auto& join = joins[joinIndex];
+        joinedFields[joinIndex].clear();
+        if (join.requiredColumns.empty()) return true;
+        auto decode = [&](const std::uint8_t* data, std::size_t length) {
+            decodeRawProjectedInto(
+                data, length,
+                join.requiredColumns,
+                joinedFields[joinIndex]);
+        };
+        bool usedMapping = false;
+        bool found = false;
+        if (joinMappedFiles[joinIndex]->isMapped()) {
+            found = joinMappedFiles[joinIndex]->readRawRowFast(
+                rowId, decode);
+            usedMapping = found;
+        }
+        if (!found) {
+            auto file = heap(join.table);
+            found = file.readRawRowFast(rowId, decode);
+        }
+        if (found) {
+            ++stats_.rowsRead;
+            ++stats_.rowCopiesAvoided;
+            if (usedMapping) ++stats_.virtualMemoryRowIdReads;
+            stats_.decodedColumns += join.requiredColumns.size();
+            stats_.skippedColumns +=
+                join.metadata->columns.size() -
+                join.requiredColumns.size();
+        }
+        return found;
+    };
+
+    auto lookupJoin =
+        [&](std::size_t joinIndex, const Value& key) {
+        auto& join = joins[joinIndex];
+        ++stats_.indexLookups;
+        ++stats_.rowIdSeekJoinLookups;
+        auto rowId = primaryIndex(join.table).find(key);
+        if (!rowId) {
+            ++stats_.rowIdSeekJoinMisses;
+            return false;
+        }
+        if (decodeJoinRow(joinIndex, *rowId)) return true;
+
+        primaryIndexes_.erase(join.table);
+        ++stats_.indexLookups;
+        ++stats_.rowIdSeekJoinLookups;
+        rowId = primaryIndex(join.table).find(key);
+        if (!rowId || !decodeJoinRow(joinIndex, *rowId)) {
+            ++stats_.rowIdSeekJoinMisses;
+            return false;
+        }
+        return true;
+    };
+
+    auto file = heap(statement.fromTable);
+    auto& mappedFile = mappedHeap(statement.fromTable);
+    ++stats_.tableScans;
+    auto visitBaseRow =
+        [&](RowId, const std::uint8_t* data, std::size_t length) {
+        decodeRawProjectedInto(
+            data, length, baseRequiredColumns, baseFields);
+        ++stats_.rowsRead;
+        ++stats_.rawRowsScanned;
+        ++stats_.rowCopiesAvoided;
+        ++stats_.rowIdSeekJoinBaseRows;
+        stats_.decodedColumns += baseRequiredColumns.size();
+        stats_.skippedColumns +=
+            baseMetadata->columns.size() - baseRequiredColumns.size();
+
+        for (std::size_t joinIndex = 0;
+             joinIndex < joins.size();
+             ++joinIndex) {
+            const auto& join = joins[joinIndex];
+            const auto position =
+                baseFieldPositions[join.baseKeyColumn];
+            if (position == missing || position >= baseFields.size()) {
+                throw std::runtime_error(
+                    "Rowid-seek join key was not decoded");
+            }
+            const auto& keyField = baseFields[position];
+            if (keyField.isNull ||
+                !lookupJoin(joinIndex, keyField.toValue())) {
+                return;
+            }
+        }
+
+        Tuple key;
+        key.reserve(groupColumns.size());
+        for (const auto& column : groupColumns) {
+            key.push_back(fieldAt(column).toValue());
+        }
+        auto& group = groups[key];
+        initializeGroup(group);
+        for (std::size_t index = 0;
+             index < projections.size();
+             ++index) {
+            const auto& projection = projections[index];
+            if (!projection.aggregate) {
+                if (group.representatives[index].isNull()) {
+                    group.representatives[index] =
+                        fieldAt(*projection.representative).toValue();
+                }
+                continue;
+            }
+
+            auto& state = group.aggregates[index];
+            const auto& aggregate = projection.aggregatePlan;
+            if (!aggregate.argument) {
+                ++state.count;
+                continue;
+            }
+            const auto& field = fieldAt(*aggregate.argument);
+            if (field.isNull) continue;
+            if (aggregate.kind == AggregateKind::Count) {
+                ++state.count;
+                continue;
+            }
+            if (aggregate.kind == AggregateKind::Sum ||
+                aggregate.kind == AggregateKind::Average ||
+                aggregate.kind == AggregateKind::LoneWolf) {
+                if (!field.numeric()) {
+                    throw std::runtime_error(
+                        "Numeric aggregate on non-number");
+                }
+                ++state.count;
+                const double numeric = field.asReal();
+                state.sum += numeric;
+                state.allIntegers =
+                    state.allIntegers &&
+                    field.type == ValueType::Integer;
+                if (aggregate.kind == AggregateKind::LoneWolf) {
+                    state.samples.push_back(numeric);
+                }
+                continue;
+            }
+
+            Value value = field.toValue();
+            ++state.count;
+            if (!state.extremum) {
+                state.extremum = std::move(value);
+                continue;
+            }
+            const int comparison = value.compare(*state.extremum);
+            if ((aggregate.kind == AggregateKind::Max &&
+                 comparison > 0) ||
+                (aggregate.kind == AggregateKind::Min &&
+                 comparison < 0)) {
+                state.extremum = std::move(value);
+            }
+        }
+    };
+    if (mappedFile.isMapped()) {
+        ++stats_.virtualMemoryScanQueries;
+        mappedFile.scanRawRowsFast(
+            [&](RowId rowId,
+                const std::uint8_t* data,
+                std::size_t length) {
+            ++stats_.virtualMemoryRowsScanned;
+            visitBaseRow(rowId, data, length);
+        });
+    } else {
+        file.scanRawRowsFast(visitBaseRow);
+    }
+
+    NativeQueryResult result;
+    result.columns = outputNames(statement, nullptr);
+    for (auto& item : groups) {
+        result.rows.push_back(makeOutput(item.second));
+    }
+    ++stats_.rowIdSeekJoinQueries;
     return result;
 }
 
@@ -1161,13 +2363,23 @@ NativeEngine::executeCostBasedJoins(const SelectStmt& statement) {
             std::unordered_multimap<Value, const EvalRow*, ValueHash>
                 index;
             index.reserve(rows.size());
+            BloomFilter bloom(rows.size());
+            ++stats_.bloomFilterBuilds;
             for (const auto& row : rows) {
                 Value key = resolveColumn(joinedKey, row);
-                if (!key.isNull()) index.emplace(std::move(key), &row);
+                if (!key.isNull()) {
+                    bloom.add(key);
+                    index.emplace(std::move(key), &row);
+                }
             }
             for (const auto& nextRow : nextRows) {
                 Value key = resolveColumn(nextKey, nextRow);
                 if (key.isNull()) continue;
+                ++stats_.bloomFilterChecks;
+                if (!bloom.mayContain(key)) {
+                    ++stats_.bloomFilterRejects;
+                    continue;
+                }
                 ++stats_.hashJoinProbes;
                 const auto range = index.equal_range(key);
                 for (auto match = range.first;
@@ -1186,13 +2398,23 @@ NativeEngine::executeCostBasedJoins(const SelectStmt& statement) {
             std::unordered_multimap<Value, const EvalRow*, ValueHash>
                 index;
             index.reserve(nextRows.size());
+            BloomFilter bloom(nextRows.size());
+            ++stats_.bloomFilterBuilds;
             for (const auto& row : nextRows) {
                 Value key = resolveColumn(nextKey, row);
-                if (!key.isNull()) index.emplace(std::move(key), &row);
+                if (!key.isNull()) {
+                    bloom.add(key);
+                    index.emplace(std::move(key), &row);
+                }
             }
             for (const auto& row : rows) {
                 Value key = resolveColumn(joinedKey, row);
                 if (key.isNull()) continue;
+                ++stats_.bloomFilterChecks;
+                if (!bloom.mayContain(key)) {
+                    ++stats_.bloomFilterRejects;
+                    continue;
+                }
                 ++stats_.hashJoinProbes;
                 const auto range = index.equal_range(key);
                 for (auto match = range.first;
@@ -1231,6 +2453,474 @@ NativeEngine::executeCostBasedJoins(const SelectStmt& statement) {
         rows = std::move(joined);
     }
     return rows;
+}
+
+std::optional<NativeQueryResult> NativeEngine::executeDirectAggregateSelect(
+    const SelectStmt& statement) {
+    if (!statement.joins.empty() || statement.distinct ||
+        statement.having || !statement.orderBy.empty() ||
+        statement.limit || statement.offset ||
+        !selectHasAggregate(statement)) {
+        return std::nullopt;
+    }
+
+    const auto* metadata = catalog_.getTable(statement.fromTable);
+    if (!metadata) {
+        throw std::runtime_error(
+            "Unknown table: " + statement.fromTable);
+    }
+
+    auto resolveColumnIndex = [&](const ColumnRef& column) {
+        if (!column.table.empty() &&
+            column.table != statement.fromTable &&
+            column.table != statement.fromAlias) {
+            throw std::runtime_error(
+                "Unknown table qualifier: " + column.table);
+        }
+        std::optional<std::size_t> result;
+        for (std::size_t index = 0;
+             index < metadata->columns.size();
+             ++index) {
+            if (metadata->columns[index].name != column.column) {
+                continue;
+            }
+            if (result && column.table.empty()) {
+                throw std::runtime_error(
+                    "Ambiguous column: " + column.column);
+            }
+            result = index;
+        }
+        if (!result) {
+            throw std::runtime_error("Unknown column: " +
+                (column.table.empty() ? "" : column.table + ".") +
+                column.column);
+        }
+        return *result;
+    };
+
+    struct PredicatePlan {
+        std::size_t column = 0;
+        std::string op;
+        Value literal;
+        bool columnOnLeft = true;
+    };
+    std::optional<PredicatePlan> predicate;
+    auto comparisonOperator = [](const std::string& op) {
+        return op == "=" || op == "!=" || op == "<" || op == ">" ||
+               op == "<=" || op == ">=";
+    };
+    if (statement.where) {
+        const auto* binary =
+            dynamic_cast<const BinaryOp*>(statement.where.get());
+        if (!binary || !comparisonOperator(binary->op)) {
+            return std::nullopt;
+        }
+        const auto* leftColumn =
+            dynamic_cast<const ColumnRef*>(binary->left.get());
+        const auto* rightColumn =
+            dynamic_cast<const ColumnRef*>(binary->right.get());
+        const auto* leftLiteral =
+            dynamic_cast<const Literal*>(binary->left.get());
+        const auto* rightLiteral =
+            dynamic_cast<const Literal*>(binary->right.get());
+        if (leftColumn && rightLiteral) {
+            predicate = PredicatePlan{
+                resolveColumnIndex(*leftColumn),
+                binary->op,
+                literalValue(*rightLiteral),
+                true};
+        } else if (rightColumn && leftLiteral) {
+            predicate = PredicatePlan{
+                resolveColumnIndex(*rightColumn),
+                binary->op,
+                literalValue(*leftLiteral),
+                false};
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    enum class AggregateKind { Count, Sum, Average, Max, Min, LoneWolf };
+    struct AggregatePlan {
+        AggregateKind kind = AggregateKind::Count;
+        std::optional<std::size_t> argumentColumn;
+    };
+    struct ProjectionPlan {
+        bool aggregate = false;
+        std::optional<std::size_t> representativeColumn;
+        AggregatePlan aggregatePlan;
+    };
+
+    std::set<std::size_t> requiredSet;
+    auto require = [&](std::size_t column) {
+        requiredSet.insert(column);
+    };
+    if (predicate) require(predicate->column);
+
+    std::vector<std::size_t> groupColumns;
+    groupColumns.reserve(statement.groupBy.size());
+    for (const auto& expression : statement.groupBy) {
+        const auto* column =
+            dynamic_cast<const ColumnRef*>(expression.get());
+        if (!column) return std::nullopt;
+        const auto index = resolveColumnIndex(*column);
+        groupColumns.push_back(index);
+        require(index);
+    }
+
+    std::vector<ProjectionPlan> projections;
+    projections.reserve(statement.columns.size());
+    bool hasAggregateProjection = false;
+    for (const auto& expression : statement.columns) {
+        if (auto* function =
+                dynamic_cast<const FunctionCall*>(expression.get())) {
+            if (function->distinct) return std::nullopt;
+            ProjectionPlan plan;
+            plan.aggregate = true;
+            hasAggregateProjection = true;
+            if (function->name == "headcount") {
+                plan.aggregatePlan.kind = AggregateKind::Count;
+            } else if (function->name == "stack") {
+                plan.aggregatePlan.kind = AggregateKind::Sum;
+            } else if (function->name == "mid") {
+                plan.aggregatePlan.kind = AggregateKind::Average;
+            } else if (function->name == "goat") {
+                plan.aggregatePlan.kind = AggregateKind::Max;
+            } else if (function->name == "L") {
+                plan.aggregatePlan.kind = AggregateKind::Min;
+            } else if (isLoneWolfName(function->name)) {
+                plan.aggregatePlan.kind = AggregateKind::LoneWolf;
+            } else {
+                return std::nullopt;
+            }
+
+            const bool countWildcard =
+                function->name == "headcount" &&
+                (function->args.empty() ||
+                 dynamic_cast<const Wildcard*>(
+                     function->args.front().get()));
+            if (!countWildcard) {
+                if (function->args.size() != 1) return std::nullopt;
+                const auto* argument =
+                    dynamic_cast<const ColumnRef*>(
+                        function->args.front().get());
+                if (!argument) return std::nullopt;
+                const auto index = resolveColumnIndex(*argument);
+                plan.aggregatePlan.argumentColumn = index;
+                require(index);
+            }
+            projections.push_back(std::move(plan));
+            continue;
+        }
+
+        const auto* column =
+            dynamic_cast<const ColumnRef*>(expression.get());
+        if (!column) return std::nullopt;
+        const auto index = resolveColumnIndex(*column);
+        if (std::find(groupColumns.begin(),
+                      groupColumns.end(),
+                      index) == groupColumns.end()) {
+            return std::nullopt;
+        }
+        ProjectionPlan plan;
+        plan.representativeColumn = index;
+        require(index);
+        projections.push_back(std::move(plan));
+    }
+    if (!hasAggregateProjection) return std::nullopt;
+
+    const std::vector<std::size_t> requiredColumns(
+        requiredSet.begin(), requiredSet.end());
+    const std::size_t missing =
+        std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> fieldPositions(
+        metadata->columns.size(), missing);
+    for (std::size_t index = 0;
+         index < requiredColumns.size();
+         ++index) {
+        fieldPositions[requiredColumns[index]] = index;
+    }
+
+    struct AggregateState {
+        std::int64_t count = 0;
+        double sum = 0.0;
+        bool allIntegers = true;
+        std::optional<Value> extremum;
+        std::vector<double> samples;
+    };
+    struct GroupState {
+        Tuple representatives;
+        std::vector<AggregateState> aggregates;
+    };
+
+    const bool scalarAggregate = groupColumns.empty();
+    GroupState scalarGroup;
+    std::unordered_map<Tuple, GroupState,
+                       TupleKeyHash, TupleKeyEqual> groups;
+    auto initializeGroup = [&](GroupState& group) {
+        if (!group.representatives.empty() ||
+            !group.aggregates.empty()) {
+            return;
+        }
+        group.representatives.resize(
+            projections.size(), Value::null());
+        group.aggregates.resize(projections.size());
+    };
+    if (scalarAggregate) initializeGroup(scalarGroup);
+
+    auto makeOutput = [&](GroupState& group) {
+        initializeGroup(group);
+        Tuple output;
+        output.reserve(projections.size());
+        for (std::size_t index = 0;
+             index < projections.size();
+             ++index) {
+            const auto& projection = projections[index];
+            if (!projection.aggregate) {
+                output.push_back(group.representatives[index]);
+                continue;
+            }
+            const auto& aggregate = projection.aggregatePlan;
+            const auto& state = group.aggregates[index];
+            if (aggregate.kind == AggregateKind::Count) {
+                output.push_back(Value(state.count));
+            } else if (aggregate.kind == AggregateKind::LoneWolf) {
+                output.push_back(Value(countLoneWolves(state.samples)));
+            } else if (state.count == 0) {
+                output.push_back(Value::null());
+            } else if (aggregate.kind == AggregateKind::Average) {
+                output.push_back(Value(
+                    state.sum / static_cast<double>(state.count)));
+            } else if (aggregate.kind == AggregateKind::Sum) {
+                output.push_back(state.allIntegers
+                    ? Value(static_cast<std::int64_t>(state.sum))
+                    : Value(state.sum));
+            } else {
+                output.push_back(
+                    state.extremum.value_or(Value::null()));
+            }
+        }
+        return output;
+    };
+
+    auto minMaxProvesEmpty =
+        [&](const PredicatePlan& plan) {
+            ++stats_.minMaxFiltersChecked;
+            const auto& range = ensureColumnRange(
+                statement.fromTable,
+                metadata->columns[plan.column].name);
+            if (plan.literal.isNull() || !range.present) return true;
+            const auto op =
+                normalizeColumnPredicateOp(plan.op, plan.columnOnLeft);
+            const int literalVsMin = plan.literal.compare(range.min);
+            const int literalVsMax = plan.literal.compare(range.max);
+            if (op == "=") {
+                return literalVsMin < 0 || literalVsMax > 0;
+            }
+            if (op == "!=") {
+                return range.min.compare(plan.literal) == 0 &&
+                       range.max.compare(plan.literal) == 0;
+            }
+            if (op == "<") {
+                return range.min.compare(plan.literal) >= 0;
+            }
+            if (op == "<=") {
+                return range.min.compare(plan.literal) > 0;
+            }
+            if (op == ">") {
+                return range.max.compare(plan.literal) <= 0;
+            }
+            if (op == ">=") {
+                return range.max.compare(plan.literal) < 0;
+            }
+            return false;
+        };
+
+    if (predicate && minMaxProvesEmpty(*predicate)) {
+        ++stats_.minMaxScansSkipped;
+        stats_.minMaxRowsSkipped += tableStatistics_[
+            statement.fromTable].rowCount;
+        NativeQueryResult result;
+        result.columns = outputNames(statement, nullptr);
+        if (scalarAggregate) {
+            result.rows.push_back(makeOutput(scalarGroup));
+        }
+        ++stats_.directAggregateQueries;
+        return result;
+    }
+
+    auto fieldAt = [&](const std::vector<RawField>& fields,
+                       std::size_t column) -> const RawField& {
+        const auto position = fieldPositions[column];
+        if (position == missing || position >= fields.size()) {
+            throw std::runtime_error(
+                "Direct aggregate column was not decoded");
+        }
+        return fields[position];
+    };
+
+    auto predicateMatches = [&](const std::vector<RawField>& fields) {
+        if (!predicate) return true;
+        const auto& field = fieldAt(fields, predicate->column);
+        if (field.isNull || predicate->literal.isNull()) {
+            return false;
+        }
+        int order = compareRawToValue(field, predicate->literal);
+        if (!predicate->columnOnLeft) order = -order;
+        return comparisonMatches(predicate->op, order);
+    };
+
+    if (scalarAggregate && projections.size() == 1 &&
+        projections.front().aggregate &&
+        projections.front().aggregatePlan.kind ==
+            AggregateKind::Count) {
+        const auto argumentColumn =
+            projections.front().aggregatePlan.argumentColumn;
+        std::int64_t count = 0;
+        auto file = heap(statement.fromTable);
+        ++stats_.tableScans;
+        file.scanRawRowsFast(
+            [&](RowId, const std::uint8_t* data, std::size_t length) {
+            ++stats_.rowsRead;
+            ++stats_.rawRowsScanned;
+            ++stats_.rowCopiesAvoided;
+            stats_.decodedColumns += requiredColumns.size();
+            stats_.skippedColumns +=
+                metadata->columns.size() - requiredColumns.size();
+
+            RawField predicateField;
+            if (predicate) {
+                predicateField =
+                    decodeRawColumn(data, length, predicate->column);
+                if (predicateField.isNull ||
+                    predicate->literal.isNull()) {
+                    return;
+                }
+                int order =
+                    compareRawToValue(predicateField,
+                                      predicate->literal);
+                if (!predicate->columnOnLeft) order = -order;
+                if (!comparisonMatches(predicate->op, order)) return;
+            }
+
+            if (!argumentColumn) {
+                ++count;
+                return;
+            }
+            RawField argumentField =
+                (predicate && *argumentColumn == predicate->column)
+                    ? predicateField
+                    : decodeRawColumn(data, length, *argumentColumn);
+            if (!argumentField.isNull) ++count;
+        });
+
+        NativeQueryResult result;
+        result.columns = outputNames(statement, nullptr);
+        result.rows.push_back(Tuple{Value(count)});
+        ++stats_.directAggregateQueries;
+        return result;
+    }
+
+    auto file = heap(statement.fromTable);
+    ++stats_.tableScans;
+    std::vector<RawField> fields;
+    fields.reserve(requiredColumns.size());
+    file.scanRawRowsFast(
+        [&](RowId, const std::uint8_t* data, std::size_t length) {
+        decodeRawProjectedInto(data, length, requiredColumns, fields);
+        ++stats_.rowsRead;
+        ++stats_.rawRowsScanned;
+        ++stats_.rowCopiesAvoided;
+        stats_.decodedColumns += requiredColumns.size();
+        stats_.skippedColumns +=
+            metadata->columns.size() - requiredColumns.size();
+        if (!predicateMatches(fields)) return;
+
+        GroupState* targetGroup = &scalarGroup;
+        if (!scalarAggregate) {
+            Tuple key;
+            key.reserve(groupColumns.size());
+            for (const auto column : groupColumns) {
+                key.push_back(fieldAt(fields, column).toValue());
+            }
+            targetGroup = &groups[key];
+        }
+        auto& group = *targetGroup;
+        initializeGroup(group);
+        for (std::size_t index = 0;
+             index < projections.size();
+             ++index) {
+            const auto& projection = projections[index];
+            if (!projection.aggregate) {
+                if (group.representatives[index].isNull()) {
+                    group.representatives[index] =
+                        fieldAt(fields,
+                                *projection.representativeColumn)
+                            .toValue();
+                }
+                continue;
+            }
+
+            auto& state = group.aggregates[index];
+            const auto& aggregate = projection.aggregatePlan;
+            if (!aggregate.argumentColumn) {
+                ++state.count;
+                continue;
+            }
+            const auto& field =
+                fieldAt(fields, *aggregate.argumentColumn);
+            if (field.isNull) continue;
+            if (aggregate.kind == AggregateKind::Count) {
+                ++state.count;
+                continue;
+            }
+            if (aggregate.kind == AggregateKind::Sum ||
+                aggregate.kind == AggregateKind::Average ||
+                aggregate.kind == AggregateKind::LoneWolf) {
+                if (!field.numeric()) {
+                    throw std::runtime_error(
+                        "Numeric aggregate on non-number");
+                }
+                ++state.count;
+                const double numeric = field.asReal();
+                state.sum += numeric;
+                state.allIntegers =
+                    state.allIntegers &&
+                    field.type == ValueType::Integer;
+                if (aggregate.kind == AggregateKind::LoneWolf) {
+                    state.samples.push_back(numeric);
+                }
+                continue;
+            }
+
+            Value value = field.toValue();
+            ++state.count;
+            if (!state.extremum) {
+                state.extremum = std::move(value);
+                continue;
+            }
+            const int comparison =
+                value.compare(*state.extremum);
+            if ((aggregate.kind == AggregateKind::Max &&
+                 comparison > 0) ||
+                (aggregate.kind == AggregateKind::Min &&
+                 comparison < 0)) {
+                state.extremum = std::move(value);
+            }
+        }
+    });
+
+    NativeQueryResult result;
+    result.columns = outputNames(statement, nullptr);
+    if (scalarAggregate) {
+        result.rows.push_back(makeOutput(scalarGroup));
+    } else {
+        for (auto& item : groups) {
+            result.rows.push_back(makeOutput(item.second));
+        }
+    }
+    ++stats_.directAggregateQueries;
+    return result;
 }
 
 bool NativeEngine::canVectorize(const SelectStmt& statement) const {
@@ -1963,6 +3653,108 @@ BPlusTree& NativeEngine::primaryIndex(const std::string& table) {
     return *pointer;
 }
 
+MappedHeapFile& NativeEngine::mappedHeap(const std::string& table) {
+    auto existing = mappedHeaps_.find(table);
+    if (existing != mappedHeaps_.end()) return existing->second;
+    auto mapped = heap(table).mappedView();
+    auto inserted = mappedHeaps_.emplace(table, std::move(mapped));
+    return inserted.first->second;
+}
+
+void NativeEngine::invalidateMappedHeap(const std::string& table) {
+    mappedHeaps_.erase(table);
+}
+
+const NativeEngine::TableStatistics::ColumnRange&
+NativeEngine::ensureColumnRange(const std::string& table,
+                                const std::string& columnName) {
+    const auto* metadata = catalog_.getTable(table);
+    if (!metadata) throw std::runtime_error("Unknown table: " + table);
+    auto cachedRange = tableStatistics_[table].columnRanges.find(
+        columnName);
+    if (cachedRange != tableStatistics_[table].columnRanges.end()) {
+        return cachedRange->second;
+    }
+
+    auto foundColumn = std::find_if(
+        metadata->columns.begin(), metadata->columns.end(),
+        [&](const ColumnMeta& column) {
+            return column.name == columnName;
+        });
+    if (foundColumn == metadata->columns.end()) {
+        throw std::runtime_error(
+            "Unknown statistics column: " + columnName);
+    }
+    const auto column = static_cast<std::size_t>(
+        std::distance(metadata->columns.begin(), foundColumn));
+
+    TableStatistics::ColumnRange range;
+    std::size_t rows = 0;
+    std::vector<double> numericSamples;
+    auto file = heap(table);
+    file.scanRawRowsFast(
+        [&](RowId, const std::uint8_t* data, std::size_t length) {
+        ++rows;
+        RawField field = decodeRawColumn(data, length, column);
+        if (field.isNull) return;
+        Value value = field.toValue();
+        if (!range.present) {
+            range.present = true;
+            range.min = value;
+            range.max = std::move(value);
+        } else {
+            if (value.compare(range.min) < 0) range.min = value;
+            if (value.compare(range.max) > 0) range.max = std::move(value);
+        }
+        ++range.nonNullCount;
+        if (field.numeric()) {
+            const double numeric = field.asReal();
+            range.numeric = true;
+            double power = numeric;
+            for (double& moment : range.rawMoments) {
+                moment += power;
+                power *= numeric;
+            }
+            numericSamples.push_back(numeric);
+        }
+    });
+
+    if (range.numeric && !numericSamples.empty()) {
+        double minimum = numericSamples.front();
+        double maximum = numericSamples.front();
+        for (const double value : numericSamples) {
+            minimum = std::min(minimum, value);
+            maximum = std::max(maximum, value);
+        }
+        range.bucketMin = minimum;
+        range.bucketMax = maximum;
+        if (minimum == maximum) {
+            range.buckets[0] = numericSamples.size();
+        } else {
+            const double width = maximum - minimum;
+            for (const double value : numericSamples) {
+                std::size_t bucket = static_cast<std::size_t>(
+                    ((value - minimum) / width) *
+                    static_cast<double>(range.buckets.size()));
+                if (bucket >= range.buckets.size()) {
+                    bucket = range.buckets.size() - 1;
+                }
+                ++range.buckets[bucket];
+            }
+        }
+    }
+
+    auto& cached = tableStatistics_[table];
+    if (cached.rowCount != 0 && cached.rowCount != rows) {
+        cached = {};
+    }
+    cached.rowCount = rows;
+    ++stats_.minMaxStatisticsBuilt;
+    stats_.minMaxBuildRows += rows;
+    auto inserted = cached.columnRanges.emplace(columnName, std::move(range));
+    return inserted.first->second;
+}
+
 std::optional<Value> NativeEngine::primaryKeyPredicate(
     const std::string& table,
     const std::string& alias,
@@ -2121,6 +3913,18 @@ Value NativeEngine::aggregate(
         }
         return result;
     }
+    if (isLoneWolfName(name)) {
+        std::vector<double> samples;
+        samples.reserve(values.size());
+        for (const auto& value : values) {
+            if (!value.isNumeric()) {
+                throw std::runtime_error(
+                    "LONE-WOLF requires numeric operands");
+            }
+            samples.push_back(value.asReal());
+        }
+        return Value(countLoneWolves(samples));
+    }
     if (name == "mid-fr") {
         std::sort(values.begin(), values.end(),
                   [](const Value& left, const Value& right) {
@@ -2158,7 +3962,7 @@ bool NativeEngine::hasAggregate(const ASTNode* expression) const {
         const std::string& name = function->name;
         return name == "headcount" || name == "stack" || name == "mid" ||
                name == "goat" || name == "L" || name == "mid-fr" ||
-               name == "percent-check";
+               name == "percent-check" || isLoneWolfName(name);
     }
     if (auto* binary = dynamic_cast<const BinaryOp*>(expression)) {
         return hasAggregate(binary->left.get()) ||
@@ -2605,6 +4409,7 @@ std::vector<std::uint8_t> NativeEngine::readFile(
 void NativeEngine::restoreFile(
     const std::filesystem::path& path,
     const std::optional<std::vector<std::uint8_t>>& bytes) {
+    mappedHeaps_.clear();
     bufferPool_.invalidateFile(path);
     if (!bytes) {
         std::error_code error;

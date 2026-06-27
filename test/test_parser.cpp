@@ -400,6 +400,14 @@ TEST(select_percentile_function) {
     ASSERT_EQ(fc->args.size(), (size_t)2);
 }
 
+TEST(select_lone_wolf_function) {
+    auto stmt = parseOne("slay LONE-WOLF(score) no-cap results");
+    auto* s = asSelect(stmt);
+    auto* fc = dynamic_cast<FunctionCall*>(s->columns[0].get());
+    ASSERT_EQ(fc->name, std::string("LONE-WOLF"));
+    ASSERT_EQ(fc->args.size(), (size_t)1);
+}
+
 TEST(select_argmax_biggest_W) {
     auto stmt = parseOne("slay biggest-W(salary) no-cap employees");
     auto* s = asSelect(stmt);

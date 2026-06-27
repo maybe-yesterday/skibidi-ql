@@ -153,6 +153,10 @@ TEST(keyword_mid_fr) {
 TEST(keyword_percent_check) {
     ASSERT_TRUE(firstType("percent-check") == TokenType::PERCENT_CHECK);
 }
+TEST(keyword_lone_wolf) {
+    ASSERT_TRUE(firstType("LONE-WOLF") == TokenType::LONE_WOLF);
+    ASSERT_TRUE(firstType("lone-wolf") == TokenType::LONE_WOLF);
+}
 TEST(keyword_split_by) {
     ASSERT_TRUE(firstType("split-by") == TokenType::SPLIT_BY);
 }

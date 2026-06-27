@@ -437,6 +437,9 @@ std::string CodeGen::genFunctionCall(const FunctionCall* fc) {
     else if (name == "mid") sqlName = "AVG";
     else if (name == "goat") sqlName = "MAX";
     else if (name == "L") sqlName = "MIN";
+    else if (name == "LONE-WOLF" || name == "lone-wolf") {
+        sqlName = "LONE_WOLF";
+    }
     else if (name == "mid-fr" || name == "percent-check" ||
              name == "biggest-W" || name == "biggest-L") {
         // These need context (handled at select level), but if used in isolation:

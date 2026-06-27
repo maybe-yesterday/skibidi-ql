@@ -98,6 +98,34 @@ TEST(projected_heap_scan_returns_only_requested_columns) {
     ASSERT_TRUE(rows[1].values[1].isNull());
 }
 
+TEST(raw_heap_scan_exposes_row_views_without_tuple_copy) {
+    TempDirectory temp;
+    BufferPool pool(2);
+    HeapFile file(temp.path / "raw.heap", pool);
+    file.insert(Tuple{
+        Value((std::int64_t)11),
+        Value(std::string("unused"))});
+    file.insert(Tuple{
+        Value((std::int64_t)12),
+        Value(std::string("also-unused"))});
+
+    std::size_t rows = 0;
+    std::vector<std::int64_t> ids;
+    file.scanRawRows(
+        [&](RowId, const std::uint8_t* data, std::size_t length) {
+            ++rows;
+            const auto projected =
+                HeapFile::decodeTupleProjected(
+                    std::vector<std::uint8_t>(data, data + length),
+                    {0});
+            ids.push_back(projected[0].asInteger());
+        });
+
+    ASSERT_EQ(rows, (size_t)2);
+    ASSERT_EQ(ids[0], (std::int64_t)11);
+    ASSERT_EQ(ids[1], (std::int64_t)12);
+}
+
 TEST(slotted_page_insert_read_update_delete) {
     std::array<std::uint8_t, SlottedPage::PAGE_SIZE> bytes{};
     SlottedPage page(bytes);

@@ -612,7 +612,8 @@ std::unique_ptr<ASTNode> Parser::parsePrimaryExpr() {
         tok.type == TokenType::MID       || tok.type == TokenType::GOAT  ||
         tok.type == TokenType::L_FUNC    || tok.type == TokenType::BIGGEST_W ||
         tok.type == TokenType::BIGGEST_L || tok.type == TokenType::MID_FR ||
-        tok.type == TokenType::PERCENT_CHECK) {
+        tok.type == TokenType::PERCENT_CHECK ||
+        tok.type == TokenType::LONE_WOLF) {
         std::string fname = tok.value;
         advance();
         return parseFunctionCall(fname, tok.line, tok.col);

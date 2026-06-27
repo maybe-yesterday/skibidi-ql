@@ -48,6 +48,7 @@ enum class TokenType {
     MID,            // AVG
     GOAT,           // MAX
     L_FUNC,         // MIN (single letter L)
+    LONE_WOLF,      // normal-distribution outlier count
 
     // Advanced analytics
     BIGGEST_W,      // ARGMAX

@@ -27,7 +27,7 @@ struct Options {
     bool cacheEnabled = true;
     bool cacheStats = false;
     std::size_t cacheEntries = 128;
-    std::size_t bufferPages = 128;
+    std::size_t bufferPages = 1024;
 #ifdef SKIBIDI_WITH_SQLITE
     bool statementCacheEnabled = true;
     std::size_t statementCacheEntries = 128;
@@ -276,7 +276,7 @@ static void printUsage(const char* program) {
 #ifdef SKIBIDI_WITH_SQLITE
         << "  --engine sqlite     Use optional SQLite compatibility backend\n"
 #endif
-        << "  --buffer-pages <n>  Native buffer-pool capacity (default: 128)\n"
+        << "  --buffer-pages <n>  Native buffer-pool capacity (default: 1024)\n"
         << "  --verbose           Print tokens, AST, optimizer report, and SQL\n"
         << "  --transpile-only    Generate SQL without executing\n"
         << "  --no-cache          Disable compilation cache\n"
@@ -410,10 +410,39 @@ int main(int argc, char** argv) {
         if (native) {
             const auto stats = native->stats();
             std::cout << "native resident-pages=" << stats.residentPages
+                      << " buffer-capacity-pages="
+                      << stats.bufferCapacityPages
+                      << " buffer-page-reads="
+                      << stats.bufferPageReads
+                      << " buffer-evictions="
+                      << stats.bufferEvictions
                       << " table-scans=" << stats.tableScans
                       << " rows-read=" << stats.rowsRead
                       << " rows-written=" << stats.rowsWritten
                       << " index-lookups=" << stats.indexLookups
+                      << " bloom-checks=" << stats.bloomFilterChecks
+                      << " bloom-rejects=" << stats.bloomFilterRejects
+                      << " minmax-skips=" << stats.minMaxScansSkipped
+                      << " minmax-rows-skipped="
+                      << stats.minMaxRowsSkipped
+                      << " streaming-aggregates="
+                      << stats.streamingAggregateQueries
+                      << " rowid-seek-joins="
+                      << stats.rowIdSeekJoinQueries
+                      << " rowid-seek-lookups="
+                      << stats.rowIdSeekJoinLookups
+                      << " rowid-seek-misses="
+                      << stats.rowIdSeekJoinMisses
+                      << " vm-scans="
+                      << stats.virtualMemoryScanQueries
+                      << " vm-rows="
+                      << stats.virtualMemoryRowsScanned
+                      << " vm-rowid-reads="
+                      << stats.virtualMemoryRowIdReads
+                      << " join-domain-skips="
+                      << stats.joinDomainScansSkipped
+                      << " join-domain-rows-skipped="
+                      << stats.joinDomainRowsSkipped
                       << " hash-join-probes=" << stats.hashJoinProbes
                       << " join-comparisons="
                       << stats.nestedLoopComparisons << "\n";

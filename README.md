@@ -9,17 +9,38 @@ No SQLite library is required for the default build or runtime.
 
 ## Performance Highlight
 
-Matched Release-build results against prepared, file-backed SQLite on the same
-10,000 rows and warm caches:
+Matched Release-build sample results against prepared, file-backed SQLite on the
+same 10,000 rows and warm caches:
 
 | Workload | Iterations | Native | SQLite | Result | Peak RSS (native / SQLite) |
 |---|---:|---:|---:|---|---:|
-| Primary-key lookup | 10,000 | 77.5 ms | 892.2 ms | Native 11.5x faster | 8.1 / 5.2 MiB |
-| Filtered count scan | 100 | 1,535.7 ms | 66.9 ms | SQLite 23.0x faster | 7.6 / 5.0 MiB |
-| Filtered grouped sum | 100 | 2,348.8 ms | 340.8 ms | SQLite 6.9x faster | 7.7 / 5.3 MiB |
-| Skewed three-table join | 10 | 626.1 ms | 74.8 ms | SQLite 8.4x faster | 16.9 / 5.5 MiB |
+| Primary-key lookup | 10,000 | 89.6 ms | 310.0 ms | Native 3.5x faster | 7.4 / 5.0 MiB |
+| Filtered count scan | 100 | 205.6 ms | 24.0 ms | SQLite 8.6x faster | 7.4 / 5.0 MiB |
+| Impossible count via min/max | 100 | 0.1 ms | 3.4 ms | Native ~34x faster | 7.4 / 5.0 MiB |
+| Filtered grouped sum | 100 | 352.1 ms | 120.1 ms | SQLite 2.9x faster | 7.4 / 5.2 MiB |
+| Skewed three-table join | 10 | 97.5 ms | 51.0 ms | SQLite 1.9x faster | 7.4 / 5.2 MiB |
+| Miss-heavy three-table join | 10 | <0.1 ms | 4.4 ms | Native metadata skip | 7.0 / 4.8 MiB |
 
-See [Benchmarks](#benchmarks) for reproduction.
+SQLite's scan advantage is not primarily a B-tree story for these workloads:
+`COUNT(*) WHERE active = 1` is a table scan with a tight `Column -> Ne ->
+AggStep` opcode loop. The native engine now has a direct raw aggregate scan and
+a 1024-page default buffer pool; the old 128-page default thrashed this
+benchmark table and made the filtered count scan about 9x slower. Cached
+table-level min/max ranges can skip impossible filtered counts entirely, while
+Bloom filters prune hash-join probes when many join keys miss. Join-shaped
+aggregates can now use a SQLite-style rowid-seek loop: scan the fact table,
+seek joined primary-key rows, decode only referenced columns, and run aggregate
+steps immediately. That loop uses cached read-only virtual-memory mappings for
+heap reads when available, avoiding buffer-pool page guards in the hot join
+path. Min/max join-domain pruning detects disjoint inner-join key ranges and
+returns empty aggregate results without scanning. A 10-iteration matching join
+spot check hit `rowid_seek_join_queries=10`,
+`rowid_seek_join_lookups=200000`, `virtual_memory_scan_queries=10`,
+`virtual_memory_rowid_reads=100000`, and `hash_join_probes=0`; the miss-heavy
+join hit `join_domain_scans_skipped=10` and `rowid_seek_join_lookups=0`. See
+[Benchmarks](#benchmarks) and
+[benchmarks/optimization_notes.md](benchmarks/optimization_notes.md) for
+reproduction details.
 
 ## Language Reference
 
@@ -67,6 +88,7 @@ See [Benchmarks](#benchmarks) for reproduction.
 | `mid(col)` | `AVG(col)` | Average |
 | `goat(col)` | `MAX(col)` | Maximum |
 | `L(col)` | `MIN(col)` | Minimum |
+| `LONE-WOLF(col)` | `LONE_WOLF(col)` | Native z-score outlier count |
 
 ### Advanced Analytics
 
@@ -249,6 +271,10 @@ no-cap transactions;
 SELECT SUM(amount) AS total, AVG(amount) AS average FROM transactions
 ```
 
+`LONE-WOLF(col)` is a native aggregate that counts numeric values whose
+absolute z-score is greater than 3.0 using the population standard deviation.
+Empty, single-value, and zero-variance groups return `0`.
+
 ### ARGMAX (biggest-W)
 
 ```skql
@@ -387,6 +413,14 @@ Source Text
     v
 [Native Physical Engine] (native_engine.h / native_engine.cpp)
     - Indexed and heap access paths
+    - Direct raw aggregate scans for simple count/sum/min/max/avg workloads
+    - Rowid-seek join aggregate loop for fact-to-primary-key joins
+    - Cached read-only virtual-memory heap views for seek-heavy reads
+    - Min/max join-domain pruning for provably empty inner joins
+    - SQLite-style streaming group aggregation after joins
+    - Cached table-level min/max pruning for impossible aggregate filters
+    - Column statistics with non-null counts, raw moments 1..5, and 16 buckets
+    - Bloom-prefiltered hash joins for miss-heavy equi-joins
     - Typed column vectors with bit-packed null masks
     - Vectorized filters, projections, groups, and common aggregates
     - Statistics cache and dynamic-programming inner-join enumeration
@@ -396,10 +430,12 @@ Source Text
     v
 [Storage Engine] (native_storage.h / native_storage.cpp)
     - Typed tuple serialization
+    - Raw row views for copy-free scan consumers
     - Projection-aware decoding that skips unreferenced payloads
+    - Early-stop projected decoding once the last referenced column is read
     - 4 KiB slotted pages
     - Persistent heap files
-    - LRU buffer pool with dirty-page flushing
+    - 1024-page default LRU buffer pool with dirty-page flushing
     |
     v
 [B+ Tree] (native_index.h / native_index.cpp)
@@ -420,9 +456,22 @@ This is NOT yet a production database:
 - Primary-key B+ trees are rebuilt lazily and are not separately persisted.
 - Inner equi-joins use cost-based left-deep enumeration. Outer joins and
   non-equality joins retain source order.
-- Heap pages still store row-oriented tuples. The decoder materializes only
-  referenced fields into typed column batches, but the engine does not yet use
-  a columnar storage format, SIMD intrinsics, or generated machine code.
+- Min/max pruning is table-level. Page-level zone maps would skip clustered
+  ranges inside larger tables, but are not persisted yet.
+- Join-domain pruning is table-level and currently attached to the
+  rowid-seek aggregate path for inner primary-key joins.
+- Bloom filters help miss-heavy hash joins; all-matching joins still pay the
+  normal hash-probe and row-materialization costs.
+- `LONE-WOLF` is exact in the native engine. SQL generation emits
+  `LONE_WOLF(col)`, so the optional SQLite backend would need a matching UDF to
+  execute that aggregate directly.
+- Virtual-memory heap views bypass buffer-pool copies/guards for selected
+  read-heavy paths, but they do not erase all `Value`/`RawField` abstraction
+  overhead. Mappings are read-only and invalidated on writes/rollback.
+- Heap pages still store row-oriented tuples. Direct aggregate scans and the
+  vector decoder materialize only referenced fields, but the engine does not
+  yet use a columnar storage format, SIMD intrinsics, or generated machine
+  code.
 
 Those boundaries are intentionally isolated behind the storage and execution
 interfaces, making WAL, locking, persisted indexes/statistics, broader
@@ -440,7 +489,10 @@ cmake --build build --config Release --target skibidi_native_benchmark
 ```
 
 Available native workloads are `point`, `scan`, and `aggregate`. Output is JSON
-and includes access-path counters such as table scans and index lookups.
+and includes access-path counters such as table scans, index lookups, direct
+aggregate scans, decoded/skipped columns, buffer-pool reads/evictions,
+min/max skips, join-domain skips, streaming aggregate rows, rowid-seek join
+lookups, virtual-memory mapped reads, and Bloom-filter rejects.
 
 The optional SQLite build also provides comparative modes:
 
@@ -466,7 +518,12 @@ python benchmarks/compare_engines.py \
 
 The comparison uses separate processes, persistent database files, prepared
 SQLite statements, one warm-up execution, and identical point, scan,
-aggregation, and skewed three-table join workloads. JSON for an individual run:
+aggregation, and skewed three-table join workloads. Native comparison runs use
+the same 1024-page default buffer pool as the CLI. To reproduce the old cache
+thrash diagnosis, pass `--buffer-pages 128` and watch
+`buffer_page_reads`/`buffer_evictions` jump. Extra workloads `count_miss` and
+`join_miss` isolate min/max pruning and Bloom-filter join pruning. JSON for an
+individual run:
 
 ```bash
 ./build-sqlite/benchmarks/skibidi_engine_comparison \

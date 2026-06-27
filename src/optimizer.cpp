@@ -305,7 +305,8 @@ bool Optimizer::hasSetProducingExpression(const SelectStmt* select) const {
             const std::string& name = function->name;
             if (name == "headcount" || name == "stack" || name == "mid" ||
                 name == "goat" || name == "L" || name == "mid-fr" ||
-                name == "percent-check") {
+                name == "percent-check" || name == "LONE-WOLF" ||
+                name == "lone-wolf") {
                 return true;
             }
         }

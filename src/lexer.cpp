@@ -31,6 +31,8 @@ const std::unordered_map<std::string, TokenType> Lexer::KEYWORDS = {
     {"biggest-L",       TokenType::BIGGEST_L},
     {"mid-fr",          TokenType::MID_FR},
     {"percent-check",   TokenType::PERCENT_CHECK},
+    {"LONE-WOLF",       TokenType::LONE_WOLF},
+    {"lone-wolf",       TokenType::LONE_WOLF},
     {"split-by",        TokenType::SPLIT_BY},
     // Single-word keywords
     {"slay",            TokenType::SLAY},

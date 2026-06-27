@@ -11,6 +11,18 @@
 #include <stdexcept>
 #include <system_error>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 template <typename T>
@@ -299,6 +311,19 @@ std::optional<std::vector<std::uint8_t>> SlottedPage::read(
         bytes_.begin() + offset + length);
 }
 
+std::optional<SlottedPage::RowView> SlottedPage::readView(
+    std::uint16_t slot) const {
+    if (!valid() || slot >= slotCount()) return std::nullopt;
+    const std::size_t position = slotOffset(slot);
+    if (read16(position + 4) == 0) return std::nullopt;
+    const std::uint16_t offset = read16(position);
+    const std::uint16_t length = read16(position + 2);
+    if (offset + length > PAGE_SIZE) {
+        throw std::runtime_error("Corrupt slotted page");
+    }
+    return RowView{bytes_.data() + offset, length};
+}
+
 bool SlottedPage::update(
     std::uint16_t slot,
     const std::vector<std::uint8_t>& row) {
@@ -433,6 +458,7 @@ BufferPool::PageGuard BufferPool::fetch(
     auto frame = std::make_unique<Frame>();
     frame->key = key;
     readPage(key, frame->bytes, create);
+    ++pageReads_;
     frame->pins = 1;
     lru_.push_front(key);
     frame->lru = lru_.begin();
@@ -513,6 +539,7 @@ void BufferPool::evictOne() {
             flush(*found->second);
             lru_.erase(found->second->lru);
             frames_.erase(found);
+            ++evictions_;
             return;
         }
     }
@@ -571,6 +598,183 @@ void BufferPool::writePage(
     if (!output) {
         throw std::runtime_error("Failed writing heap page: " + key.file);
     }
+}
+
+MappedHeapFile::~MappedHeapFile() {
+    close();
+}
+
+MappedHeapFile::MappedHeapFile(MappedHeapFile&& other) noexcept {
+    *this = std::move(other);
+}
+
+MappedHeapFile& MappedHeapFile::operator=(
+    MappedHeapFile&& other) noexcept {
+    if (this != &other) {
+        close();
+        data_ = other.data_;
+        size_ = other.size_;
+#ifdef _WIN32
+        fileHandle_ = other.fileHandle_;
+        mappingHandle_ = other.mappingHandle_;
+        other.fileHandle_ = nullptr;
+        other.mappingHandle_ = nullptr;
+#else
+        fileDescriptor_ = other.fileDescriptor_;
+        other.fileDescriptor_ = -1;
+#endif
+        other.data_ = nullptr;
+        other.size_ = 0;
+    }
+    return *this;
+}
+
+MappedHeapFile MappedHeapFile::open(
+    const std::filesystem::path& path) {
+    MappedHeapFile view;
+    const auto absolute = path.is_absolute()
+        ? path
+        : std::filesystem::absolute(path);
+    std::error_code error;
+    if (!std::filesystem::exists(absolute, error) || error) {
+        return view;
+    }
+
+#ifdef _WIN32
+    HANDLE file = CreateFileW(
+        absolute.wstring().c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) return view;
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0) {
+        CloseHandle(file);
+        return view;
+    }
+    if (static_cast<unsigned long long>(fileSize.QuadPart) >
+        static_cast<unsigned long long>(
+            std::numeric_limits<std::size_t>::max())) {
+        CloseHandle(file);
+        return view;
+    }
+
+    HANDLE mapping = CreateFileMappingW(
+        file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!mapping) {
+        CloseHandle(file);
+        return view;
+    }
+
+    void* data = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    if (!data) {
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return view;
+    }
+
+    view.fileHandle_ = file;
+    view.mappingHandle_ = mapping;
+    view.data_ = static_cast<const std::uint8_t*>(data);
+    view.size_ = static_cast<std::size_t>(fileSize.QuadPart);
+#else
+    const int fd = ::open(absolute.string().c_str(), O_RDONLY);
+    if (fd < 0) return view;
+
+    struct stat info {};
+    if (fstat(fd, &info) != 0 || info.st_size <= 0) {
+        ::close(fd);
+        return view;
+    }
+    if (static_cast<unsigned long long>(info.st_size) >
+        static_cast<unsigned long long>(
+            std::numeric_limits<std::size_t>::max())) {
+        ::close(fd);
+        return view;
+    }
+
+    void* data = mmap(nullptr,
+                      static_cast<std::size_t>(info.st_size),
+                      PROT_READ,
+                      MAP_SHARED,
+                      fd,
+                      0);
+    if (data == MAP_FAILED) {
+        ::close(fd);
+        return view;
+    }
+
+    view.fileDescriptor_ = fd;
+    view.data_ = static_cast<const std::uint8_t*>(data);
+    view.size_ = static_cast<std::size_t>(info.st_size);
+#endif
+    return view;
+}
+
+void MappedHeapFile::close() {
+#ifdef _WIN32
+    if (data_) UnmapViewOfFile(data_);
+    if (mappingHandle_) {
+        CloseHandle(static_cast<HANDLE>(mappingHandle_));
+    }
+    if (fileHandle_) {
+        CloseHandle(static_cast<HANDLE>(fileHandle_));
+    }
+    fileHandle_ = nullptr;
+    mappingHandle_ = nullptr;
+#else
+    if (data_) munmap(const_cast<std::uint8_t*>(data_), size_);
+    if (fileDescriptor_ >= 0) ::close(fileDescriptor_);
+    fileDescriptor_ = -1;
+#endif
+    data_ = nullptr;
+    size_ = 0;
+}
+
+std::uint16_t MappedHeapFile::read16(
+    const std::uint8_t* bytes,
+    std::size_t offset) {
+    std::uint16_t value = 0;
+    std::memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+std::uint32_t MappedHeapFile::read32(
+    const std::uint8_t* bytes,
+    std::size_t offset) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+bool MappedHeapFile::validPage(const std::uint8_t* bytes) {
+    return read32(bytes, 0) == SlottedPage::MAGIC;
+}
+
+std::uint16_t MappedHeapFile::slotCount(
+    const std::uint8_t* bytes) {
+    return validPage(bytes) ? read16(bytes, 4) : 0;
+}
+
+std::optional<SlottedPage::RowView> MappedHeapFile::readView(
+    const std::uint8_t* bytes,
+    std::uint16_t slot) {
+    if (!validPage(bytes) || slot >= slotCount(bytes)) {
+        return std::nullopt;
+    }
+    const std::size_t position = 16 + static_cast<std::size_t>(slot) * 6;
+    if (read16(bytes, position + 4) == 0) return std::nullopt;
+    const std::uint16_t offset = read16(bytes, position);
+    const std::uint16_t length = read16(bytes, position + 2);
+    if (static_cast<std::size_t>(offset) + length >
+        SlottedPage::PAGE_SIZE) {
+        throw std::runtime_error("Corrupt mapped slotted page");
+    }
+    return SlottedPage::RowView{bytes + offset, length};
 }
 
 HeapFile::HeapFile(std::filesystem::path path, BufferPool& bufferPool)
@@ -729,6 +933,23 @@ void HeapFile::scanProjectedBatches(
     if (!rows.empty()) visitor(std::move(rows));
 }
 
+void HeapFile::scanRawRows(
+    const std::function<void(RowId,
+                             const std::uint8_t*,
+                             std::size_t)>& visitor) {
+    const std::size_t pages = pageCount();
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        auto guard = bufferPool_.fetch(path_, page, false);
+        SlottedPage slotted(guard.bytes());
+        if (!slotted.valid()) continue;
+        for (std::uint16_t slot = 0; slot < slotted.slotCount(); ++slot) {
+            auto view = slotted.readView(slot);
+            if (!view) continue;
+            visitor(RowId{page, slot}, view->data, view->size);
+        }
+    }
+}
+
 std::optional<StoredRow> HeapFile::read(RowId row) {
     auto guard = bufferPool_.fetch(path_, row.page, false);
     SlottedPage slotted(guard.bytes());
@@ -762,6 +983,10 @@ RowId HeapFile::update(RowId row, const Tuple& tuple) {
 
 void HeapFile::flush() {
     bufferPool_.flushFile(path_);
+}
+
+MappedHeapFile HeapFile::mappedView() const {
+    return MappedHeapFile::open(path_);
 }
 
 std::vector<std::uint8_t> HeapFile::encodeTuple(const Tuple& tuple) {
@@ -819,6 +1044,7 @@ Tuple HeapFile::decodeTuple(const std::vector<std::uint8_t>& bytes) {
 Tuple HeapFile::decodeTupleProjected(
     const std::vector<std::uint8_t>& bytes,
     const std::vector<std::size_t>& columns) {
+    if (columns.empty()) return {};
     std::size_t offset = 0;
     const std::uint16_t count =
         readPod<std::uint16_t>(bytes, offset);
@@ -896,7 +1122,10 @@ Tuple HeapFile::decodeTupleProjected(
             default:
                 throw std::runtime_error("Unknown tuple field type");
         }
-        if (materialize && !columns.empty()) ++projected;
+        if (materialize) {
+            ++projected;
+            if (projected == columns.size()) break;
+        }
     }
     return tuple;
 }

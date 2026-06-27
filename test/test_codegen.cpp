@@ -213,6 +213,11 @@ TEST(generate_L_maps_to_MIN) {
     ASSERT_CONTAINS(sql, "MIN(salary)");
 }
 
+TEST(generate_lone_wolf_maps_to_sql_function_name) {
+    std::string sql = toSQL("slay LONE-WOLF(score) no-cap results");
+    ASSERT_CONTAINS(sql, "LONE_WOLF(score)");
+}
+
 // -----------------------------------------------------------------------
 // SELECT – expression codegen
 // -----------------------------------------------------------------------

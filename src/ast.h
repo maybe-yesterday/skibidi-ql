@@ -209,7 +209,7 @@ struct UnaryOp : ASTNode {
 // FunctionCall
 // -----------------------------------------------------------------------
 struct FunctionCall : ASTNode {
-    std::string name;       // function name (headcount, stack, mid, goat, L, biggest-W, biggest-L, mid-fr, percent-check)
+    std::string name;       // function name (headcount, stack, mid, goat, L, LONE-WOLF, biggest-W, biggest-L, mid-fr, percent-check)
     std::vector<std::unique_ptr<ASTNode>> args;
     bool distinct = false;  // for headcount(unique-fr col)
     std::string alias;

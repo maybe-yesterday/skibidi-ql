@@ -35,7 +35,7 @@ struct Options {
     std::string workload = "scan";
     int iterations = 100;
     int rows = 10000;
-    int bufferPages = 128;
+    int bufferPages = 1024;
 };
 
 std::size_t peakResidentBytes() {
@@ -85,7 +85,9 @@ Options parseOptions(int argc, char** argv) {
         (options.workload != "point" &&
          options.workload != "scan" &&
          options.workload != "aggregate" &&
-         options.workload != "join") ||
+         options.workload != "count_miss" &&
+         options.workload != "join" &&
+         options.workload != "join_miss") ||
         options.iterations <= 0 || options.rows <= 0 ||
         options.bufferPages <= 0) {
         throw std::runtime_error("Invalid benchmark option value");
@@ -139,7 +141,9 @@ void insertNativeUsers(NativeEngine& engine, int rowCount) {
     }
 }
 
-void seedNativeJoin(NativeEngine& engine, int rowCount) {
+void seedNativeJoin(NativeEngine& engine,
+                    int rowCount,
+                    bool missDimensionTwo = false) {
     CreateStmt facts;
     facts.table = "facts";
     facts.columns = {
@@ -190,7 +194,10 @@ void seedNativeJoin(NativeEngine& engine, int rowCount) {
             std::vector<std::unique_ptr<ASTNode>> row;
             row.push_back(Literal::makeInt(id));
             row.push_back(Literal::makeInt((id - 1) % d1Rows + 1));
-            row.push_back(Literal::makeInt((id - 1) % d2Rows + 1));
+            row.push_back(Literal::makeInt(
+                missDimensionTwo
+                    ? d2Rows + 1000 + (id % d2Rows)
+                    : (id - 1) % d2Rows + 1));
             row.push_back(Literal::makeInt(id % 100));
             insert.valueRows.push_back(std::move(row));
         }
@@ -206,9 +213,21 @@ std::string nativeQuery(const Options& options) {
     if (options.workload == "scan") {
         return "slay headcount(*) no-cap users only-if active = 1;";
     }
+    if (options.workload == "count_miss") {
+        return "slay headcount(*) no-cap users only-if id > " +
+               std::to_string(options.rows + 1000) + ";";
+    }
     if (options.workload == "aggregate") {
         return "slay category, stack(score) no-cap users "
                "only-if active = 1 vibe-check category;";
+    }
+    if (options.workload == "join_miss") {
+        return "slay headcount(*) "
+               "no-cap facts lowkey f "
+               "link-up dimension_one lowkey d1 "
+               "fr-fr f.d1_id = d1.id "
+               "link-up dimension_two lowkey d2 "
+               "fr-fr f.d2_id = d2.id;";
     }
     return "slay d2.label, stack(f.amount) "
            "no-cap facts lowkey f "
@@ -227,9 +246,19 @@ std::string sqliteQuery(const Options& options) {
     if (options.workload == "scan") {
         return "SELECT COUNT(*) FROM users WHERE active = 1";
     }
+    if (options.workload == "count_miss") {
+        return "SELECT COUNT(*) FROM users WHERE id > " +
+               std::to_string(options.rows + 1000);
+    }
     if (options.workload == "aggregate") {
         return "SELECT category, SUM(score) FROM users "
                "WHERE active = 1 GROUP BY category";
+    }
+    if (options.workload == "join_miss") {
+        return "SELECT COUNT(*) "
+               "FROM facts AS f "
+               "JOIN dimension_one AS d1 ON f.d1_id = d1.id "
+               "JOIN dimension_two AS d2 ON f.d2_id = d2.id";
     }
     return "SELECT d2.label, SUM(f.amount) "
            "FROM facts AS f "
@@ -281,7 +310,9 @@ void seedSqliteUsers(sqlite3* database, int rowCount) {
     sqliteExecute(database, "COMMIT");
 }
 
-void seedSqliteJoin(sqlite3* database, int rowCount) {
+void seedSqliteJoin(sqlite3* database,
+                    int rowCount,
+                    bool missDimensionTwo = false) {
     sqliteExecute(database,
         "CREATE TABLE facts("
         "id INTEGER PRIMARY KEY, d1_id INTEGER NOT NULL, "
@@ -330,7 +361,11 @@ void seedSqliteJoin(sqlite3* database, int rowCount) {
     for (int id = 1; id <= rowCount; ++id) {
         sqlite3_bind_int(fact, 1, id);
         sqlite3_bind_int(fact, 2, (id - 1) % d1Rows + 1);
-        sqlite3_bind_int(fact, 3, (id - 1) % 10 + 1);
+        sqlite3_bind_int(
+            fact, 3,
+            missDimensionTwo
+                ? 1010 + (id % 10)
+                : (id - 1) % 10 + 1);
         sqlite3_bind_int(fact, 4, id % 100);
         sqlite3_step(fact);
         sqlite3_reset(fact);
@@ -392,6 +427,12 @@ void printResult(const Options& options,
     if (stats) {
         std::cout << ",\"vectorized_queries\":"
                   << stats->vectorizedQueries
+                  << ",\"buffer_capacity_pages\":"
+                  << stats->bufferCapacityPages
+                  << ",\"buffer_page_reads\":"
+                  << stats->bufferPageReads
+                  << ",\"buffer_evictions\":"
+                  << stats->bufferEvictions
                   << ",\"vector_batches\":" << stats->vectorBatches
                   << ",\"decoded_columns\":"
                   << stats->decodedColumns
@@ -399,10 +440,56 @@ void printResult(const Options& options,
                   << stats->skippedColumns
                   << ",\"vector_nulls\":"
                   << stats->vectorNulls
+                  << ",\"direct_aggregate_queries\":"
+                  << stats->directAggregateQueries
+                  << ",\"raw_rows_scanned\":"
+                  << stats->rawRowsScanned
+                  << ",\"row_copies_avoided\":"
+                  << stats->rowCopiesAvoided
+                  << ",\"min_max_filters_checked\":"
+                  << stats->minMaxFiltersChecked
+                  << ",\"min_max_scans_skipped\":"
+                  << stats->minMaxScansSkipped
+                  << ",\"min_max_rows_skipped\":"
+                  << stats->minMaxRowsSkipped
+                  << ",\"min_max_statistics_built\":"
+                  << stats->minMaxStatisticsBuilt
+                  << ",\"min_max_build_rows\":"
+                  << stats->minMaxBuildRows
+                  << ",\"streaming_aggregate_queries\":"
+                  << stats->streamingAggregateQueries
+                  << ",\"streaming_aggregate_rows\":"
+                  << stats->streamingAggregateRows
+                  << ",\"rowid_seek_join_queries\":"
+                  << stats->rowIdSeekJoinQueries
+                  << ",\"rowid_seek_join_base_rows\":"
+                  << stats->rowIdSeekJoinBaseRows
+                  << ",\"rowid_seek_join_lookups\":"
+                  << stats->rowIdSeekJoinLookups
+                  << ",\"rowid_seek_join_misses\":"
+                  << stats->rowIdSeekJoinMisses
+                  << ",\"virtual_memory_scan_queries\":"
+                  << stats->virtualMemoryScanQueries
+                  << ",\"virtual_memory_rows_scanned\":"
+                  << stats->virtualMemoryRowsScanned
+                  << ",\"virtual_memory_rowid_reads\":"
+                  << stats->virtualMemoryRowIdReads
+                  << ",\"join_domain_filters_checked\":"
+                  << stats->joinDomainFiltersChecked
+                  << ",\"join_domain_scans_skipped\":"
+                  << stats->joinDomainScansSkipped
+                  << ",\"join_domain_rows_skipped\":"
+                  << stats->joinDomainRowsSkipped
                   << ",\"join_plans_enumerated\":"
                   << stats->joinPlansEnumerated
                   << ",\"join_order_changes\":"
                   << stats->joinOrderChanges
+                  << ",\"bloom_filter_builds\":"
+                  << stats->bloomFilterBuilds
+                  << ",\"bloom_filter_checks\":"
+                  << stats->bloomFilterChecks
+                  << ",\"bloom_filter_rejects\":"
+                  << stats->bloomFilterRejects
                   << ",\"hash_join_probes\":"
                   << stats->hashJoinProbes;
     }
@@ -425,8 +512,11 @@ int main(int argc, char** argv) {
             NativeEngine engine(
                 root / "native",
                 static_cast<std::size_t>(options.bufferPages));
-            if (options.workload == "join") {
-                seedNativeJoin(engine, options.rows);
+            if (options.workload == "join" ||
+                options.workload == "join_miss") {
+                seedNativeJoin(
+                    engine, options.rows,
+                    options.workload == "join_miss");
             } else {
                 createUsers(engine);
                 insertNativeUsers(engine, options.rows);
@@ -460,8 +550,11 @@ int main(int argc, char** argv) {
                 "PRAGMA journal_mode=OFF;"
                 "PRAGMA synchronous=OFF;"
                 "PRAGMA temp_store=MEMORY");
-            if (options.workload == "join") {
-                seedSqliteJoin(database, options.rows);
+            if (options.workload == "join" ||
+                options.workload == "join_miss") {
+                seedSqliteJoin(
+                    database, options.rows,
+                    options.workload == "join_miss");
             } else {
                 seedSqliteUsers(database, options.rows);
             }

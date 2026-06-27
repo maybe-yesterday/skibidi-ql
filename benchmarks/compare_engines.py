@@ -10,8 +10,10 @@ import subprocess
 DEFAULT_ITERATIONS = {
     "point": 10_000,
     "scan": 100,
+    "count_miss": 100,
     "aggregate": 100,
     "join": 10,
+    "join_miss": 10,
 }
 
 

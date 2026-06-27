@@ -5,6 +5,7 @@
 #include "native_index.h"
 #include "native_storage.h"
 
+#include <array>
 #include <filesystem>
 #include <cstdint>
 #include <memory>
@@ -22,11 +23,17 @@ struct NativeQueryResult {
 
 struct NativeEngineStats {
     std::size_t residentPages = 0;
+    std::size_t bufferCapacityPages = 0;
+    std::size_t bufferPageReads = 0;
+    std::size_t bufferEvictions = 0;
     std::size_t tableScans = 0;
     std::size_t rowsRead = 0;
     std::size_t rowsWritten = 0;
     std::size_t nestedLoopComparisons = 0;
     std::size_t hashJoinProbes = 0;
+    std::size_t bloomFilterBuilds = 0;
+    std::size_t bloomFilterChecks = 0;
+    std::size_t bloomFilterRejects = 0;
     std::size_t indexLookups = 0;
     std::size_t vectorizedQueries = 0;
     std::size_t vectorBatches = 0;
@@ -34,6 +41,26 @@ struct NativeEngineStats {
     std::size_t decodedColumns = 0;
     std::size_t skippedColumns = 0;
     std::size_t vectorNulls = 0;
+    std::size_t directAggregateQueries = 0;
+    std::size_t rawRowsScanned = 0;
+    std::size_t rowCopiesAvoided = 0;
+    std::size_t minMaxFiltersChecked = 0;
+    std::size_t minMaxScansSkipped = 0;
+    std::size_t minMaxRowsSkipped = 0;
+    std::size_t minMaxStatisticsBuilt = 0;
+    std::size_t minMaxBuildRows = 0;
+    std::size_t streamingAggregateQueries = 0;
+    std::size_t streamingAggregateRows = 0;
+    std::size_t rowIdSeekJoinQueries = 0;
+    std::size_t rowIdSeekJoinBaseRows = 0;
+    std::size_t rowIdSeekJoinLookups = 0;
+    std::size_t rowIdSeekJoinMisses = 0;
+    std::size_t virtualMemoryScanQueries = 0;
+    std::size_t virtualMemoryRowsScanned = 0;
+    std::size_t virtualMemoryRowIdReads = 0;
+    std::size_t joinDomainFiltersChecked = 0;
+    std::size_t joinDomainScansSkipped = 0;
+    std::size_t joinDomainRowsSkipped = 0;
     std::size_t joinPlansEnumerated = 0;
     std::size_t joinOrderChanges = 0;
     double estimatedJoinCost = 0.0;
@@ -42,7 +69,7 @@ struct NativeEngineStats {
 class NativeEngine {
 public:
     explicit NativeEngine(std::filesystem::path databasePath,
-                          std::size_t bufferPages = 128);
+                          std::size_t bufferPages = 1024);
     ~NativeEngine();
 
     NativeEngine(const NativeEngine&) = delete;
@@ -119,8 +146,21 @@ private:
     };
 
     struct TableStatistics {
+        struct ColumnRange {
+            bool present = false;
+            Value min = Value::null();
+            Value max = Value::null();
+            std::size_t nonNullCount = 0;
+            bool numeric = false;
+            std::array<double, 5> rawMoments{};
+            std::array<std::size_t, 16> buckets{};
+            double bucketMin = 0.0;
+            double bucketMax = 0.0;
+        };
+
         std::size_t rowCount = 0;
         std::unordered_map<std::string, std::size_t> distinctCounts;
+        std::unordered_map<std::string, ColumnRange> columnRanges;
     };
 
     std::filesystem::path root_;
@@ -130,6 +170,7 @@ private:
     std::unordered_map<std::string, std::unique_ptr<BPlusTree>>
         primaryIndexes_;
     std::unordered_map<std::string, TableStatistics> tableStatistics_;
+    std::unordered_map<std::string, MappedHeapFile> mappedHeaps_;
     mutable NativeEngineStats stats_;
     bool transactionActive_ = false;
     std::unordered_map<std::string, std::vector<std::uint8_t>>
@@ -141,6 +182,10 @@ private:
     NativeQueryResult executeUpdate(const UpdateStmt& statement);
     NativeQueryResult executeDelete(const DeleteStmt& statement);
     NativeQueryResult executeSelect(const SelectStmt& statement);
+    std::optional<NativeQueryResult> executeDirectAggregateSelect(
+        const SelectStmt& statement);
+    std::optional<NativeQueryResult> executeRowIdSeekJoinAggregateSelect(
+        const SelectStmt& statement);
     std::optional<NativeQueryResult> executeVectorizedSelect(
         const SelectStmt& statement);
     std::optional<std::vector<EvalRow>> executeCostBasedJoins(
@@ -160,6 +205,11 @@ private:
                                           const std::string& alias,
                                           const Value& key);
     BPlusTree& primaryIndex(const std::string& table);
+    MappedHeapFile& mappedHeap(const std::string& table);
+    void invalidateMappedHeap(const std::string& table);
+    const TableStatistics::ColumnRange& ensureColumnRange(
+        const std::string& table,
+        const std::string& column);
     std::optional<Value> primaryKeyPredicate(
         const std::string& table,
         const std::string& alias,
