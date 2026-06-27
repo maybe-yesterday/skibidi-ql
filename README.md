@@ -21,24 +21,7 @@ same 10,000 rows and warm caches:
 | Skewed three-table join | 10 | 97.5 ms | 51.0 ms | SQLite 1.9x faster | 7.4 / 5.2 MiB |
 | Miss-heavy three-table join | 10 | <0.1 ms | 4.4 ms | Native metadata skip | 7.0 / 4.8 MiB |
 
-SQLite's scan advantage is not primarily a B-tree story for these workloads:
-`COUNT(*) WHERE active = 1` is a table scan with a tight `Column -> Ne ->
-AggStep` opcode loop. The native engine now has a direct raw aggregate scan and
-a 1024-page default buffer pool; the old 128-page default thrashed this
-benchmark table and made the filtered count scan about 9x slower. Cached
-table-level min/max ranges can skip impossible filtered counts entirely, while
-Bloom filters prune hash-join probes when many join keys miss. Join-shaped
-aggregates can now use a SQLite-style rowid-seek loop: scan the fact table,
-seek joined primary-key rows, decode only referenced columns, and run aggregate
-steps immediately. That loop uses cached read-only virtual-memory mappings for
-heap reads when available, avoiding buffer-pool page guards in the hot join
-path. Min/max join-domain pruning detects disjoint inner-join key ranges and
-returns empty aggregate results without scanning. A 10-iteration matching join
-spot check hit `rowid_seek_join_queries=10`,
-`rowid_seek_join_lookups=200000`, `virtual_memory_scan_queries=10`,
-`virtual_memory_rowid_reads=100000`, and `hash_join_probes=0`; the miss-heavy
-join hit `join_domain_scans_skipped=10` and `rowid_seek_join_lookups=0`. See
-[Benchmarks](#benchmarks) and
+See [Benchmarks](#benchmarks) and
 [benchmarks/optimization_notes.md](benchmarks/optimization_notes.md) for
 reproduction details.
 
