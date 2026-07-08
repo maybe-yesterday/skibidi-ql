@@ -48,6 +48,20 @@ reproduction details.
 | `ratio` | `DELETE FROM` | Delete rows |
 | `manifest` | `CREATE TABLE` | Create table |
 | `rizz-down` | `DROP TABLE` | Drop table |
+| `manifest-snapshot` | `CREATE SNAPSHOT` | Freeze a reproducible training dataset |
+| `manifest-dataset` | `CREATE DATASET` | Alias for `manifest-snapshot` |
+| `with-seed` | `WITH SEED` | Snapshot/shuffle seed |
+| `ship-torch` | `EXPORT TORCH` | Build a deterministic PyTorch batch plan |
+| `export-torch` | `EXPORT TORCH` | Plain alias for `ship-torch` |
+| `spill-batch` | `EXPLAIN BATCH` | Explain batch provenance / resume token |
+| `explain-batch` | `EXPLAIN BATCH` | Plain alias for `spill-batch` |
+| `batch-size` | `BATCH_SIZE` | Batched training export size |
+| `world-size` | `WORLD_SIZE` | Distributed training replica count |
+| `manifest-context` | `CREATE CONTEXT` | Create a prompt-context log |
+| `yeet-memory` | `APPEND MEMORY` | Append a message and extract semantic atoms |
+| `spill-context` | `SPILL CONTEXT` | Render the maintained current context view |
+| `token-budget` | `TOKEN_BUDGET` | Context-view rendering budget |
+| `vibe-tab` | `TAG MEMORY` | Topic tab / namespace for prompt context |
 | `lowkey` | `AS` | Alias |
 | `plus` | `AND` | Logical AND |
 | `or-nah` | `OR` | Logical OR |
@@ -169,6 +183,178 @@ skibidi> .commit
 ```
 
 Use `.rollback` to restore the database to its state at `.begin`.
+
+### Training Snapshots
+
+SkibidiQL can now act like a tiny database-backed training dataset engine. The
+main-character move is `manifest-snapshot`: it runs a source query once, freezes
+the included native row IDs, assigns deterministic train/validation/test splits,
+stores the seed, feature schema, label schema, schema fingerprint, table
+version, and leakage warnings in the native catalog.
+
+```skql
+manifest-snapshot train_v1 lowkey
+slay age, country, clicked, user_id
+no-cap events
+only-if ts < '2026-01-01'
+split-by user_id
+with-seed 42
+features (
+    age FLOAT NORMALIZE ZSCORE,
+    country CATEGORICAL ENCODE DICT
+)
+label clicked INT;
+```
+
+The SQL-ish spelling also works (for older folks):
+
+```sql
+CREATE SNAPSHOT train_v1 AS
+SELECT age, country, clicked, user_id
+FROM events
+WHERE ts < '2026-01-01'
+SPLIT BY user_id
+WITH SEED 42
+FEATURES (age FLOAT NORMALIZE ZSCORE, country CATEGORICAL ENCODE DICT)
+LABEL clicked INT;
+```
+
+For training, ask for a deterministic PyTorch plan:
+
+```skql
+ship-torch train_v1
+batch-size 256
+shuffle deterministic
+epoch 3
+rank 0
+world-size 8;
+```
+
+Batch provenance is first-class, so a loss spike can be traced back to raw rows:
+
+```skql
+spill-batch train_v1 batch-size 256 epoch 3 batch 1042 rank 0 world-size 8;
+```
+
+The result includes sample count, source `page:slot` row IDs, feature columns,
+label distribution, split, seed, rank/world-size, worker, and a resume token.
+The deterministic sampler is:
+
+```text
+epoch + global sample + rank/world-size -> stable row id order
+```
+
+Use `split-by user_id` for non-sus user-level splits. `split-by random by row`
+is accepted, but if a `user_id` column exists and the same user lands in
+multiple splits, the snapshot reports a leakage warning.
+
+The tiny Python reader lives under `python/tensorql`:
+
+```bash
+python -m pip install -e python/tensorql
+```
+
+```python
+from tensorql import TensorQLDataset
+from torch.utils.data import DataLoader
+
+ds = TensorQLDataset("mydata", dataset="train_v1", batch_size=256, epoch=3)
+loader = DataLoader(ds, batch_size=None, num_workers=4)
+```
+
+`TensorQLDataset` yields already-batched records with `features`, `label`,
+`rowid`, `snapshot`, `split`, `epoch`, and `rank`. Numeric columns become
+PyTorch tensors when PyTorch is installed; text/blob columns stay as Python
+lists for now.
+
+### Prompt Views
+
+SkibidiQL also has a small prototype for the idea:
+
+> Prompt context should be a maintained database view over an append-only
+> conversation log, not raw chat history.
+
+The core loop is:
+
+```text
+raw messages
+  -> semantic atoms
+  -> invalidation / provenance
+  -> token-budgeted current context view
+```
+
+Create a context log:
+
+```skql
+manifest-context convo_123;
+```
+
+Append messages. The current prototype uses deterministic rule extraction for
+obvious facts/preferences/constraints/tasks, which keeps the demo inspectable:
+
+```skql
+yeet-memory convo_123 drip
+    (1, 'user', 'I live in Seattle.');
+
+yeet-memory convo_123 drip
+    (88, 'user', 'Actually I moved to NYC.');
+```
+
+The second message extracts `user_location=NYC` and invalidates the older
+`user_location=Seattle` atom. Render the current prompt view:
+
+```skql
+spill-context convo_123
+only-if 'Find restaurants near me'
+token-budget 200
+receipts on;
+```
+
+Example fields:
+
+```text
+field=current_context | value=fact user_location=NYC @message_88
+field=invalidated | value=user_location=Seattle @message_1 invalidated_by=message_88
+field=token_budget | value=200
+field=token_cost | value=8
+```
+
+This is intentionally not “RAG but with chat logs.” The database bit is view
+maintenance: active/invalidated atoms, provenance, contradiction handling, and
+budget-aware rendering. The prototype persists contexts in the native catalog
+alongside tables and snapshots.
+
+Topic tabs are first-class too. An agent can put memories in an explicit
+`vibe-tab`, query only that tab, or move a message later when the convo
+forks into a new mini-arc:
+
+```skql
+yeet-memory convo_123 drip
+    (7, 'user', 'My dog likes salmon.')
+vibe-tab 'convo about dog';
+
+spill-context convo_123
+vibe-tab 'convo about dog'
+only-if 'what does my dog like?'
+token-budget 200
+receipts on;
+
+vibe-tab convo_123 message 88 'travel';
+```
+
+Under the hood, messages and extracted atoms both store the tab. `spill-context`
+filters atoms by tab before ranking/rendering, and retagging recomputes
+per-tab invalidation so `main` does not stay haunted by facts moved elsewhere.
+Tiny but real agent-memory affordance: the LLM can choose a label like
+`convo about dog`, save it, then ask for only that slice later.
+
+Plain aliases also work:
+
+```sql
+CREATE CONTEXT convo_123;
+APPEND MEMORY convo_123 drip (1, 'user', 'I live in Seattle.');
+SPILL CONTEXT convo_123 query 'Find restaurants near me' token_budget 200;
+```
 
 ### Transpile Only (No Execution)
 
@@ -366,6 +552,10 @@ Source Text
     v
 [Metadata Catalog] (metadata.h / metadata.cpp)
     - Tracks schema in .skibidi_catalog.json
+    - Tracks TensorQL snapshots: query text, seed, schema fingerprint,
+      row IDs, split assignment, feature specs, label spec, and warnings
+    - Tracks ContextQL logs: messages, semantic atoms, active/invalidated
+      status, invalidation provenance, and rendered prompt-view metadata
     - Updated after successful CREATE TABLE / DROP TABLE execution
     - Validates column references (best-effort)
     - Exposes revision and schema fingerprint metadata
@@ -396,6 +586,10 @@ Source Text
     v
 [Native Physical Engine] (native_engine.h / native_engine.cpp)
     - Indexed and heap access paths
+    - Training snapshot materialization with deterministic splits
+    - Deterministic distributed batch planning for PyTorch-style loaders
+    - Batch provenance explain output for row-level debugging/resume tokens
+    - ContextQL append/extract/invalidate/render loop for prompt views
     - Direct raw aggregate scans for simple count/sum/min/max/avg workloads
     - Rowid-seek join aggregate loop for fact-to-primary-key joins
     - Cached read-only virtual-memory heap views for seek-heavy reads
@@ -455,6 +649,14 @@ This is NOT yet a production database:
   vector decoder materialize only referenced fields, but the engine does not
   yet use a columnar storage format, SIMD intrinsics, or generated machine
   code.
+- `manifest-snapshot` currently snapshots one native table with an optional
+  filter. Arbitrary join/materialized-transform snapshots are the next layer.
+  The Python `TensorQLDataset` reader returns batched tensors for numeric
+  fields and keeps text/blob fields as lists.
+- ContextQL extraction is currently deterministic rule-based NLP for a tiny
+  set of demo patterns (`user_location`, preferences, constraints, tasks).
+  The database semantics are real; broad semantic extraction and learned
+  relevance scoring are future work.
 
 Those boundaries are intentionally isolated behind the storage and execution
 interfaces, making WAL, locking, persisted indexes/statistics, broader

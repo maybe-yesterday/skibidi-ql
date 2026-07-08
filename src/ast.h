@@ -20,6 +20,13 @@ struct UpdateStmt;
 struct DeleteStmt;
 struct CreateStmt;
 struct DropStmt;
+struct CreateSnapshotStmt;
+struct ExportTorchStmt;
+struct ExplainBatchStmt;
+struct CreateContextStmt;
+struct AppendMemoryStmt;
+struct SpillContextStmt;
+struct TagMemoryStmt;
 
 // -----------------------------------------------------------------------
 // Visitor base
@@ -39,6 +46,13 @@ struct ASTVisitor {
     virtual void visit(DeleteStmt&) = 0;
     virtual void visit(CreateStmt&) = 0;
     virtual void visit(DropStmt&) = 0;
+    virtual void visit(CreateSnapshotStmt&) = 0;
+    virtual void visit(ExportTorchStmt&) = 0;
+    virtual void visit(ExplainBatchStmt&) = 0;
+    virtual void visit(CreateContextStmt&) = 0;
+    virtual void visit(AppendMemoryStmt&) = 0;
+    virtual void visit(SpillContextStmt&) = 0;
+    virtual void visit(TagMemoryStmt&) = 0;
 };
 
 // -----------------------------------------------------------------------
@@ -509,6 +523,182 @@ struct DropStmt : ASTNode {
         n->table = table;
         n->ifExists = ifExists;
         n->line = line; n->col = col;
+        return n;
+    }
+};
+
+// -----------------------------------------------------------------------
+// Training dataset metadata: manifest-dataset / export-torch / explain-batch
+// -----------------------------------------------------------------------
+struct FeatureSpec {
+    std::string name;
+    std::string spec;
+};
+
+struct CreateSnapshotStmt : ASTNode {
+    std::string name;
+    std::unique_ptr<SelectStmt> source;
+    std::string splitBy;
+    unsigned long long seed = 0;
+    std::vector<FeatureSpec> features;
+    FeatureSpec label;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "CreateSnapshotStmt(" << name << ")\n";
+        if (source) {
+            printIndent(os, indent + 1);
+            os << "SOURCE:\n";
+            source->print(os, indent + 2);
+        }
+        printIndent(os, indent + 1);
+        os << "SPLIT BY: " << splitBy << "\n";
+        printIndent(os, indent + 1);
+        os << "SEED: " << seed << "\n";
+        printIndent(os, indent + 1);
+        os << "FEATURES:";
+        for (const auto& feature : features) {
+            os << " " << feature.name;
+            if (!feature.spec.empty()) os << "(" << feature.spec << ")";
+        }
+        os << "\n";
+        printIndent(os, indent + 1);
+        os << "LABEL: " << label.name;
+        if (!label.spec.empty()) os << "(" << label.spec << ")";
+        os << "\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<CreateSnapshotStmt>();
+        n->name = name;
+        n->splitBy = splitBy;
+        n->seed = seed;
+        n->features = features;
+        n->label = label;
+        n->line = line; n->col = col;
+        if (source) {
+            n->source = std::unique_ptr<SelectStmt>(
+                static_cast<SelectStmt*>(source->clone().release()));
+        }
+        return n;
+    }
+};
+
+struct ExportTorchStmt : ASTNode {
+    std::string dataset;
+    unsigned long long batchSize = 256;
+    bool deterministicShuffle = true;
+    unsigned long long epoch = 0;
+    unsigned long long rank = 0;
+    unsigned long long worldSize = 1;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "ExportTorchStmt(" << dataset << ", batch-size "
+           << batchSize << ", epoch " << epoch << ", rank " << rank
+           << "/" << worldSize << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ExportTorchStmt>(*this);
+        return n;
+    }
+};
+
+struct ExplainBatchStmt : ASTNode {
+    std::string dataset;
+    unsigned long long batchSize = 256;
+    unsigned long long epoch = 0;
+    unsigned long long batch = 0;
+    unsigned long long rank = 0;
+    unsigned long long worldSize = 1;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "ExplainBatchStmt(" << dataset << ", batch " << batch
+           << ", batch-size " << batchSize << ", epoch " << epoch
+           << ", rank " << rank << "/" << worldSize << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ExplainBatchStmt>(*this);
+        return n;
+    }
+};
+
+// -----------------------------------------------------------------------
+// ContextQL: prompt context as a maintained database view
+// -----------------------------------------------------------------------
+struct CreateContextStmt : ASTNode {
+    std::string name;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "CreateContextStmt(" << name << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<CreateContextStmt>(*this);
+        return n;
+    }
+};
+
+struct AppendMemoryStmt : ASTNode {
+    std::string context;
+    unsigned long long messageId = 0;
+    std::string speaker;
+    std::string text;
+    std::string tab;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "AppendMemoryStmt(" << context << ", message "
+           << messageId << ", " << speaker;
+        if (!tab.empty()) os << ", tab " << tab;
+        os << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<AppendMemoryStmt>(*this);
+        return n;
+    }
+};
+
+struct SpillContextStmt : ASTNode {
+    std::string context;
+    std::string query;
+    std::string tab;
+    unsigned long long tokenBudget = 1200;
+    bool receipts = true;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "SpillContextStmt(" << context << ", token-budget "
+           << tokenBudget << ", receipts "
+           << (receipts ? "on" : "off");
+        if (!tab.empty()) os << ", tab " << tab;
+        os << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<SpillContextStmt>(*this);
+        return n;
+    }
+};
+
+struct TagMemoryStmt : ASTNode {
+    std::string context;
+    unsigned long long messageId = 0;
+    std::string tab;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "TagMemoryStmt(" << context << ", message "
+           << messageId << ", tab " << tab << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<TagMemoryStmt>(*this);
         return n;
     }
 };

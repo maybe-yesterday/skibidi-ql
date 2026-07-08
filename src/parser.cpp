@@ -1,6 +1,56 @@
 #include "parser.h"
+#include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <sstream>
 #include <stdexcept>
+
+namespace {
+
+std::string lowerCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    return value;
+}
+
+bool wordEquals(const Token& token, const std::string& value) {
+    return token.type == TokenType::IDENTIFIER &&
+           lowerCopy(token.value) == lowerCopy(value);
+}
+
+bool isClauseBoundary(const Token& token) {
+    if (token.type == TokenType::SEMICOLON ||
+        token.type == TokenType::EOF_TOKEN ||
+        token.type == TokenType::COMMA ||
+        token.type == TokenType::RPAREN) {
+        return true;
+    }
+    if (token.type == TokenType::SPLIT_BY ||
+        token.type == TokenType::WITH_SEED ||
+        token.type == TokenType::BATCH_SIZE ||
+        token.type == TokenType::WORLD_SIZE) {
+        return true;
+    }
+    if (token.type == TokenType::IDENTIFIER) {
+        const std::string word = lowerCopy(token.value);
+        return word == "seed" || word == "with" ||
+               word == "features" || word == "feature" ||
+               word == "label" || word == "shuffle" ||
+               word == "epoch" || word == "rank" ||
+               word == "worker" || word == "batch" ||
+               word == "world_size" || word == "batch_size";
+    }
+    return false;
+}
+
+std::string tokenText(const Token& token) {
+    if (token.type == TokenType::STRING_LIT) return "'" + token.value + "'";
+    return token.value;
+}
+
+} // namespace
 
 // -----------------------------------------------------------------------
 // Constructor / helpers
@@ -44,6 +94,33 @@ const Token& Parser::expect(TokenType t, const std::string& msg) {
     return advance();
 }
 
+bool Parser::checkWord(const std::string& value) const {
+    return wordEquals(current(), value);
+}
+
+bool Parser::matchWord(const std::string& value) {
+    if (!checkWord(value)) return false;
+    advance();
+    return true;
+}
+
+const Token& Parser::expectWord(const std::string& value,
+                                const std::string& msg) {
+    if (!checkWord(value)) {
+        throw ParseError(msg + " (got '" + current().value + "')",
+                         current().line,
+                         current().col);
+    }
+    return advance();
+}
+
+const Token& Parser::expectName(const std::string& msg) {
+    if (current().type == TokenType::IDENTIFIER) return advance();
+    throw ParseError(msg + " (got '" + current().value + "')",
+                     current().line,
+                     current().col);
+}
+
 // -----------------------------------------------------------------------
 // Top-level parse
 // -----------------------------------------------------------------------
@@ -68,8 +145,46 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
         case TokenType::RATIO:     stmt = parseDelete(); break;
         case TokenType::MANIFEST:  stmt = parseCreate(); break;
         case TokenType::RIZZ_DOWN: stmt = parseDrop();   break;
+        case TokenType::MANIFEST_DATASET:
+        case TokenType::MANIFEST_SNAPSHOT:
+            stmt = parseCreateSnapshot(); break;
+        case TokenType::EXPORT_TORCH:
+        case TokenType::SHIP_TORCH:
+            stmt = parseExportTorch(); break;
+        case TokenType::EXPLAIN_BATCH:
+        case TokenType::SPILL_BATCH:
+            stmt = parseExplainBatch(); break;
+        case TokenType::MANIFEST_CONTEXT:
+            stmt = parseCreateContext(); break;
+        case TokenType::YEET_MEMORY:
+            stmt = parseAppendMemory(); break;
+        case TokenType::SPILL_CONTEXT:
+            stmt = parseSpillContext(); break;
+        case TokenType::VIBE_TAB:
+            stmt = parseTagMemory(); break;
         default:
-            throw ParseError("Expected statement keyword (slay, yeet-into, glow-up, ratio, manifest, rizz-down)", tok.line, tok.col);
+            if (checkWord("create") &&
+                (wordEquals(peek(1), "dataset") ||
+                 wordEquals(peek(1), "snapshot"))) {
+                stmt = parseCreateSnapshot();
+            } else if (checkWord("create") &&
+                       wordEquals(peek(1), "context")) {
+                stmt = parseCreateContext();
+            } else if (checkWord("append") &&
+                       wordEquals(peek(1), "memory")) {
+                stmt = parseAppendMemory();
+            } else if (checkWord("tag") &&
+                       wordEquals(peek(1), "memory")) {
+                stmt = parseTagMemory();
+            } else if (checkWord("export") && wordEquals(peek(1), "torch")) {
+                stmt = parseExportTorch();
+            } else if (checkWord("explain") && wordEquals(peek(1), "batch")) {
+                stmt = parseExplainBatch();
+            } else if (checkWord("spill") && wordEquals(peek(1), "context")) {
+                stmt = parseSpillContext();
+            } else {
+                throw ParseError("Expected statement keyword (slay, yeet-into, glow-up, ratio, manifest, rizz-down, manifest-snapshot, ship-torch, spill-batch, manifest-context, yeet-memory, spill-context, vibe-tab)", tok.line, tok.col);
+            }
     }
 
     // Consume optional semicolon
@@ -264,6 +379,264 @@ std::unique_ptr<DropStmt> Parser::parseDrop() {
 }
 
 // -----------------------------------------------------------------------
+// CREATE SNAPSHOT / DATASET
+// Native spelling:
+//   manifest-snapshot train_v1 lowkey slay ... split-by user_id
+//     with-seed 42 features (...) label clicked INT
+// SQL-ish alias:
+//   CREATE SNAPSHOT train_v1 AS SELECT ... SPLIT BY user_id WITH SEED 42
+// -----------------------------------------------------------------------
+std::unique_ptr<CreateSnapshotStmt> Parser::parseCreateSnapshot() {
+    auto stmt = std::make_unique<CreateSnapshotStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::MANIFEST_DATASET) ||
+        match(TokenType::MANIFEST_SNAPSHOT)) {
+        // already consumed native keyword
+    } else {
+        expectWord("create", "Expected 'create'");
+        if (matchWord("dataset") || matchWord("snapshot")) {
+            // consumed plain alias
+        } else {
+            throw ParseError(
+                "Expected 'dataset' or 'snapshot' after CREATE",
+                current().line,
+                current().col);
+        }
+    }
+
+    stmt->name = expectName("Expected snapshot name").value;
+    if (!match(TokenType::LOWKEY) && !matchWord("as")) {
+        throw ParseError("Expected 'lowkey'/'as' before snapshot query",
+                         current().line,
+                         current().col);
+    }
+
+    stmt->source = parseSelect();
+
+    while (!check(TokenType::SEMICOLON) &&
+           !check(TokenType::EOF_TOKEN)) {
+        if (match(TokenType::SPLIT_BY) || matchWord("split")) {
+            (void)matchWord("by");
+            if (matchWord("random")) {
+                (void)matchWord("by");
+            }
+            stmt->splitBy = expectName("Expected split key").value;
+            continue;
+        }
+        if (match(TokenType::WITH_SEED) || matchWord("seed")) {
+            stmt->seed = parseUnsignedOption("seed");
+            continue;
+        }
+        if (matchWord("with")) {
+            expectWord("seed", "Expected 'seed' after WITH");
+            stmt->seed = parseUnsignedOption("seed");
+            continue;
+        }
+        if (matchWord("features") || matchWord("feature")) {
+            stmt->features = parseFeatureSpecs();
+            continue;
+        }
+        if (matchWord("label")) {
+            stmt->label = parseLabelSpec();
+            continue;
+        }
+        throw ParseError("Expected snapshot clause (split-by, with-seed, features, label)",
+                         current().line,
+                         current().col);
+    }
+
+    return stmt;
+}
+
+// -----------------------------------------------------------------------
+// EXPORT TORCH / ship-torch
+// -----------------------------------------------------------------------
+std::unique_ptr<ExportTorchStmt> Parser::parseExportTorch() {
+    auto stmt = std::make_unique<ExportTorchStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::EXPORT_TORCH) || match(TokenType::SHIP_TORCH)) {
+        // native keyword
+    } else {
+        expectWord("export", "Expected 'export'");
+        expectWord("torch", "Expected 'torch'");
+    }
+
+    stmt->dataset = expectName("Expected snapshot name").value;
+    while (!check(TokenType::SEMICOLON) &&
+           !check(TokenType::EOF_TOKEN)) {
+        if (match(TokenType::BATCH_SIZE) || matchWord("batch_size")) {
+            stmt->batchSize = parseUnsignedOption("batch-size");
+        } else if (matchWord("shuffle")) {
+            stmt->deterministicShuffle = true;
+            (void)matchWord("deterministic");
+        } else if (matchWord("deterministic")) {
+            stmt->deterministicShuffle = true;
+        } else if (matchWord("epoch")) {
+            stmt->epoch = parseUnsignedOption("epoch");
+        } else if (matchWord("rank")) {
+            stmt->rank = parseUnsignedOption("rank");
+        } else if (match(TokenType::WORLD_SIZE) ||
+                   matchWord("world_size")) {
+            stmt->worldSize = parseUnsignedOption("world-size");
+        } else {
+            throw ParseError("Expected export option",
+                             current().line,
+                             current().col);
+        }
+    }
+    return stmt;
+}
+
+// -----------------------------------------------------------------------
+// EXPLAIN BATCH / spill-batch
+// -----------------------------------------------------------------------
+std::unique_ptr<ExplainBatchStmt> Parser::parseExplainBatch() {
+    auto stmt = std::make_unique<ExplainBatchStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::EXPLAIN_BATCH) || match(TokenType::SPILL_BATCH)) {
+        // native keyword
+    } else {
+        expectWord("explain", "Expected 'explain'");
+        expectWord("batch", "Expected 'batch'");
+    }
+
+    stmt->dataset = expectName("Expected snapshot name").value;
+    while (!check(TokenType::SEMICOLON) &&
+           !check(TokenType::EOF_TOKEN)) {
+        if (match(TokenType::BATCH_SIZE) || matchWord("batch_size")) {
+            stmt->batchSize = parseUnsignedOption("batch-size");
+        } else if (matchWord("epoch")) {
+            stmt->epoch = parseUnsignedOption("epoch");
+        } else if (matchWord("batch")) {
+            stmt->batch = parseUnsignedOption("batch");
+        } else if (matchWord("rank")) {
+            stmt->rank = parseUnsignedOption("rank");
+        } else if (match(TokenType::WORLD_SIZE) ||
+                   matchWord("world_size")) {
+            stmt->worldSize = parseUnsignedOption("world-size");
+        } else {
+            throw ParseError("Expected explain-batch option",
+                             current().line,
+                             current().col);
+        }
+    }
+    return stmt;
+}
+
+// -----------------------------------------------------------------------
+// ContextQL: manifest-context / yeet-memory / spill-context
+// -----------------------------------------------------------------------
+std::unique_ptr<CreateContextStmt> Parser::parseCreateContext() {
+    auto stmt = std::make_unique<CreateContextStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::MANIFEST_CONTEXT)) {
+        // native keyword
+    } else {
+        expectWord("create", "Expected 'create'");
+        expectWord("context", "Expected 'context'");
+    }
+    stmt->name = expectName("Expected context name").value;
+    return stmt;
+}
+
+std::unique_ptr<AppendMemoryStmt> Parser::parseAppendMemory() {
+    auto stmt = std::make_unique<AppendMemoryStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::YEET_MEMORY)) {
+        // native keyword
+    } else {
+        expectWord("append", "Expected 'append'");
+        expectWord("memory", "Expected 'memory'");
+    }
+
+    stmt->context = expectName("Expected context name").value;
+    expect(TokenType::DRIP, "Expected 'drip' before memory tuple");
+    expect(TokenType::LPAREN, "Expected '('");
+    stmt->messageId = parseUnsignedOption("message-id");
+    expect(TokenType::COMMA, "Expected ',' after message id");
+    stmt->speaker =
+        expect(TokenType::STRING_LIT, "Expected speaker string").value;
+    expect(TokenType::COMMA, "Expected ',' after speaker");
+    stmt->text =
+        expect(TokenType::STRING_LIT, "Expected message text").value;
+    expect(TokenType::RPAREN, "Expected ')'");
+    if (match(TokenType::VIBE_TAB) || matchWord("tab")) {
+        stmt->tab =
+            expect(TokenType::STRING_LIT, "Expected tab string").value;
+    }
+    return stmt;
+}
+
+std::unique_ptr<SpillContextStmt> Parser::parseSpillContext() {
+    auto stmt = std::make_unique<SpillContextStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::SPILL_CONTEXT)) {
+        // native keyword
+    } else {
+        expectWord("spill", "Expected 'spill'");
+        expectWord("context", "Expected 'context'");
+    }
+
+    stmt->context = expectName("Expected context name").value;
+    while (!check(TokenType::SEMICOLON) &&
+           !check(TokenType::EOF_TOKEN)) {
+        if (match(TokenType::ONLY_IF) || matchWord("query")) {
+            stmt->query =
+                expect(TokenType::STRING_LIT, "Expected query string").value;
+        } else if (match(TokenType::TOKEN_BUDGET) ||
+                   matchWord("token_budget")) {
+            stmt->tokenBudget = parseUnsignedOption("token-budget");
+        } else if (match(TokenType::VIBE_TAB) || matchWord("tab")) {
+            stmt->tab =
+                expect(TokenType::STRING_LIT, "Expected tab string").value;
+        } else if (matchWord("receipts")) {
+            if (matchWord("off")) {
+                stmt->receipts = false;
+            } else {
+                (void)matchWord("on");
+                stmt->receipts = true;
+            }
+        } else {
+            throw ParseError("Expected context option",
+                             current().line,
+                             current().col);
+        }
+    }
+    return stmt;
+}
+
+std::unique_ptr<TagMemoryStmt> Parser::parseTagMemory() {
+    auto stmt = std::make_unique<TagMemoryStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::VIBE_TAB)) {
+        // native keyword
+    } else {
+        expectWord("tag", "Expected 'tag'");
+        expectWord("memory", "Expected 'memory'");
+    }
+
+    stmt->context = expectName("Expected context name").value;
+    expectWord("message", "Expected 'message'");
+    stmt->messageId = parseUnsignedOption("message-id");
+    stmt->tab = expect(TokenType::STRING_LIT, "Expected tab string").value;
+    return stmt;
+}
+
+// -----------------------------------------------------------------------
 // Table ref: IDENTIFIER ['lowkey' IDENTIFIER]
 // -----------------------------------------------------------------------
 void Parser::parseTableRef(std::string& table, std::string& alias) {
@@ -422,6 +795,69 @@ ColumnDef Parser::parseColumnDef() {
     }
 
     return def;
+}
+
+std::vector<FeatureSpec> Parser::parseFeatureSpecs() {
+    std::vector<FeatureSpec> features;
+    if (match(TokenType::LPAREN)) {
+        if (check(TokenType::RPAREN)) {
+            advance();
+            return features;
+        }
+        features.push_back(parseFeatureSpec());
+        while (match(TokenType::COMMA)) {
+            if (check(TokenType::RPAREN)) break;
+            features.push_back(parseFeatureSpec());
+        }
+        expect(TokenType::RPAREN, "Expected ')' after feature list");
+        return features;
+    }
+
+    features.push_back(parseFeatureSpec());
+    return features;
+}
+
+FeatureSpec Parser::parseFeatureSpec() {
+    FeatureSpec feature;
+    feature.name = expectName("Expected feature column").value;
+
+    std::ostringstream spec;
+    bool first = true;
+    while (!isClauseBoundary(current())) {
+        if (!first) spec << " ";
+        spec << tokenText(current());
+        first = false;
+        advance();
+    }
+    feature.spec = spec.str();
+    return feature;
+}
+
+FeatureSpec Parser::parseLabelSpec() {
+    FeatureSpec label;
+    label.name = expectName("Expected label column").value;
+
+    std::ostringstream spec;
+    bool first = true;
+    while (!isClauseBoundary(current())) {
+        if (!first) spec << " ";
+        spec << tokenText(current());
+        first = false;
+        advance();
+    }
+    label.spec = spec.str();
+    return label;
+}
+
+unsigned long long Parser::parseUnsignedOption(const std::string& name) {
+    const Token& token = current();
+    if (token.type != TokenType::INTEGER_LIT) {
+        throw ParseError("Expected integer for " + name,
+                         token.line,
+                         token.col);
+    }
+    advance();
+    return static_cast<unsigned long long>(std::stoull(token.value));
 }
 
 // -----------------------------------------------------------------------

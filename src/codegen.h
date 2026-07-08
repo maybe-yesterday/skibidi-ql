@@ -17,6 +17,13 @@ private:
     std::string genDelete(const DeleteStmt* s);
     std::string genCreate(const CreateStmt* s);
     std::string genDrop(const DropStmt* s);
+    std::string genCreateSnapshot(const CreateSnapshotStmt* s);
+    std::string genExportTorch(const ExportTorchStmt* s);
+    std::string genExplainBatch(const ExplainBatchStmt* s);
+    std::string genCreateContext(const CreateContextStmt* s);
+    std::string genAppendMemory(const AppendMemoryStmt* s);
+    std::string genSpillContext(const SpillContextStmt* s);
+    std::string genTagMemory(const TagMemoryStmt* s);
     std::string genExpr(const ASTNode* node);
     std::string genFunctionCall(const FunctionCall* fc);
     std::string genWindowFunc(const WindowFunc* wf);

@@ -334,6 +334,77 @@ TEST(load_overwrites_existing_in_memory_state) {
     ASSERT_TRUE(cat.hasTable("users"));
 }
 
+TEST(save_and_load_training_snapshot) {
+    CatalogFileGuard guard;
+    {
+        Catalog cat;
+        cat.addTable(simpleTable("events"));
+        DatasetSnapshotMeta snapshot;
+        snapshot.name = "train_v1";
+        snapshot.queryText = "SELECT age, clicked FROM events";
+        snapshot.sourceTable = "events";
+        snapshot.schemaFingerprint = "123";
+        snapshot.tableVersion = "7";
+        snapshot.splitBy = "user_id";
+        snapshot.seed = 42;
+        snapshot.features.push_back({"age", "FLOAT NORMALIZE ZSCORE"});
+        snapshot.label = {"clicked", "INT"};
+        snapshot.rows.push_back({"0:0", "train"});
+        snapshot.rows.push_back({"0:1", "validation"});
+        snapshot.warnings.push_back("leakage-check sus");
+        cat.addSnapshot(snapshot);
+        cat.save();
+    }
+    {
+        Catalog cat;
+        cat.load();
+        ASSERT_TRUE(cat.hasSnapshot("train_v1"));
+        const auto* snapshot = cat.getSnapshot("train_v1");
+        ASSERT_TRUE(snapshot != nullptr);
+        ASSERT_EQ(snapshot->sourceTable, std::string("events"));
+        ASSERT_EQ(snapshot->splitBy, std::string("user_id"));
+        ASSERT_EQ(snapshot->seed, (std::uint64_t)42);
+        ASSERT_EQ(snapshot->features.size(), (size_t)1);
+        ASSERT_EQ(snapshot->features[0].name, std::string("age"));
+        ASSERT_EQ(snapshot->rows.size(), (size_t)2);
+        ASSERT_EQ(snapshot->warnings.size(), (size_t)1);
+    }
+}
+
+TEST(save_and_load_contextql_context) {
+    CatalogFileGuard guard;
+    {
+        Catalog cat;
+        ConversationContextMeta context;
+        context.name = "convo_123";
+        context.messages.push_back(
+            {1, "user", "I live in Seattle.", "main"});
+        context.messages.push_back(
+            {88, "user", "Actually I moved to NYC.", "travel"});
+        context.atoms.push_back(
+            {"user_location", "Seattle", "fact", "invalidated",
+             "message_1", "message_88", "main"});
+        context.atoms.push_back(
+            {"user_location", "NYC", "fact", "active",
+             "message_88", "", "travel"});
+        cat.addContext(context);
+        cat.save();
+    }
+    {
+        Catalog cat;
+        cat.load();
+        ASSERT_TRUE(cat.hasContext("convo_123"));
+        const auto* context = cat.getContext("convo_123");
+        ASSERT_TRUE(context != nullptr);
+        ASSERT_EQ(context->messages.size(), (size_t)2);
+        ASSERT_EQ(context->atoms.size(), (size_t)2);
+        ASSERT_EQ(context->messages[1].tab, std::string("travel"));
+        ASSERT_EQ(context->atoms[0].status, std::string("invalidated"));
+        ASSERT_EQ(context->atoms[1].value, std::string("NYC"));
+        ASSERT_EQ(context->atoms[1].tab, std::string("travel"));
+    }
+}
+
 int main() {
     return run_all_tests("Metadata");
 }

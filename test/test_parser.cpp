@@ -61,6 +61,48 @@ static DropStmt* asDrop(const std::unique_ptr<ASTNode>& node) {
     return s;
 }
 
+static CreateSnapshotStmt* asSnapshot(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<CreateSnapshotStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static ExportTorchStmt* asExportTorch(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<ExportTorchStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static ExplainBatchStmt* asExplainBatch(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<ExplainBatchStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static CreateContextStmt* asCreateContext(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<CreateContextStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static AppendMemoryStmt* asAppendMemory(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<AppendMemoryStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static SpillContextStmt* asSpillContext(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<SpillContextStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static TagMemoryStmt* asTagMemory(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<TagMemoryStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
 // -----------------------------------------------------------------------
 // parseAll() – basic
 // -----------------------------------------------------------------------
@@ -398,6 +440,99 @@ TEST(select_percentile_function) {
     auto* fc = dynamic_cast<FunctionCall*>(s->columns[0].get());
     ASSERT_EQ(fc->name, std::string("percent-check"));
     ASSERT_EQ(fc->args.size(), (size_t)2);
+}
+
+// -----------------------------------------------------------------------
+// TensorQL snapshots / batch provenance
+// -----------------------------------------------------------------------
+TEST(snapshot_manifest_parses_gen_z_training_dataset) {
+    auto stmt = parseOne(
+        "manifest-snapshot train_v1 lowkey "
+        "slay age, country, clicked no-cap events only-if ts < '2026-01-01' "
+        "split-by user_id with-seed 42 "
+        "features (age FLOAT NORMALIZE ZSCORE, "
+        "country CATEGORICAL ENCODE DICT) "
+        "label clicked INT;");
+    auto* s = asSnapshot(stmt);
+    ASSERT_EQ(s->name, std::string("train_v1"));
+    ASSERT_TRUE(s->source != nullptr);
+    ASSERT_EQ(s->source->fromTable, std::string("events"));
+    ASSERT_EQ(s->splitBy, std::string("user_id"));
+    ASSERT_EQ(s->seed, (unsigned long long)42);
+    ASSERT_EQ(s->features.size(), (size_t)2);
+    ASSERT_EQ(s->features[0].name, std::string("age"));
+    ASSERT_CONTAINS(s->features[0].spec, "FLOAT");
+    ASSERT_EQ(s->label.name, std::string("clicked"));
+    ASSERT_EQ(s->label.spec, std::string("INT"));
+}
+
+TEST(snapshot_manifest_accepts_plain_sqlish_alias) {
+    auto stmt = parseOne(
+        "CREATE SNAPSHOT train_v1 AS "
+        "SELECT age, clicked FROM events WHERE ts < '2026-01-01' "
+        "SPLIT BY user_id WITH SEED 42 "
+        "FEATURES (age FLOAT) LABEL clicked INT;");
+    auto* s = asSnapshot(stmt);
+    ASSERT_EQ(s->name, std::string("train_v1"));
+    ASSERT_EQ(s->source->fromTable, std::string("events"));
+    ASSERT_EQ(s->splitBy, std::string("user_id"));
+    ASSERT_EQ(s->seed, (unsigned long long)42);
+}
+
+TEST(ship_torch_and_spill_batch_parse) {
+    auto exportStmt = parseOne(
+        "ship-torch train_v1 batch-size 256 shuffle deterministic "
+        "epoch 3 rank 1 world-size 8;");
+    auto* exportTorch = asExportTorch(exportStmt);
+    ASSERT_EQ(exportTorch->dataset, std::string("train_v1"));
+    ASSERT_EQ(exportTorch->batchSize, (unsigned long long)256);
+    ASSERT_TRUE(exportTorch->deterministicShuffle);
+    ASSERT_EQ(exportTorch->epoch, (unsigned long long)3);
+    ASSERT_EQ(exportTorch->rank, (unsigned long long)1);
+    ASSERT_EQ(exportTorch->worldSize, (unsigned long long)8);
+
+    auto explainStmt = parseOne(
+        "spill-batch train_v1 batch-size 128 epoch 3 batch 1042 "
+        "rank 0 world-size 8;");
+    auto* explain = asExplainBatch(explainStmt);
+    ASSERT_EQ(explain->dataset, std::string("train_v1"));
+    ASSERT_EQ(explain->batchSize, (unsigned long long)128);
+    ASSERT_EQ(explain->batch, (unsigned long long)1042);
+}
+
+TEST(contextql_manifest_yeet_and_spill_parse) {
+    auto createStmt = parseOne("manifest-context convo_123;");
+    auto* create = asCreateContext(createStmt);
+    ASSERT_EQ(create->name, std::string("convo_123"));
+
+    auto appendStmt = parseOne(
+        "yeet-memory convo_123 drip "
+        "(88, 'user', 'Actually I moved to NYC.') "
+        "vibe-tab 'convo about dog';");
+    auto* append = asAppendMemory(appendStmt);
+    ASSERT_EQ(append->context, std::string("convo_123"));
+    ASSERT_EQ(append->messageId, (unsigned long long)88);
+    ASSERT_EQ(append->speaker, std::string("user"));
+    ASSERT_CONTAINS(append->text, "NYC");
+    ASSERT_EQ(append->tab, std::string("convo about dog"));
+
+    auto spillStmt = parseOne(
+        "spill-context convo_123 vibe-tab 'convo about dog' "
+        "only-if 'restaurants near me' "
+        "token-budget 200 receipts on;");
+    auto* spill = asSpillContext(spillStmt);
+    ASSERT_EQ(spill->context, std::string("convo_123"));
+    ASSERT_EQ(spill->tab, std::string("convo about dog"));
+    ASSERT_EQ(spill->query, std::string("restaurants near me"));
+    ASSERT_EQ(spill->tokenBudget, (unsigned long long)200);
+    ASSERT_TRUE(spill->receipts);
+
+    auto tagStmt = parseOne(
+        "vibe-tab convo_123 message 88 'convo about dog';");
+    auto* tag = asTagMemory(tagStmt);
+    ASSERT_EQ(tag->context, std::string("convo_123"));
+    ASSERT_EQ(tag->messageId, (unsigned long long)88);
+    ASSERT_EQ(tag->tab, std::string("convo about dog"));
 }
 
 TEST(select_lone_wolf_function) {

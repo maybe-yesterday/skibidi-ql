@@ -182,6 +182,19 @@ private:
     NativeQueryResult executeUpdate(const UpdateStmt& statement);
     NativeQueryResult executeDelete(const DeleteStmt& statement);
     NativeQueryResult executeSelect(const SelectStmt& statement);
+    NativeQueryResult executeCreateSnapshot(
+        const CreateSnapshotStmt& statement);
+    NativeQueryResult executeExportTorch(const ExportTorchStmt& statement);
+    NativeQueryResult executeExplainBatch(
+        const ExplainBatchStmt& statement);
+    NativeQueryResult executeCreateContext(
+        const CreateContextStmt& statement);
+    NativeQueryResult executeAppendMemory(
+        const AppendMemoryStmt& statement);
+    NativeQueryResult executeSpillContext(
+        const SpillContextStmt& statement);
+    NativeQueryResult executeTagMemory(
+        const TagMemoryStmt& statement);
     std::optional<NativeQueryResult> executeDirectAggregateSelect(
         const SelectStmt& statement);
     std::optional<NativeQueryResult> executeRowIdSeekJoinAggregateSelect(

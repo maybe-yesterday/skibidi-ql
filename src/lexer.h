@@ -37,6 +37,21 @@ enum class TokenType {
     // DDL keywords
     MANIFEST,       // CREATE TABLE
     RIZZ_DOWN,      // DROP TABLE
+    MANIFEST_DATASET,   // CREATE DATASET/SNAPSHOT
+    MANIFEST_SNAPSHOT,  // CREATE SNAPSHOT
+    EXPORT_TORCH,       // EXPORT TORCH
+    SHIP_TORCH,         // EXPORT TORCH (Gen Z alias)
+    EXPLAIN_BATCH,      // EXPLAIN BATCH
+    SPILL_BATCH,        // EXPLAIN BATCH (Gen Z alias)
+    WITH_SEED,          // WITH SEED
+    BATCH_SIZE,         // BATCH_SIZE
+    WORLD_SIZE,         // WORLD_SIZE
+    MAX_LEN,            // MAX_LEN
+    MANIFEST_CONTEXT,   // CREATE CONTEXT
+    YEET_MEMORY,        // APPEND CONTEXT MESSAGE
+    SPILL_CONTEXT,      // RENDER CURRENT CONTEXT VIEW
+    TOKEN_BUDGET,       // token budget for context rendering
+    VIBE_TAB,           // CONTEXT TAB / TOPIC TAG
 
     // Constraints
     MAIN_CHARACTER, // PRIMARY KEY

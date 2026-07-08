@@ -1,0 +1,31 @@
+manifest events (
+    id INTEGER main-character,
+    user_id INTEGER,
+    age INTEGER,
+    country TEXT,
+    clicked INTEGER,
+    ts TEXT
+);
+
+yeet-into events (id, user_id, age, country, clicked, ts)
+drip
+    (1, 101, 20, 'us', 1, '2025-01-01'),
+    (2, 101, 21, 'us', 0, '2025-01-02'),
+    (3, 202, 30, 'ca', 1, '2025-01-03'),
+    (4, 303, 40, 'uk', 0, '2025-01-04');
+
+manifest-snapshot train_v1 lowkey
+slay age, country, clicked, user_id
+no-cap events
+only-if ts < '2026-01-01'
+split-by user_id
+with-seed 42
+features (
+    age FLOAT NORMALIZE ZSCORE,
+    country CATEGORICAL ENCODE DICT
+)
+label clicked INT;
+
+ship-torch train_v1 batch-size 2 shuffle deterministic epoch 0 rank 0 world-size 1;
+
+spill-batch train_v1 batch-size 2 epoch 0 batch 0 rank 0 world-size 1;

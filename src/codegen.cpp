@@ -43,6 +43,13 @@ std::string CodeGen::generate(const ASTNode* node) {
     if (auto* s = dynamic_cast<const DeleteStmt*>(node)) return genDelete(s);
     if (auto* s = dynamic_cast<const CreateStmt*>(node)) return genCreate(s);
     if (auto* s = dynamic_cast<const DropStmt*>(node))   return genDrop(s);
+    if (auto* s = dynamic_cast<const CreateSnapshotStmt*>(node)) return genCreateSnapshot(s);
+    if (auto* s = dynamic_cast<const ExportTorchStmt*>(node)) return genExportTorch(s);
+    if (auto* s = dynamic_cast<const ExplainBatchStmt*>(node)) return genExplainBatch(s);
+    if (auto* s = dynamic_cast<const CreateContextStmt*>(node)) return genCreateContext(s);
+    if (auto* s = dynamic_cast<const AppendMemoryStmt*>(node)) return genAppendMemory(s);
+    if (auto* s = dynamic_cast<const SpillContextStmt*>(node)) return genSpillContext(s);
+    if (auto* s = dynamic_cast<const TagMemoryStmt*>(node)) return genTagMemory(s);
 
     throw std::runtime_error("CodeGen: Unknown top-level node type");
 }
@@ -355,6 +362,66 @@ std::string CodeGen::genDrop(const DropStmt* s) {
     out << "DROP TABLE";
     if (s->ifExists) out << " IF EXISTS";
     out << " " << s->table;
+    return out.str();
+}
+
+std::string CodeGen::genCreateSnapshot(const CreateSnapshotStmt* s) {
+    std::ostringstream out;
+    out << "-- manifest-snapshot " << s->name << " AS ";
+    if (s->source) out << genSelect(s->source.get());
+    out << " split-by " << s->splitBy
+        << " seed " << s->seed;
+    return out.str();
+}
+
+std::string CodeGen::genExportTorch(const ExportTorchStmt* s) {
+    std::ostringstream out;
+    out << "-- ship-torch " << s->dataset
+        << " batch-size " << s->batchSize
+        << " epoch " << s->epoch
+        << " rank " << s->rank
+        << " world-size " << s->worldSize;
+    return out.str();
+}
+
+std::string CodeGen::genExplainBatch(const ExplainBatchStmt* s) {
+    std::ostringstream out;
+    out << "-- spill-batch " << s->dataset
+        << " batch " << s->batch
+        << " batch-size " << s->batchSize
+        << " epoch " << s->epoch
+        << " rank " << s->rank
+        << " world-size " << s->worldSize;
+    return out.str();
+}
+
+std::string CodeGen::genCreateContext(const CreateContextStmt* s) {
+    return "-- manifest-context " + s->name;
+}
+
+std::string CodeGen::genAppendMemory(const AppendMemoryStmt* s) {
+    std::ostringstream out;
+    out << "-- yeet-memory " << s->context
+        << " message " << s->messageId
+        << " speaker " << quoteString(s->speaker);
+    if (!s->tab.empty()) out << " vibe-tab " << quoteString(s->tab);
+    return out.str();
+}
+
+std::string CodeGen::genSpillContext(const SpillContextStmt* s) {
+    std::ostringstream out;
+    out << "-- spill-context " << s->context
+        << " token-budget " << s->tokenBudget
+        << " receipts " << (s->receipts ? "on" : "off");
+    if (!s->tab.empty()) out << " vibe-tab " << quoteString(s->tab);
+    return out.str();
+}
+
+std::string CodeGen::genTagMemory(const TagMemoryStmt* s) {
+    std::ostringstream out;
+    out << "-- vibe-tab " << s->context
+        << " message " << s->messageId
+        << " " << quoteString(s->tab);
     return out.str();
 }
 

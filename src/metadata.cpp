@@ -34,12 +34,18 @@ std::string escapeJson(const std::string& value) {
     return out;
 }
 
+struct CatalogData {
+    std::unordered_map<std::string, TableMeta> tables;
+    std::unordered_map<std::string, DatasetSnapshotMeta> snapshots;
+    std::unordered_map<std::string, ConversationContextMeta> contexts;
+};
+
 class JsonReader {
 public:
     explicit JsonReader(std::string text) : text_(std::move(text)) {}
 
-    std::unordered_map<std::string, TableMeta> parseCatalog() {
-        std::unordered_map<std::string, TableMeta> result;
+    CatalogData parseCatalog() {
+        CatalogData result;
         expect('{');
         if (consume('}')) return result;
 
@@ -47,7 +53,11 @@ public:
             const std::string key = parseString();
             expect(':');
             if (key == "tables") {
-                result = parseTables();
+                result.tables = parseTables();
+            } else if (key == "snapshots") {
+                result.snapshots = parseSnapshots();
+            } else if (key == "contexts") {
+                result.contexts = parseContexts();
             } else {
                 skipValue();
             }
@@ -159,6 +169,33 @@ private:
         throw std::runtime_error("Expected JSON boolean");
     }
 
+    std::uint64_t parseUnsigned() {
+        whitespace();
+        const std::size_t start = pos_;
+        while (pos_ < text_.size() &&
+               std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
+            ++pos_;
+        }
+        if (start == pos_) {
+            throw std::runtime_error("Expected JSON integer");
+        }
+        return static_cast<std::uint64_t>(
+            std::stoull(text_.substr(start, pos_ - start)));
+    }
+
+    std::vector<std::string> parseStringArray() {
+        std::vector<std::string> result;
+        expect('[');
+        if (consume(']')) return result;
+
+        do {
+            result.push_back(parseString());
+        } while (consume(','));
+
+        expect(']');
+        return result;
+    }
+
     std::unordered_map<std::string, TableMeta> parseTables() {
         std::unordered_map<std::string, TableMeta> result;
         expect('{');
@@ -230,6 +267,199 @@ private:
         return column;
     }
 
+    std::unordered_map<std::string, DatasetSnapshotMeta> parseSnapshots() {
+        std::unordered_map<std::string, DatasetSnapshotMeta> result;
+        expect('{');
+        if (consume('}')) return result;
+
+        do {
+            const std::string name = parseString();
+            expect(':');
+            DatasetSnapshotMeta snapshot = parseSnapshot(name);
+            result[name] = std::move(snapshot);
+        } while (consume(','));
+
+        expect('}');
+        return result;
+    }
+
+    DatasetSnapshotMeta parseSnapshot(const std::string& name) {
+        DatasetSnapshotMeta snapshot;
+        snapshot.name = name;
+        expect('{');
+        if (consume('}')) return snapshot;
+
+        do {
+            const std::string key = parseString();
+            expect(':');
+            if (key == "query_text") snapshot.queryText = parseString();
+            else if (key == "source_table") snapshot.sourceTable = parseString();
+            else if (key == "schema_fingerprint") snapshot.schemaFingerprint = parseString();
+            else if (key == "table_version") snapshot.tableVersion = parseString();
+            else if (key == "split_by") snapshot.splitBy = parseString();
+            else if (key == "seed") snapshot.seed = parseUnsigned();
+            else if (key == "features") snapshot.features = parseFeatures();
+            else if (key == "label") snapshot.label = parseFeature();
+            else if (key == "rows") snapshot.rows = parseRows();
+            else if (key == "warnings") snapshot.warnings = parseStringArray();
+            else skipValue();
+        } while (consume(','));
+
+        expect('}');
+        return snapshot;
+    }
+
+    std::vector<SnapshotFeatureMeta> parseFeatures() {
+        std::vector<SnapshotFeatureMeta> result;
+        expect('[');
+        if (consume(']')) return result;
+
+        do {
+            result.push_back(parseFeature());
+        } while (consume(','));
+
+        expect(']');
+        return result;
+    }
+
+    SnapshotFeatureMeta parseFeature() {
+        SnapshotFeatureMeta feature;
+        expect('{');
+        if (consume('}')) return feature;
+
+        do {
+            const std::string key = parseString();
+            expect(':');
+            if (key == "name") feature.name = parseString();
+            else if (key == "spec") feature.spec = parseString();
+            else skipValue();
+        } while (consume(','));
+
+        expect('}');
+        return feature;
+    }
+
+    std::vector<SnapshotRowMeta> parseRows() {
+        std::vector<SnapshotRowMeta> result;
+        expect('[');
+        if (consume(']')) return result;
+
+        do {
+            SnapshotRowMeta row;
+            expect('{');
+            if (!consume('}')) {
+                do {
+                    const std::string key = parseString();
+                    expect(':');
+                    if (key == "rowid") row.rowid = parseString();
+                    else if (key == "split") row.split = parseString();
+                    else skipValue();
+                } while (consume(','));
+                expect('}');
+            }
+            result.push_back(std::move(row));
+        } while (consume(','));
+
+        expect(']');
+        return result;
+    }
+
+    std::unordered_map<std::string, ConversationContextMeta>
+    parseContexts() {
+        std::unordered_map<std::string, ConversationContextMeta> result;
+        expect('{');
+        if (consume('}')) return result;
+
+        do {
+            const std::string name = parseString();
+            expect(':');
+            ConversationContextMeta context = parseContext(name);
+            result[name] = std::move(context);
+        } while (consume(','));
+
+        expect('}');
+        return result;
+    }
+
+    ConversationContextMeta parseContext(const std::string& name) {
+        ConversationContextMeta context;
+        context.name = name;
+        expect('{');
+        if (consume('}')) return context;
+
+        do {
+            const std::string key = parseString();
+            expect(':');
+            if (key == "messages") context.messages = parseMessages();
+            else if (key == "atoms") context.atoms = parseAtoms();
+            else skipValue();
+        } while (consume(','));
+
+        expect('}');
+        return context;
+    }
+
+    std::vector<ContextMessageMeta> parseMessages() {
+        std::vector<ContextMessageMeta> result;
+        expect('[');
+        if (consume(']')) return result;
+
+        do {
+            ContextMessageMeta message;
+            expect('{');
+            if (!consume('}')) {
+                do {
+                    const std::string key = parseString();
+                    expect(':');
+                    if (key == "id") message.id = parseUnsigned();
+                    else if (key == "speaker") message.speaker = parseString();
+                    else if (key == "text") message.text = parseString();
+                    else if (key == "tab") message.tab = parseString();
+                    else skipValue();
+                } while (consume(','));
+                expect('}');
+            }
+            if (message.tab.empty()) message.tab = "main";
+            result.push_back(std::move(message));
+        } while (consume(','));
+
+        expect(']');
+        return result;
+    }
+
+    std::vector<ContextAtomMeta> parseAtoms() {
+        std::vector<ContextAtomMeta> result;
+        expect('[');
+        if (consume(']')) return result;
+
+        do {
+            ContextAtomMeta atom;
+            expect('{');
+            if (!consume('}')) {
+                do {
+                    const std::string key = parseString();
+                    expect(':');
+                    if (key == "key") atom.key = parseString();
+                    else if (key == "value") atom.value = parseString();
+                    else if (key == "type") atom.type = parseString();
+                    else if (key == "status") atom.status = parseString();
+                    else if (key == "source") atom.source = parseString();
+                    else if (key == "invalidated_by") {
+                        atom.invalidatedBy = parseString();
+                    } else if (key == "tab") {
+                        atom.tab = parseString();
+                    } else skipValue();
+                } while (consume(','));
+                expect('}');
+            }
+            if (atom.tab.empty()) atom.tab = "main";
+            result.push_back(std::move(atom));
+        } while (consume(','));
+
+        expect(']');
+        return result;
+    }
+
     void skipValue() {
         whitespace();
         if (pos_ >= text_.size()) {
@@ -287,8 +517,14 @@ void Catalog::load() {
         std::ostringstream buffer;
         buffer << file.rdbuf();
         auto loaded = JsonReader(buffer.str()).parseCatalog();
-        for (auto& entry : loaded) {
+        for (auto& entry : loaded.tables) {
             tables[entry.first] = std::move(entry.second);
+        }
+        for (auto& entry : loaded.snapshots) {
+            snapshots[entry.first] = std::move(entry.second);
+        }
+        for (auto& entry : loaded.contexts) {
+            contexts[entry.first] = std::move(entry.second);
         }
         ++revision_;
         recomputeFingerprint();
@@ -335,6 +571,117 @@ void Catalog::save() {
         file << "]\n    }";
     }
     if (!names.empty()) file << "\n  ";
+    file << "},\n  \"snapshots\": {";
+
+    auto snapshotNamesValue = snapshotNames();
+    std::sort(snapshotNamesValue.begin(), snapshotNamesValue.end());
+    for (std::size_t snapshotIndex = 0;
+         snapshotIndex < snapshotNamesValue.size();
+         ++snapshotIndex) {
+        const auto& name = snapshotNamesValue[snapshotIndex];
+        const auto& snapshot = snapshots.at(name);
+        file << (snapshotIndex == 0 ? "\n" : ",\n")
+             << "    \"" << escapeJson(name) << "\": {\n"
+             << "      \"query_text\": \""
+             << escapeJson(snapshot.queryText) << "\",\n"
+             << "      \"source_table\": \""
+             << escapeJson(snapshot.sourceTable) << "\",\n"
+             << "      \"schema_fingerprint\": \""
+             << escapeJson(snapshot.schemaFingerprint) << "\",\n"
+             << "      \"table_version\": \""
+             << escapeJson(snapshot.tableVersion) << "\",\n"
+             << "      \"split_by\": \""
+             << escapeJson(snapshot.splitBy) << "\",\n"
+             << "      \"seed\": " << snapshot.seed << ",\n"
+             << "      \"features\": [";
+
+        for (std::size_t featureIndex = 0;
+             featureIndex < snapshot.features.size();
+             ++featureIndex) {
+            const auto& feature = snapshot.features[featureIndex];
+            file << (featureIndex == 0 ? "\n" : ",\n")
+                 << "        {\"name\": \"" << escapeJson(feature.name)
+                 << "\", \"spec\": \"" << escapeJson(feature.spec)
+                 << "\"}";
+        }
+        if (!snapshot.features.empty()) file << "\n      ";
+        file << "],\n"
+             << "      \"label\": {\"name\": \""
+             << escapeJson(snapshot.label.name) << "\", \"spec\": \""
+             << escapeJson(snapshot.label.spec) << "\"},\n"
+             << "      \"rows\": [";
+
+        for (std::size_t rowIndex = 0;
+             rowIndex < snapshot.rows.size();
+             ++rowIndex) {
+            const auto& row = snapshot.rows[rowIndex];
+            file << (rowIndex == 0 ? "\n" : ",\n")
+                 << "        {\"rowid\": \"" << escapeJson(row.rowid)
+                 << "\", \"split\": \"" << escapeJson(row.split)
+                 << "\"}";
+        }
+        if (!snapshot.rows.empty()) file << "\n      ";
+        file << "],\n"
+             << "      \"warnings\": [";
+
+        for (std::size_t warningIndex = 0;
+             warningIndex < snapshot.warnings.size();
+             ++warningIndex) {
+            file << (warningIndex == 0 ? "" : ", ")
+                 << "\"" << escapeJson(snapshot.warnings[warningIndex])
+                 << "\"";
+        }
+        file << "]\n"
+             << "    }";
+    }
+    if (!snapshotNamesValue.empty()) file << "\n  ";
+    file << "},\n  \"contexts\": {";
+
+    auto contextNamesValue = contextNames();
+    std::sort(contextNamesValue.begin(), contextNamesValue.end());
+    for (std::size_t contextIndex = 0;
+         contextIndex < contextNamesValue.size();
+         ++contextIndex) {
+        const auto& name = contextNamesValue[contextIndex];
+        const auto& context = contexts.at(name);
+        file << (contextIndex == 0 ? "\n" : ",\n")
+             << "    \"" << escapeJson(name) << "\": {\n"
+             << "      \"messages\": [";
+
+        for (std::size_t messageIndex = 0;
+             messageIndex < context.messages.size();
+             ++messageIndex) {
+            const auto& message = context.messages[messageIndex];
+            file << (messageIndex == 0 ? "\n" : ",\n")
+                 << "        {\"id\": " << message.id
+                 << ", \"speaker\": \"" << escapeJson(message.speaker)
+                 << "\", \"text\": \"" << escapeJson(message.text)
+                 << "\", \"tab\": \"" << escapeJson(message.tab)
+                 << "\"}";
+        }
+        if (!context.messages.empty()) file << "\n      ";
+        file << "],\n"
+             << "      \"atoms\": [";
+
+        for (std::size_t atomIndex = 0;
+             atomIndex < context.atoms.size();
+             ++atomIndex) {
+            const auto& atom = context.atoms[atomIndex];
+            file << (atomIndex == 0 ? "\n" : ",\n")
+                 << "        {\"key\": \"" << escapeJson(atom.key)
+                 << "\", \"value\": \"" << escapeJson(atom.value)
+                 << "\", \"type\": \"" << escapeJson(atom.type)
+                 << "\", \"status\": \"" << escapeJson(atom.status)
+                 << "\", \"source\": \"" << escapeJson(atom.source)
+                 << "\", \"invalidated_by\": \""
+                 << escapeJson(atom.invalidatedBy)
+                 << "\", \"tab\": \"" << escapeJson(atom.tab) << "\"}";
+        }
+        if (!context.atoms.empty()) file << "\n      ";
+        file << "]\n"
+             << "    }";
+    }
+    if (!contextNamesValue.empty()) file << "\n  ";
     file << "}\n}\n";
 }
 
@@ -346,6 +693,13 @@ void Catalog::addTable(const TableMeta& table) {
 
 void Catalog::removeTable(const std::string& name) {
     if (tables.erase(name) > 0) {
+        for (auto it = snapshots.begin(); it != snapshots.end(); ) {
+            if (it->second.sourceTable == name) {
+                it = snapshots.erase(it);
+            } else {
+                ++it;
+            }
+        }
         ++revision_;
         recomputeFingerprint();
     }
@@ -358,6 +712,54 @@ bool Catalog::hasTable(const std::string& name) const {
 const TableMeta* Catalog::getTable(const std::string& name) const {
     auto it = tables.find(name);
     if (it == tables.end()) return nullptr;
+    return &it->second;
+}
+
+void Catalog::addSnapshot(const DatasetSnapshotMeta& snapshot) {
+    snapshots[snapshot.name] = snapshot;
+    ++revision_;
+    recomputeFingerprint();
+}
+
+void Catalog::removeSnapshot(const std::string& name) {
+    if (snapshots.erase(name) > 0) {
+        ++revision_;
+        recomputeFingerprint();
+    }
+}
+
+bool Catalog::hasSnapshot(const std::string& name) const {
+    return snapshots.count(name) > 0;
+}
+
+const DatasetSnapshotMeta* Catalog::getSnapshot(
+    const std::string& name) const {
+    auto it = snapshots.find(name);
+    if (it == snapshots.end()) return nullptr;
+    return &it->second;
+}
+
+void Catalog::addContext(const ConversationContextMeta& context) {
+    contexts[context.name] = context;
+    ++revision_;
+    recomputeFingerprint();
+}
+
+void Catalog::removeContext(const std::string& name) {
+    if (contexts.erase(name) > 0) {
+        ++revision_;
+        recomputeFingerprint();
+    }
+}
+
+bool Catalog::hasContext(const std::string& name) const {
+    return contexts.count(name) > 0;
+}
+
+const ConversationContextMeta* Catalog::getContext(
+    const std::string& name) const {
+    auto it = contexts.find(name);
+    if (it == contexts.end()) return nullptr;
     return &it->second;
 }
 
@@ -378,6 +780,24 @@ std::vector<std::string> Catalog::tableNames() const {
     std::vector<std::string> names;
     names.reserve(tables.size());
     for (const auto& entry : tables) {
+        names.push_back(entry.first);
+    }
+    return names;
+}
+
+std::vector<std::string> Catalog::snapshotNames() const {
+    std::vector<std::string> names;
+    names.reserve(snapshots.size());
+    for (const auto& entry : snapshots) {
+        names.push_back(entry.first);
+    }
+    return names;
+}
+
+std::vector<std::string> Catalog::contextNames() const {
+    std::vector<std::string> names;
+    names.reserve(contexts.size());
+    for (const auto& entry : contexts) {
         names.push_back(entry.first);
     }
     return names;
@@ -409,6 +829,46 @@ void Catalog::recomputeFingerprint() {
             append(column.not_null ? "1" : "0");
             append(column.fk_table);
             append(column.fk_col);
+        }
+    }
+    auto snapshotsValue = snapshotNames();
+    std::sort(snapshotsValue.begin(), snapshotsValue.end());
+    for (const auto& name : snapshotsValue) {
+        append(name);
+        const auto& snapshot = snapshots.at(name);
+        append(snapshot.queryText);
+        append(snapshot.sourceTable);
+        append(snapshot.schemaFingerprint);
+        append(snapshot.tableVersion);
+        append(snapshot.splitBy);
+        append(std::to_string(snapshot.seed));
+        for (const auto& feature : snapshot.features) {
+            append(feature.name);
+            append(feature.spec);
+        }
+        append(snapshot.label.name);
+        append(snapshot.label.spec);
+        append(std::to_string(snapshot.rows.size()));
+    }
+    auto contextsValue = contextNames();
+    std::sort(contextsValue.begin(), contextsValue.end());
+    for (const auto& name : contextsValue) {
+        append(name);
+        const auto& context = contexts.at(name);
+        for (const auto& message : context.messages) {
+            append(std::to_string(message.id));
+            append(message.speaker);
+            append(message.text);
+            append(message.tab);
+        }
+        for (const auto& atom : context.atoms) {
+            append(atom.key);
+            append(atom.value);
+            append(atom.type);
+            append(atom.status);
+            append(atom.source);
+            append(atom.invalidatedBy);
+            append(atom.tab);
         }
     }
     schemaFingerprint_ = hash;

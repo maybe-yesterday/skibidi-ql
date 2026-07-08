@@ -160,6 +160,24 @@ TEST(keyword_lone_wolf) {
 TEST(keyword_split_by) {
     ASSERT_TRUE(firstType("split-by") == TokenType::SPLIT_BY);
 }
+TEST(keyword_tensorql_training_snapshot_terms) {
+    ASSERT_TRUE(firstType("manifest-snapshot") == TokenType::MANIFEST_SNAPSHOT);
+    ASSERT_TRUE(firstType("manifest-dataset") == TokenType::MANIFEST_DATASET);
+    ASSERT_TRUE(firstType("ship-torch") == TokenType::SHIP_TORCH);
+    ASSERT_TRUE(firstType("export-torch") == TokenType::EXPORT_TORCH);
+    ASSERT_TRUE(firstType("spill-batch") == TokenType::SPILL_BATCH);
+    ASSERT_TRUE(firstType("explain-batch") == TokenType::EXPLAIN_BATCH);
+    ASSERT_TRUE(firstType("with-seed") == TokenType::WITH_SEED);
+    ASSERT_TRUE(firstType("batch-size") == TokenType::BATCH_SIZE);
+    ASSERT_TRUE(firstType("world-size") == TokenType::WORLD_SIZE);
+}
+TEST(keyword_contextql_terms) {
+    ASSERT_TRUE(firstType("manifest-context") == TokenType::MANIFEST_CONTEXT);
+    ASSERT_TRUE(firstType("yeet-memory") == TokenType::YEET_MEMORY);
+    ASSERT_TRUE(firstType("spill-context") == TokenType::SPILL_CONTEXT);
+    ASSERT_TRUE(firstType("token-budget") == TokenType::TOKEN_BUDGET);
+    ASSERT_TRUE(firstType("vibe-tab") == TokenType::VIBE_TAB);
+}
 
 // -----------------------------------------------------------------------
 // Special: single "L" is L_FUNC (MIN)

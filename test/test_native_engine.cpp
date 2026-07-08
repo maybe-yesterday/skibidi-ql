@@ -42,6 +42,16 @@ static std::vector<NativeQueryResult> executeSource(
     return results;
 }
 
+static std::string fieldValue(const NativeQueryResult& result,
+                              const std::string& field) {
+    for (const auto& row : result.rows) {
+        if (row.size() >= 2 && row[0] == Value(field)) {
+            return row[1].toString();
+        }
+    }
+    return "";
+}
+
 TEST(native_engine_crud_filter_order_and_limit) {
     NativeTestDatabase database;
     auto results = executeSource(
@@ -576,6 +586,149 @@ TEST(native_engine_lone_wolf_groups_by_category) {
     ASSERT_EQ(packOutliers, (std::int64_t)0);
     const auto stats = database.engine.stats();
     ASSERT_EQ(stats.directAggregateQueries, (size_t)1);
+}
+
+TEST(native_engine_manifests_training_snapshot_and_spills_batch) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest events ("
+        "id INTEGER main-character, user_id INTEGER, age INTEGER, "
+        "country TEXT, clicked INTEGER, ts TEXT);"
+        "yeet-into events drip "
+        "(1, 101, 20, 'us', 1, '2025-01-01'), "
+        "(2, 101, 21, 'us', 0, '2025-01-02'), "
+        "(3, 202, 30, 'ca', 1, '2025-01-03'), "
+        "(4, 303, 40, 'uk', 0, '2025-01-04');"
+        "manifest-snapshot train_v1 lowkey "
+        "slay age, country, clicked, user_id no-cap events "
+        "only-if ts < '2026-01-01' "
+        "split-by user_id with-seed 42 "
+        "features (age FLOAT NORMALIZE ZSCORE, "
+        "country CATEGORICAL ENCODE DICT) "
+        "label clicked INT;");
+
+    const auto& snapshotResult = results.back();
+    ASSERT_EQ(fieldValue(snapshotResult, "snapshot"), std::string("train_v1"));
+    ASSERT_EQ(fieldValue(snapshotResult, "rows"), std::string("4"));
+    ASSERT_CONTAINS(fieldValue(snapshotResult, "features"), "age");
+    ASSERT_TRUE(database.engine.catalog().hasSnapshot("train_v1"));
+
+    const auto exportResult = executeSource(
+        database.engine,
+        "ship-torch train_v1 batch-size 2 shuffle deterministic "
+        "epoch 0 rank 0 world-size 1;").front();
+    ASSERT_CONTAINS(fieldValue(exportResult, "python"), "TensorQLDataset");
+
+    const auto explainResult = executeSource(
+        database.engine,
+        "spill-batch train_v1 batch-size 2 epoch 0 batch 0 "
+        "rank 0 world-size 1;").front();
+    ASSERT_EQ(fieldValue(explainResult, "snapshot"), std::string("train_v1"));
+    ASSERT_CONTAINS(fieldValue(explainResult, "source_rows"), ":");
+    ASSERT_CONTAINS(fieldValue(explainResult, "feature_columns"), "country");
+    ASSERT_CONTAINS(fieldValue(explainResult, "resume_token"), "epoch=0");
+}
+
+TEST(native_engine_warns_when_row_split_leaks_user_id) {
+    NativeTestDatabase database;
+    std::string source =
+        "manifest events ("
+        "id INTEGER main-character, user_id INTEGER, age INTEGER, "
+        "clicked INTEGER);"
+        "yeet-into events drip ";
+    for (int id = 1; id <= 40; ++id) {
+        if (id > 1) source += ", ";
+        source += "(" + std::to_string(id) + ", 7, " +
+                  std::to_string(20 + id) + ", " +
+                  std::to_string(id % 2) + ")";
+    }
+    source += ";"
+        "manifest-snapshot leak_v1 lowkey "
+        "slay age, clicked, user_id no-cap events "
+        "split-by random by row with-seed 42 "
+        "features (age FLOAT) label clicked INT;";
+
+    const auto result = executeSource(database.engine, source).back();
+    ASSERT_CONTAINS(fieldValue(result, "warning"), "user_id");
+    ASSERT_CONTAINS(fieldValue(result, "warning"), "prefer split-by user_id");
+}
+
+TEST(native_engine_contextql_maintains_prompt_view_with_receipts) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'I live in Seattle.');"
+        "yeet-memory convo_123 drip "
+        "(88, 'user', 'Actually I moved to NYC.');"
+        "spill-context convo_123 only-if 'Find restaurants near me' "
+        "token-budget 200 receipts on;");
+
+    ASSERT_EQ(results.size(), (size_t)4);
+    const auto& appendFirst = results[1];
+    ASSERT_EQ(fieldValue(appendFirst, "extracted_atoms"), std::string("1"));
+    ASSERT_CONTAINS(fieldValue(appendFirst, "atom"), "Seattle");
+
+    const auto& appendSecond = results[2];
+    ASSERT_EQ(fieldValue(appendSecond, "invalidated_atoms"), std::string("1"));
+    ASSERT_CONTAINS(fieldValue(appendSecond, "atom"), "NYC");
+
+    const auto& spill = results[3];
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "user_location=NYC");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "message_88");
+    ASSERT_CONTAINS(fieldValue(spill, "invalidated"), "Seattle");
+    ASSERT_CONTAINS(fieldValue(spill, "invalidated"), "invalidated_by=message_88");
+}
+
+TEST(native_engine_contextql_tabs_filter_and_retag_memory) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'My dog likes salmon.') "
+        "vibe-tab 'convo about dog';"
+        "yeet-memory convo_123 drip "
+        "(2, 'user', 'I live in Seattle.');"
+        "yeet-memory convo_123 drip "
+        "(3, 'user', 'Actually I moved to NYC.');"
+        "spill-context convo_123 vibe-tab 'convo about dog' "
+        "only-if 'what does my dog like?' token-budget 200 receipts on;"
+        "vibe-tab convo_123 message 3 'convo about dog';"
+        "spill-context convo_123 vibe-tab 'main' "
+        "only-if 'where am I?' token-budget 200 receipts on;"
+        "spill-context convo_123 vibe-tab 'convo about dog' "
+        "only-if 'dog and location' token-budget 200 receipts on;");
+
+    ASSERT_EQ(results.size(), (size_t)8);
+
+    const auto& dogBeforeMove = results[4];
+    ASSERT_EQ(fieldValue(dogBeforeMove, "tab"),
+              std::string("convo about dog"));
+    ASSERT_CONTAINS(fieldValue(dogBeforeMove, "current_context"),
+                    "dog_preference=salmon");
+    ASSERT_TRUE(fieldValue(dogBeforeMove, "current_context")
+                    .find("user_location=NYC") == std::string::npos);
+
+    const auto& retag = results[5];
+    ASSERT_EQ(fieldValue(retag, "message"), std::string("message_3"));
+    ASSERT_EQ(fieldValue(retag, "retagged_atoms"), std::string("1"));
+
+    const auto& mainAfterMove = results[6];
+    ASSERT_EQ(fieldValue(mainAfterMove, "tab"), std::string("main"));
+    ASSERT_CONTAINS(fieldValue(mainAfterMove, "current_context"),
+                    "user_location=Seattle");
+    ASSERT_TRUE(fieldValue(mainAfterMove, "current_context")
+                    .find("user_location=NYC") == std::string::npos);
+    ASSERT_EQ(fieldValue(mainAfterMove, "invalidated"), std::string(""));
+
+    const auto& dogAfterMove = results[7];
+    ASSERT_CONTAINS(fieldValue(dogAfterMove, "current_context"),
+                    "dog_preference=salmon");
+    ASSERT_CONTAINS(fieldValue(dogAfterMove, "current_context"),
+                    "user_location=NYC");
 }
 
 int main() {

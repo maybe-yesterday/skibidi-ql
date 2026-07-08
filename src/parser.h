@@ -35,6 +35,11 @@ private:
     bool checkAny(std::initializer_list<TokenType> types) const;
     bool match(TokenType t);
     const Token& expect(TokenType t, const std::string& msg);
+    bool checkWord(const std::string& value) const;
+    bool matchWord(const std::string& value);
+    const Token& expectWord(const std::string& value,
+                            const std::string& msg);
+    const Token& expectName(const std::string& msg);
 
     // Statement parsers
     std::unique_ptr<SelectStmt> parseSelect();
@@ -43,6 +48,13 @@ private:
     std::unique_ptr<DeleteStmt> parseDelete();
     std::unique_ptr<CreateStmt> parseCreate();
     std::unique_ptr<DropStmt>   parseDrop();
+    std::unique_ptr<CreateSnapshotStmt> parseCreateSnapshot();
+    std::unique_ptr<ExportTorchStmt> parseExportTorch();
+    std::unique_ptr<ExplainBatchStmt> parseExplainBatch();
+    std::unique_ptr<CreateContextStmt> parseCreateContext();
+    std::unique_ptr<AppendMemoryStmt> parseAppendMemory();
+    std::unique_ptr<SpillContextStmt> parseSpillContext();
+    std::unique_ptr<TagMemoryStmt> parseTagMemory();
 
     // Clause parsers
     void parseTableRef(std::string& table, std::string& alias);
@@ -52,6 +64,10 @@ private:
     std::vector<std::unique_ptr<ASTNode>> parseColumnList();
     std::vector<OrderItem> parseOrderList();
     ColumnDef parseColumnDef();
+    std::vector<FeatureSpec> parseFeatureSpecs();
+    FeatureSpec parseFeatureSpec();
+    FeatureSpec parseLabelSpec();
+    unsigned long long parseUnsignedOption(const std::string& name);
 
     // Expression parsers (recursive descent)
     std::unique_ptr<ASTNode> parseExpr();

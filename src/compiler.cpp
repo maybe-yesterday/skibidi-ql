@@ -83,7 +83,11 @@ CompilationResult QueryCompiler::compileUncached(
     for (auto& ast : statements) {
         const bool statementChangesSchema =
             dynamic_cast<CreateStmt*>(ast.get()) ||
-            dynamic_cast<DropStmt*>(ast.get());
+            dynamic_cast<DropStmt*>(ast.get()) ||
+            dynamic_cast<CreateSnapshotStmt*>(ast.get()) ||
+            dynamic_cast<CreateContextStmt*>(ast.get()) ||
+            dynamic_cast<AppendMemoryStmt*>(ast.get()) ||
+            dynamic_cast<TagMemoryStmt*>(ast.get());
         if (statementChangesSchema) {
             schemaChanging = true;
         }

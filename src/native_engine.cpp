@@ -1,5 +1,7 @@
 #include "native_engine.h"
 
+#include "codegen.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -423,6 +425,296 @@ std::string normalizeColumnPredicateOp(std::string op,
     return op;
 }
 
+std::string rowIdString(RowId row) {
+    return std::to_string(row.page) + ":" + std::to_string(row.slot);
+}
+
+RowId parseRowIdString(const std::string& text) {
+    const auto colon = text.find(':');
+    if (colon == std::string::npos) {
+        throw std::runtime_error("Malformed snapshot row id: " + text);
+    }
+    const auto page = std::stoul(text.substr(0, colon));
+    const auto slot = std::stoul(text.substr(colon + 1));
+    return RowId{static_cast<std::uint32_t>(page),
+                 static_cast<std::uint16_t>(slot)};
+}
+
+std::uint64_t fnv1a64(const std::string& text) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char ch : text) {
+        hash ^= ch;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::uint64_t mix64(std::uint64_t value) {
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33;
+    return value;
+}
+
+std::uint64_t snapshotHash(std::uint64_t seed,
+                           std::uint64_t epoch,
+                           const std::string& key) {
+    return mix64(seed ^ (epoch * 0x9e3779b97f4a7c15ULL) ^ fnv1a64(key));
+}
+
+std::string splitForKey(std::uint64_t seed, const std::string& key) {
+    const auto bucket = snapshotHash(seed, 0, key) % 100;
+    if (bucket < 80) return "train";
+    if (bucket < 90) return "validation";
+    return "test";
+}
+
+std::vector<const SnapshotRowMeta*> plannedSnapshotRows(
+    const DatasetSnapshotMeta& snapshot,
+    std::uint64_t epoch,
+    std::uint64_t rank,
+    std::uint64_t worldSize,
+    const std::string& split = "train") {
+    if (worldSize == 0) {
+        throw std::runtime_error("world-size must be greater than zero");
+    }
+    if (rank >= worldSize) {
+        throw std::runtime_error("rank must be smaller than world-size");
+    }
+
+    std::vector<const SnapshotRowMeta*> rows;
+    rows.reserve(snapshot.rows.size());
+    for (const auto& row : snapshot.rows) {
+        if (row.split == split) rows.push_back(&row);
+    }
+    std::stable_sort(rows.begin(), rows.end(),
+        [&](const SnapshotRowMeta* left,
+            const SnapshotRowMeta* right) {
+        const auto leftHash =
+            snapshotHash(snapshot.seed, epoch, left->rowid);
+        const auto rightHash =
+            snapshotHash(snapshot.seed, epoch, right->rowid);
+        if (leftHash != rightHash) return leftHash < rightHash;
+        return left->rowid < right->rowid;
+    });
+
+    std::vector<const SnapshotRowMeta*> sharded;
+    sharded.reserve((rows.size() + static_cast<std::size_t>(worldSize) - 1) /
+                    static_cast<std::size_t>(worldSize));
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        if (index % worldSize == rank) sharded.push_back(rows[index]);
+    }
+    return sharded;
+}
+
+std::string joinStrings(const std::vector<std::string>& values,
+                        const std::string& separator) {
+    std::string out;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index > 0) out += separator;
+        out += values[index];
+    }
+    return out;
+}
+
+void addKeyValue(NativeQueryResult& result,
+                 const std::string& field,
+                 const std::string& value) {
+    result.rows.push_back(
+        Tuple{Value(field), Value(value)});
+}
+
+std::optional<std::size_t> tableColumnIndex(const TableMeta& table,
+                                            const std::string& column) {
+    for (std::size_t index = 0; index < table.columns.size(); ++index) {
+        if (table.columns[index].name == column) return index;
+    }
+    return std::nullopt;
+}
+
+std::string lowerText(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    return value;
+}
+
+std::string trimText(const std::string& value) {
+    std::size_t first = 0;
+    while (first < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[first]))) {
+        ++first;
+    }
+    std::size_t last = value.size();
+    while (last > first &&
+           std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+        --last;
+    }
+    return value.substr(first, last - first);
+}
+
+std::string cleanAtomValue(std::string value) {
+    value = trimText(value);
+    const auto lower = lowerText(value);
+    for (const std::string& stop : {" but ", " and ", " because "}) {
+        const auto pos = lower.find(stop);
+        if (pos != std::string::npos) {
+            value = value.substr(0, pos);
+            break;
+        }
+    }
+    while (!value.empty() &&
+           (value.back() == '.' || value.back() == '!' ||
+            value.back() == '?' || value.back() == ',' ||
+            value.back() == ';')) {
+        value.pop_back();
+    }
+    return trimText(value);
+}
+
+std::optional<std::string> extractAfterMarker(const std::string& text,
+                                              const std::string& marker) {
+    const auto lower = lowerText(text);
+    const auto pos = lower.find(marker);
+    if (pos == std::string::npos) return std::nullopt;
+    auto value = text.substr(pos + marker.size());
+    const auto punctuation = value.find_first_of(".!?;\n\r");
+    if (punctuation != std::string::npos) {
+        value = value.substr(0, punctuation);
+    }
+    value = cleanAtomValue(value);
+    if (value.empty()) return std::nullopt;
+    return value;
+}
+
+std::string normalizedTab(const std::string& tab);
+
+std::vector<ContextAtomMeta> extractContextAtoms(const AppendMemoryStmt& statement) {
+    std::vector<ContextAtomMeta> atoms;
+    const std::string source =
+        "message_" + std::to_string(statement.messageId);
+    auto add = [&](std::string key,
+                   std::string value,
+                   std::string type) {
+        if (value.empty()) return;
+        ContextAtomMeta atom;
+        atom.key = std::move(key);
+        atom.value = std::move(value);
+        atom.type = std::move(type);
+        atom.status = "active";
+        atom.source = source;
+        atom.tab = normalizedTab(statement.tab);
+        atoms.push_back(std::move(atom));
+    };
+
+    for (const std::string& marker : {
+             "i live in ", "i moved to ", "moved to ",
+             "i am in ", "i'm in ", "my location is ",
+             "i live near "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("user_location", *value, "fact");
+            break;
+        }
+    }
+    for (const std::string& marker : {"i prefer ", "i like "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("user_preference", *value, "preference");
+            break;
+        }
+    }
+    for (const std::string& marker : {
+             "my dog likes ", "my dog loves ", "my dog prefers "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("dog_preference", *value, "preference");
+            break;
+        }
+    }
+    for (const std::string& marker : {
+             "my dog is named ", "my dog's name is "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("dog_name", *value, "fact");
+            break;
+        }
+    }
+    if (auto value = extractAfterMarker(statement.text, "remember that ")) {
+        add("user_constraint", *value, "constraint");
+    }
+    for (const std::string& marker : {"i need ", "i want "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("current_task", *value, "task");
+            break;
+        }
+    }
+    return atoms;
+}
+
+int contextAtomUtility(const ContextAtomMeta& atom,
+                       const std::string& query) {
+    const auto q = lowerText(query);
+    const auto value = lowerText(atom.value);
+    int score = 10;
+    if (q.find(value) != std::string::npos && !value.empty()) score += 40;
+    if (atom.key == "user_location" &&
+        (q.find("near me") != std::string::npos ||
+         q.find("nearby") != std::string::npos ||
+         q.find("restaurant") != std::string::npos ||
+         q.find("weather") != std::string::npos ||
+         q.find("location") != std::string::npos ||
+         q.find("near ") != std::string::npos)) {
+        score += 100;
+    }
+    if (atom.type == "constraint") score += 80;
+    if (atom.type == "preference" &&
+        (q.find("recommend") != std::string::npos ||
+         q.find("choose") != std::string::npos ||
+         q.find("prefer") != std::string::npos)) {
+        score += 60;
+    }
+    if (atom.type == "task") score += 50;
+    return score;
+}
+
+std::size_t estimateContextTokens(const std::string& text) {
+    return std::max<std::size_t>(1, (text.size() + 3) / 4);
+}
+
+std::string renderContextAtom(const ContextAtomMeta& atom,
+                              bool receipts) {
+    std::string rendered = atom.type + " " + atom.key + "=" + atom.value;
+    if (receipts) rendered += " @" + atom.source;
+    return rendered;
+}
+
+std::string normalizedTab(const std::string& tab) {
+    const auto cleaned = cleanAtomValue(tab);
+    return cleaned.empty() ? "main" : cleaned;
+}
+
+void recomputeContextAtomStatus(ConversationContextMeta& context) {
+    for (auto& atom : context.atoms) {
+        atom.tab = normalizedTab(atom.tab);
+        atom.status = "active";
+        atom.invalidatedBy.clear();
+    }
+
+    for (std::size_t index = 0; index < context.atoms.size(); ++index) {
+        const auto& atom = context.atoms[index];
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            auto& existing = context.atoms[prior];
+            if (existing.status == "active" &&
+                existing.key == atom.key &&
+                existing.tab == atom.tab &&
+                existing.value != atom.value) {
+                existing.status = "invalidated";
+                existing.invalidatedBy = atom.source;
+            }
+        }
+    }
+}
+
 } // namespace
 
 NativeEngine::TypedVector::TypedVector(ValueType valueType)
@@ -676,6 +968,34 @@ NativeQueryResult NativeEngine::execute(const ASTNode* statement) {
     }
     if (auto* select = dynamic_cast<const SelectStmt*>(statement)) {
         return executeSelect(*select);
+    }
+    if (auto* snapshot =
+            dynamic_cast<const CreateSnapshotStmt*>(statement)) {
+        return executeCreateSnapshot(*snapshot);
+    }
+    if (auto* exportTorch =
+            dynamic_cast<const ExportTorchStmt*>(statement)) {
+        return executeExportTorch(*exportTorch);
+    }
+    if (auto* explain =
+            dynamic_cast<const ExplainBatchStmt*>(statement)) {
+        return executeExplainBatch(*explain);
+    }
+    if (auto* context =
+            dynamic_cast<const CreateContextStmt*>(statement)) {
+        return executeCreateContext(*context);
+    }
+    if (auto* memory =
+            dynamic_cast<const AppendMemoryStmt*>(statement)) {
+        return executeAppendMemory(*memory);
+    }
+    if (auto* spill =
+            dynamic_cast<const SpillContextStmt*>(statement)) {
+        return executeSpillContext(*spill);
+    }
+    if (auto* tag =
+            dynamic_cast<const TagMemoryStmt*>(statement)) {
+        return executeTagMemory(*tag);
     }
     throw std::runtime_error("Unsupported native statement");
 }
@@ -984,6 +1304,532 @@ NativeQueryResult NativeEngine::executeDelete(
     }
     result.message = "deleted " + std::to_string(result.rowsAffected) +
                      " row(s)";
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeCreateSnapshot(
+    const CreateSnapshotStmt& statement) {
+    if (catalog_.hasSnapshot(statement.name)) {
+        throw std::runtime_error(
+            "Snapshot already exists: " + statement.name);
+    }
+    if (!statement.source) {
+        throw std::runtime_error("Snapshot requires a source query");
+    }
+    const auto& source = *statement.source;
+    if (!source.joins.empty() || !source.groupBy.empty() ||
+        source.having || source.limit || source.offset) {
+        throw std::runtime_error(
+            "manifest-snapshot currently supports one table with an optional filter");
+    }
+
+    const auto* table = catalog_.getTable(source.fromTable);
+    if (!table) {
+        throw std::runtime_error("Unknown source table: " + source.fromTable);
+    }
+
+    std::vector<std::string> selectedColumns;
+    bool selectedWildcard = false;
+    for (const auto& expression : source.columns) {
+        if (dynamic_cast<const Wildcard*>(expression.get())) {
+            selectedWildcard = true;
+            continue;
+        }
+        auto* column = dynamic_cast<const ColumnRef*>(expression.get());
+        if (!column) {
+            throw std::runtime_error(
+                "manifest-snapshot features must be projected columns");
+        }
+        selectedColumns.push_back(column->column);
+    }
+
+    DatasetSnapshotMeta snapshot;
+    snapshot.name = statement.name;
+    snapshot.sourceTable = source.fromTable;
+    snapshot.schemaFingerprint =
+        std::to_string(catalog_.schemaFingerprint());
+    snapshot.tableVersion = std::to_string(catalog_.revision());
+    snapshot.splitBy = statement.splitBy.empty() ? "row" : statement.splitBy;
+    snapshot.seed = statement.seed;
+    snapshot.label.name = statement.label.name;
+    snapshot.label.spec = statement.label.spec;
+
+    for (const auto& feature : statement.features) {
+        snapshot.features.push_back({feature.name, feature.spec});
+    }
+
+    if (snapshot.label.name.empty()) {
+        if (!selectedColumns.empty()) {
+            snapshot.label.name = selectedColumns.back();
+        } else if (selectedWildcard && !table->columns.empty()) {
+            snapshot.label.name = table->columns.back().name;
+        }
+    }
+
+    if (snapshot.features.empty()) {
+        if (selectedWildcard) {
+            for (const auto& column : table->columns) {
+                if (column.name != snapshot.label.name) {
+                    snapshot.features.push_back({column.name, ""});
+                }
+            }
+        } else {
+            for (const auto& column : selectedColumns) {
+                if (column != snapshot.label.name) {
+                    snapshot.features.push_back({column, ""});
+                }
+            }
+        }
+    }
+
+    if (snapshot.features.empty()) {
+        throw std::runtime_error(
+            "manifest-snapshot requires at least one feature");
+    }
+    if (snapshot.label.name.empty()) {
+        throw std::runtime_error("manifest-snapshot requires a label");
+    }
+
+    for (const auto& feature : snapshot.features) {
+        if (!tableColumnIndex(*table, feature.name)) {
+            throw std::runtime_error(
+                "Unknown feature column: " + feature.name);
+        }
+    }
+    const auto labelIndex = tableColumnIndex(*table, snapshot.label.name);
+    if (!labelIndex) {
+        throw std::runtime_error(
+            "Unknown label column: " + snapshot.label.name);
+    }
+
+    const bool splitByRow =
+        snapshot.splitBy == "row" || snapshot.splitBy == "rowid";
+    if (!splitByRow && !tableColumnIndex(*table, snapshot.splitBy)) {
+        throw std::runtime_error(
+            "Unknown split key column: " + snapshot.splitBy);
+    }
+
+    CodeGen codegen;
+    snapshot.queryText = codegen.generate(&source);
+
+    std::unordered_map<std::string, std::set<std::string>> splitKeySplits;
+    std::unordered_map<std::string, std::set<std::string>> userIdSplits;
+    const auto userIdIndex = tableColumnIndex(*table, "user_id");
+
+    auto rows = scanTable(source.fromTable, source.fromAlias);
+    for (const auto& scanned : rows) {
+        if (source.where &&
+            !eval(source.where.get(), scanned.row).asBoolean()) {
+            continue;
+        }
+
+        const std::string rowid = rowIdString(scanned.id);
+        std::string splitKey = rowid;
+        if (!splitByRow) {
+            ColumnRef splitColumn;
+            splitColumn.column = snapshot.splitBy;
+            splitKey = resolveColumn(splitColumn, scanned.row).toString();
+        }
+        const std::string split = splitForKey(snapshot.seed, splitKey);
+        snapshot.rows.push_back({rowid, split});
+
+        if (!splitByRow) {
+            splitKeySplits[splitKey].insert(split);
+        }
+        if (userIdIndex && snapshot.splitBy != "user_id" &&
+            *userIdIndex < scanned.row.values.size()) {
+            userIdSplits[scanned.row.values[*userIdIndex].toString()]
+                .insert(split);
+        }
+    }
+
+    for (const auto& entry : splitKeySplits) {
+        if (entry.second.size() > 1) {
+            snapshot.warnings.push_back(
+                "leakage-check sus: split key '" + entry.first +
+                "' appears in multiple splits");
+            break;
+        }
+    }
+    for (const auto& entry : userIdSplits) {
+        if (entry.second.size() > 1) {
+            snapshot.warnings.push_back(
+                "leakage-check sus: user_id '" + entry.first +
+                "' appears in multiple splits; prefer split-by user_id");
+            break;
+        }
+    }
+
+    catalog_.addSnapshot(snapshot);
+    catalog_.save();
+
+    std::size_t train = 0;
+    std::size_t validation = 0;
+    std::size_t test = 0;
+    for (const auto& row : snapshot.rows) {
+        if (row.split == "train") ++train;
+        else if (row.split == "validation") ++validation;
+        else if (row.split == "test") ++test;
+    }
+
+    std::vector<std::string> featureNames;
+    featureNames.reserve(snapshot.features.size());
+    for (const auto& feature : snapshot.features) {
+        featureNames.push_back(feature.name);
+    }
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "snapshot", snapshot.name);
+    addKeyValue(result, "rows", std::to_string(snapshot.rows.size()));
+    addKeyValue(result, "train_rows", std::to_string(train));
+    addKeyValue(result, "validation_rows", std::to_string(validation));
+    addKeyValue(result, "test_rows", std::to_string(test));
+    addKeyValue(result, "split_by", snapshot.splitBy);
+    addKeyValue(result, "seed", std::to_string(snapshot.seed));
+    addKeyValue(result, "features", joinStrings(featureNames, ","));
+    addKeyValue(result, "label", snapshot.label.name);
+    if (!snapshot.warnings.empty()) {
+        addKeyValue(result, "warning",
+                    joinStrings(snapshot.warnings, " | "));
+    }
+    result.message = "manifested snapshot " + snapshot.name;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeExportTorch(
+    const ExportTorchStmt& statement) {
+    const auto* snapshot = catalog_.getSnapshot(statement.dataset);
+    if (!snapshot) {
+        throw std::runtime_error("Unknown snapshot: " + statement.dataset);
+    }
+    if (statement.batchSize == 0) {
+        throw std::runtime_error("batch-size must be greater than zero");
+    }
+    const auto planned = plannedSnapshotRows(
+        *snapshot, statement.epoch, statement.rank, statement.worldSize);
+    const auto batches =
+        (planned.size() + static_cast<std::size_t>(statement.batchSize) - 1) /
+        static_cast<std::size_t>(statement.batchSize);
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "snapshot", snapshot->name);
+    addKeyValue(result, "torch_dataset",
+                "from tensorql import TensorQLDataset");
+    addKeyValue(result, "python",
+                "TensorQLDataset(db_path, dataset=\"" + snapshot->name +
+                "\", batch_size=" +
+                std::to_string(statement.batchSize) + ")");
+    addKeyValue(result, "samples", std::to_string(planned.size()));
+    addKeyValue(result, "batches", std::to_string(batches));
+    addKeyValue(result, "batch_size", std::to_string(statement.batchSize));
+    addKeyValue(result, "shuffle", statement.deterministicShuffle
+                ? "deterministic" : "off");
+    addKeyValue(result, "epoch", std::to_string(statement.epoch));
+    addKeyValue(result, "rank", std::to_string(statement.rank));
+    addKeyValue(result, "world_size", std::to_string(statement.worldSize));
+    result.message = "torch export plan ready for " + snapshot->name;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeExplainBatch(
+    const ExplainBatchStmt& statement) {
+    const auto* snapshot = catalog_.getSnapshot(statement.dataset);
+    if (!snapshot) {
+        throw std::runtime_error("Unknown snapshot: " + statement.dataset);
+    }
+    if (statement.batchSize == 0) {
+        throw std::runtime_error("batch-size must be greater than zero");
+    }
+
+    const auto planned = plannedSnapshotRows(
+        *snapshot, statement.epoch, statement.rank, statement.worldSize);
+    const auto start =
+        static_cast<std::size_t>(statement.batch) *
+        static_cast<std::size_t>(statement.batchSize);
+    const auto end = std::min(
+        planned.size(),
+        start + static_cast<std::size_t>(statement.batchSize));
+
+    std::vector<const SnapshotRowMeta*> batchRows;
+    if (start < planned.size()) {
+        batchRows.insert(batchRows.end(),
+                         planned.begin() + static_cast<std::ptrdiff_t>(start),
+                         planned.begin() + static_cast<std::ptrdiff_t>(end));
+    }
+
+    const auto* table = catalog_.getTable(snapshot->sourceTable);
+    if (!table) {
+        throw std::runtime_error(
+            "Snapshot source table disappeared: " + snapshot->sourceTable);
+    }
+    const auto labelIndex = tableColumnIndex(*table, snapshot->label.name);
+    if (!labelIndex) {
+        throw std::runtime_error(
+            "Snapshot label column disappeared: " + snapshot->label.name);
+    }
+
+    std::map<std::string, std::size_t> labelCounts;
+    auto file = heap(snapshot->sourceTable);
+    std::vector<std::string> rowids;
+    rowids.reserve(batchRows.size());
+    for (const auto* row : batchRows) {
+        rowids.push_back(row->rowid);
+        auto stored = file.read(parseRowIdString(row->rowid));
+        if (!stored || *labelIndex >= stored->values.size()) continue;
+        ++labelCounts[stored->values[*labelIndex].toString()];
+    }
+
+    std::vector<std::string> labelParts;
+    for (const auto& entry : labelCounts) {
+        labelParts.push_back(entry.first + "=" +
+                             std::to_string(entry.second));
+    }
+    std::vector<std::string> featureNames;
+    for (const auto& feature : snapshot->features) {
+        featureNames.push_back(feature.name);
+    }
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "snapshot", snapshot->name);
+    addKeyValue(result, "batch", std::to_string(statement.batch));
+    addKeyValue(result, "samples", std::to_string(batchRows.size()));
+    addKeyValue(result, "source_rows",
+                rowids.empty() ? "" : joinStrings(rowids, ","));
+    if (!rowids.empty()) {
+        addKeyValue(result, "source_range",
+                    rowids.front() + "-" + rowids.back());
+    }
+    addKeyValue(result, "feature_columns",
+                joinStrings(featureNames, ","));
+    addKeyValue(result, "label_distribution",
+                joinStrings(labelParts, ","));
+    addKeyValue(result, "split", "train");
+    addKeyValue(result, "seed", std::to_string(snapshot->seed));
+    addKeyValue(result, "epoch", std::to_string(statement.epoch));
+    addKeyValue(result, "rank",
+                std::to_string(statement.rank) + "/" +
+                std::to_string(statement.worldSize));
+    addKeyValue(result, "worker", "0");
+    addKeyValue(result, "resume_token",
+                snapshot->name + ":epoch=" +
+                std::to_string(statement.epoch) + ":batch=" +
+                std::to_string(statement.batch) + ":rank=" +
+                std::to_string(statement.rank));
+    result.message = "spilled batch provenance for " + snapshot->name;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeCreateContext(
+    const CreateContextStmt& statement) {
+    if (catalog_.hasContext(statement.name)) {
+        throw std::runtime_error(
+            "Context already exists: " + statement.name);
+    }
+    ConversationContextMeta context;
+    context.name = statement.name;
+    catalog_.addContext(context);
+    catalog_.save();
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", statement.name);
+    addKeyValue(result, "messages", "0");
+    addKeyValue(result, "atoms", "0");
+    result.message = "manifested context " + statement.name;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeAppendMemory(
+    const AppendMemoryStmt& statement) {
+    const auto* existing = catalog_.getContext(statement.context);
+    if (!existing) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+    ConversationContextMeta context = *existing;
+    for (const auto& message : context.messages) {
+        if (message.id == statement.messageId) {
+            throw std::runtime_error(
+                "Duplicate context message id: " +
+                std::to_string(statement.messageId));
+        }
+    }
+
+    ContextMessageMeta message;
+    message.id = statement.messageId;
+    message.speaker = statement.speaker;
+    message.text = statement.text;
+    message.tab = normalizedTab(statement.tab);
+    context.messages.push_back(message);
+
+    auto atoms = extractContextAtoms(statement);
+    const std::string invalidator =
+        "message_" + std::to_string(statement.messageId);
+    std::size_t invalidated = 0;
+    for (const auto& atom : atoms) {
+        for (auto& existingAtom : context.atoms) {
+            if (existingAtom.status == "active" &&
+                existingAtom.key == atom.key &&
+                existingAtom.tab == atom.tab &&
+                existingAtom.value != atom.value) {
+                existingAtom.status = "invalidated";
+                existingAtom.invalidatedBy = invalidator;
+                ++invalidated;
+            }
+        }
+        context.atoms.push_back(atom);
+    }
+
+    catalog_.addContext(context);
+    catalog_.save();
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", statement.context);
+    addKeyValue(result, "message", invalidator);
+    addKeyValue(result, "speaker", statement.speaker);
+    addKeyValue(result, "tab", message.tab);
+    addKeyValue(result, "extracted_atoms", std::to_string(atoms.size()));
+    addKeyValue(result, "invalidated_atoms", std::to_string(invalidated));
+    for (const auto& atom : atoms) {
+        addKeyValue(result, "atom",
+                    atom.key + "=" + atom.value + " @" + atom.source);
+    }
+    result.message = "yeeted memory into " + statement.context;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeTagMemory(
+    const TagMemoryStmt& statement) {
+    const auto* existing = catalog_.getContext(statement.context);
+    if (!existing) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+    ConversationContextMeta context = *existing;
+    const std::string source =
+        "message_" + std::to_string(statement.messageId);
+    const std::string tab = normalizedTab(statement.tab);
+
+    bool found = false;
+    for (auto& message : context.messages) {
+        if (message.id == statement.messageId) {
+            message.tab = tab;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        throw std::runtime_error(
+            "Unknown context message id: " +
+            std::to_string(statement.messageId));
+    }
+
+    std::size_t retaggedAtoms = 0;
+    for (auto& atom : context.atoms) {
+        if (atom.source == source) {
+            atom.tab = tab;
+            ++retaggedAtoms;
+        }
+    }
+    recomputeContextAtomStatus(context);
+
+    catalog_.addContext(context);
+    catalog_.save();
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", statement.context);
+    addKeyValue(result, "message", source);
+    addKeyValue(result, "tab", tab);
+    addKeyValue(result, "retagged_atoms", std::to_string(retaggedAtoms));
+    result.message = "vibe-tabbed memory in " + statement.context;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeSpillContext(
+    const SpillContextStmt& statement) {
+    const auto* context = catalog_.getContext(statement.context);
+    if (!context) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+
+    struct RankedAtom {
+        const ContextAtomMeta* atom = nullptr;
+        int utility = 0;
+        std::size_t ordinal = 0;
+    };
+
+    std::vector<RankedAtom> active;
+    std::vector<const ContextAtomMeta*> invalidated;
+    const std::string tabFilter = statement.tab.empty()
+        ? std::string{}
+        : normalizedTab(statement.tab);
+    for (std::size_t index = 0; index < context->atoms.size(); ++index) {
+        const auto& atom = context->atoms[index];
+        if (!tabFilter.empty() && atom.tab != tabFilter) continue;
+        if (atom.status == "active") {
+            active.push_back(
+                RankedAtom{&atom, contextAtomUtility(atom, statement.query),
+                           index});
+        } else if (atom.status == "invalidated") {
+            invalidated.push_back(&atom);
+        }
+    }
+    std::stable_sort(active.begin(), active.end(),
+        [](const RankedAtom& left, const RankedAtom& right) {
+        if (left.utility != right.utility) {
+            return left.utility > right.utility;
+        }
+        return left.ordinal > right.ordinal;
+    });
+
+    std::vector<std::string> renderedAtoms;
+    std::size_t tokenCost = 0;
+    for (const auto& ranked : active) {
+        std::string rendered =
+            renderContextAtom(*ranked.atom, statement.receipts);
+        const auto cost = estimateContextTokens(rendered);
+        if (!renderedAtoms.empty() &&
+            tokenCost + cost > statement.tokenBudget) {
+            continue;
+        }
+        if (renderedAtoms.empty() && cost > statement.tokenBudget) {
+            continue;
+        }
+        renderedAtoms.push_back(std::move(rendered));
+        tokenCost += cost;
+    }
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", context->name);
+    addKeyValue(result, "query", statement.query);
+    addKeyValue(result, "tab",
+                tabFilter.empty() ? "all" : tabFilter);
+    addKeyValue(result, "token_budget",
+                std::to_string(statement.tokenBudget));
+    addKeyValue(result, "token_cost", std::to_string(tokenCost));
+    addKeyValue(result, "messages",
+                std::to_string(context->messages.size()));
+    addKeyValue(result, "active_atoms", std::to_string(active.size()));
+    addKeyValue(result, "rendered_atoms",
+                std::to_string(renderedAtoms.size()));
+    addKeyValue(result, "current_context",
+                joinStrings(renderedAtoms, " | "));
+
+    for (const auto& rendered : renderedAtoms) {
+        addKeyValue(result, "view_atom", rendered);
+    }
+    if (statement.receipts) {
+        for (const auto* atom : invalidated) {
+            addKeyValue(result, "invalidated",
+                atom->key + "=" + atom->value + " @" + atom->source +
+                " invalidated_by=" + atom->invalidatedBy);
+        }
+    }
+    result.message = "spilled context view for " + context->name;
     return result;
 }
 

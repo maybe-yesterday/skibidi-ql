@@ -1,0 +1,27 @@
+manifest-context convo_123;
+
+yeet-memory convo_123 drip
+    (1, 'user', 'I live in Seattle.');
+
+yeet-memory convo_123 drip
+    (88, 'user', 'Actually I moved to NYC.');
+
+yeet-memory convo_123 drip
+    (89, 'user', 'I prefer quiet restaurants.');
+
+yeet-memory convo_123 drip
+    (90, 'user', 'My dog likes salmon.')
+vibe-tab 'convo about dog';
+
+spill-context convo_123
+only-if 'Find restaurants near me'
+token-budget 200
+receipts on;
+
+spill-context convo_123
+vibe-tab 'convo about dog'
+only-if 'what does my dog like?'
+token-budget 200
+receipts on;
+
+vibe-tab convo_123 message 88 'travel';
