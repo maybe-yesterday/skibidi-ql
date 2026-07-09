@@ -264,7 +264,92 @@ loader = DataLoader(ds, batch_size=None, num_workers=4)
 
 ## Benchmarks
 
-### Context strategy benchmark
+### Agent context quality benchmark
+
+This is the headline benchmark for the main thesis: context is data, so test it
+like data. The suite compares SkibidiQL against common non-database memory
+strategies:
+
+- full-history prompt stuffing
+- recency-window memory
+- keyword scan
+- lexical/BM25-style RAG over message chunks
+- rule/extractive summary memory
+
+It generates many flavors of long-running assistant-memory failure modes:
+
+- contradictions and stale facts
+- topic switches and explicit tabs
+- stale preferences and stable cross-topic preferences
+- summary compression loss
+- long-running task/debug continuity
+- open questions and project decisions
+- ACL-restricted facts that must redact raw values
+
+```bash
+cmake --build build --config Release --target skibidi_context_benchmark
+./build/benchmarks/skibidi_context_benchmark \
+  --quality-suite \
+  --scenarios 50 \
+  --scenario-messages 80 \
+  --token-budget 192
+```
+
+Measurement setup: the corpus is generated inside
+`benchmarks/context_benchmark.cpp`. `--scenarios 50 --scenario-messages 80`
+means 50 synthetic assistant conversations, each padded to 80 messages, with
+ground-truth sets of needed active facts, invalidated facts, and restricted raw
+values. No LLM judge is used. `lexical_rag` is a dependency-free BM25-ish
+message retriever, not embedding RAG. `extractive_summary` is a deterministic
+rule/extractive proxy that keeps durable-looking lines; no GPT/Claude/etc.
+summary model is used. Policy-safe active recall counts a needed fact only if
+the rendered context contains the active fact in an allowed form; for ACL
+cases, the redaction receipt counts and the raw secret does not.
+
+Local Release result:
+
+> On 50 synthetic long-running assistant conversations with contradictions,
+> topic switches, stale preferences, stable preferences, summary compression
+> loss, task/debug state, open questions, decisions, and ACL-restricted facts,
+> SkibidiQL achieved 100.0% policy-safe active recall using 64.6% fewer tokens
+> than lexical RAG and 81.5% fewer tokens than recency-window memory, while
+> correctly excluding 100.0% of invalidated facts and 100.0% of ACL-restricted
+> raw values.
+
+| Method | What it simulates | Policy-safe active recall | Avg tokens | Invalidated excluded | ACL raw excluded |
+|---|---|---:|---:|---:|---:|
+| SkibidiQL | relational context DB | 100.0% | 33.9 | 100.0% | 100.0% |
+| full_history | paste every message | 87.5% | 1794.5 | 0.0% | 0.0% |
+| recency_window | last messages until budget | 0.0% | 183.3 | 100.0% | 100.0% |
+| keyword_scan | query term scan | 73.4% | 46.8 | 33.3% | 66.7% |
+| lexical_rag | BM25-ish dependency-free RAG | 87.5% | 95.9 | 0.0% | 0.0% |
+| extractive_summary | rule/extractive summary proxy | 81.2% | 33.8 | 0.0% | 0.0% |
+
+Challenge split, by policy-safe active recall:
+
+| Challenge flavor | SkibidiQL | Recency | RAG | Extractive summary |
+|---|---:|---:|---:|---:|
+| ACL-restricted facts | 100.0% | 0.0% | 0.0% | 0.0% |
+| contradictions + stale location | 100.0% | 0.0% | 100.0% | 100.0% |
+| contradictions inside a topic tab | 100.0% | 0.0% | 100.0% | 100.0% |
+| debug/task continuity | 100.0% | 0.0% | 100.0% | 100.0% |
+| long-running task state | 100.0% | 0.0% | 100.0% | 100.0% |
+| open questions + decisions | 100.0% | 0.0% | 100.0% | 100.0% |
+| stable preferences + topic switches | 100.0% | 0.0% | 100.0% | 100.0% |
+| stale preferences | 100.0% | 0.0% | 100.0% | 100.0% |
+| summary compression loss | 100.0% | 0.0% | 100.0% | 0.0% |
+| topic switches + tab retrieval | 100.0% | 0.0% | 100.0% | 100.0% |
+
+The RAG and extractive-summary baselines can find many easy non-ACL facts, but
+they do not know which facts were invalidated and they leak raw restricted
+values. The extractive summary also misses the dedicated summary-compression
+challenge, where durable-looking but irrelevant notes fill the summary budget
+before the needed fact appears. Recency looks safe on invalidation/ACL only
+because it misses the relevant facts. That is exactly the gap SkibidiQL is
+targeting: context should have schemas, provenance, validity, and policy, not
+just retrieval.
+
+### Context strategy microbenchmark
 
 This compares SkibidiQL context retrieval against non-SkibidiQL baselines:
 full-history prompt stuffing, recency windows, and keyword scans.
