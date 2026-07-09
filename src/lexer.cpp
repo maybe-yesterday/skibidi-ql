@@ -33,6 +33,7 @@ const std::unordered_map<std::string, TokenType> Lexer::KEYWORDS = {
     {"manifest-context", TokenType::MANIFEST_CONTEXT},
     {"yeet-memory",     TokenType::YEET_MEMORY},
     {"spill-context",   TokenType::SPILL_CONTEXT},
+    {"explain-context", TokenType::EXPLAIN_CONTEXT},
     {"show-tabs",       TokenType::SHOW_TABS},
     {"show-context-schemas", TokenType::SHOW_CONTEXT_SCHEMAS},
     {"show-context-objects", TokenType::SHOW_CONTEXT_OBJECTS},

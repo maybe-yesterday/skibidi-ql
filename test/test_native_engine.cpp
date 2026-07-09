@@ -1257,6 +1257,36 @@ TEST(native_engine_prompt_extractor_handles_new_atom_types) {
     ASSERT_CONTAINS(fieldValue(spill, "current_context"), "user_constraint=");
 }
 
+TEST(native_engine_explain_context_reports_prompt_view_plan) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'I live in Seattle.') vibe-tab 'where';"
+        "yeet-memory convo_123 drip "
+        "(2, 'user', 'Actually I moved to NYC.') vibe-tab 'where';"
+        "explain-context convo_123 vibe-tab 'where' "
+        "only-if 'restaurants near me' token-budget 200 receipts on;");
+
+    ASSERT_EQ(results.size(), (size_t)4);
+    const auto& explain = results[3];
+    ASSERT_CONTAINS(fieldValue(explain, "thesis"),
+                    "maintains the prompt");
+    ASSERT_CONTAINS(fieldValue(explain, "plan"),
+                    "Scan messages -> Scan atoms");
+    ASSERT_EQ(fieldValue(explain, "scan_messages"), std::string("2/2"));
+    ASSERT_EQ(fieldValue(explain, "scan_atoms"), std::string("2/2"));
+    ASSERT_EQ(fieldValue(explain, "pruned_invalidated_atoms"),
+              std::string("1"));
+    ASSERT_EQ(fieldValue(explain, "rendered_if_spilled"),
+              std::string("1"));
+    ASSERT_CONTAINS(fieldValue(explain, "provenance_model"),
+                    "git-blame-for-prompts");
+    ASSERT_CONTAINS(fieldValue(explain, "ranked_atom"),
+                    "user_location=NYC");
+}
+
 TEST(native_engine_merge_tabs_recomputes_contradiction_status) {
     NativeTestDatabase database;
     auto results = executeSource(

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "skibidi_config.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -80,8 +82,10 @@ struct StoredRow {
 
 class SlottedPage {
 public:
-    static constexpr std::size_t PAGE_SIZE = 4096;
-    static constexpr std::uint32_t MAGIC = 0x534B5047;
+    static constexpr std::size_t PAGE_SIZE =
+        skibidi::config::kPageSizeBytes;
+    static constexpr std::uint32_t MAGIC =
+        skibidi::config::kSlottedPageMagic;
 
     struct RowView {
         const std::uint8_t* data = nullptr;
@@ -139,7 +143,9 @@ public:
         Frame* frame_ = nullptr;
     };
 
-    explicit BufferPool(std::size_t capacityPages = 1024);
+    explicit BufferPool(
+        std::size_t capacityPages =
+            skibidi::config::defaultBufferPoolPages());
     ~BufferPool();
 
     PageGuard fetch(const std::filesystem::path& file,

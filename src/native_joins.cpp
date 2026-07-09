@@ -1,6 +1,8 @@
 #include "native_engine.h"
 
+#include "hash_utils.h"
 #include "native_raw.h"
+#include "skibidi_config.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -19,8 +21,7 @@ struct TupleKeyHash {
     std::size_t operator()(const Tuple& tuple) const {
         std::size_t seed = 0;
         for (const auto& value : tuple) {
-            seed ^= value.hash() + 0x9e3779b97f4a7c15ULL +
-                    (seed << 6) + (seed >> 2);
+            seed = skibidi::hash::combine(seed, value.hash());
         }
         return seed;
     }
@@ -35,9 +36,11 @@ struct TupleKeyEqual {
 class BloomFilter {
 public:
     explicit BloomFilter(std::size_t expectedValues) {
-        std::size_t bits = 64;
+        std::size_t bits = skibidi::config::bloomMinimumBits();
         const std::size_t wanted =
-            std::max<std::size_t>(64, expectedValues * 12);
+            std::max(bits,
+                     expectedValues *
+                         skibidi::config::bloomBitsPerValue());
         while (bits < wanted) bits <<= 1;
         bitMask_ = bits - 1;
         words_.assign((bits + 63) / 64, 0);
@@ -47,14 +50,14 @@ public:
         const auto hash = value.hash();
         set(hash);
         set(hash + mix(hash));
-        set(hash + mix(hash ^ 0x9e3779b97f4a7c15ULL));
+        set(hash + mix(hash ^ skibidi::hash::kGoldenRatio64));
     }
 
     bool mayContain(const Value& value) const {
         const auto hash = value.hash();
         return test(hash) &&
                test(hash + mix(hash)) &&
-               test(hash + mix(hash ^ 0x9e3779b97f4a7c15ULL));
+               test(hash + mix(hash ^ skibidi::hash::kGoldenRatio64));
     }
 
 private:
@@ -62,12 +65,9 @@ private:
     std::size_t bitMask_ = 63;
 
     static std::size_t mix(std::size_t value) {
-        value ^= value >> 33;
-        value *= static_cast<std::size_t>(0xff51afd7ed558ccdULL);
-        value ^= value >> 33;
-        value *= static_cast<std::size_t>(0xc4ceb9fe1a85ec53ULL);
-        value ^= value >> 33;
-        return value | 1U;
+        return static_cast<std::size_t>(
+            skibidi::hash::avalanche64(
+                static_cast<std::uint64_t>(value))) | 1U;
     }
 
     void set(std::size_t hash) {

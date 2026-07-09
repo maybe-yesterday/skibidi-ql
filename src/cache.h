@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ast.h"
+#include "skibidi_config.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -34,8 +35,11 @@ struct CacheStats {
 
 class CompilationCache {
 public:
-    explicit CompilationCache(std::size_t maxEntries = 128,
-                              std::size_t maxBytes = 4 * 1024 * 1024);
+    explicit CompilationCache(
+        std::size_t maxEntries =
+            skibidi::config::defaultCompilationCacheEntries(),
+        std::size_t maxBytes =
+            skibidi::config::kDefaultMaxCompilationCacheBytes);
 
     bool get(std::string_view source,
              std::uint64_t schemaFingerprint,

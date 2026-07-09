@@ -1,4 +1,7 @@
 #pragma once
+
+#include "hash_utils.h"
+
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -136,7 +139,8 @@ private:
     std::unordered_map<std::string, ConversationContextMeta> contexts;
     std::string filePath_;
     std::uint64_t revision_ = 0;
-    std::uint64_t schemaFingerprint_ = 1469598103934665603ULL;
+    std::uint64_t schemaFingerprint_ =
+        skibidi::hash::kFnv1a64OffsetBasis;
 
     void recomputeFingerprint();
 };

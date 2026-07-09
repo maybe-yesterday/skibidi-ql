@@ -26,6 +26,7 @@ struct ExplainBatchStmt;
 struct CreateContextStmt;
 struct AppendMemoryStmt;
 struct SpillContextStmt;
+struct ExplainContextStmt;
 struct TagMemoryStmt;
 struct ShowTabsStmt;
 struct ShowContextSchemasStmt;
@@ -57,6 +58,7 @@ struct ASTVisitor {
     virtual void visit(CreateContextStmt&) = 0;
     virtual void visit(AppendMemoryStmt&) = 0;
     virtual void visit(SpillContextStmt&) = 0;
+    virtual void visit(ExplainContextStmt&) = 0;
     virtual void visit(TagMemoryStmt&) = 0;
     virtual void visit(ShowTabsStmt&) = 0;
     virtual void visit(ShowContextSchemasStmt&) = 0;
@@ -694,6 +696,28 @@ struct SpillContextStmt : ASTNode {
     }
     std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<SpillContextStmt>(*this);
+        return n;
+    }
+};
+
+struct ExplainContextStmt : ASTNode {
+    std::string context;
+    std::string query;
+    std::string tab;
+    unsigned long long tokenBudget = 1200;
+    bool receipts = true;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "ExplainContextStmt(" << context << ", token-budget "
+           << tokenBudget << ", receipts "
+           << (receipts ? "on" : "off");
+        if (!tab.empty()) os << ", tab " << tab;
+        os << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ExplainContextStmt>(*this);
         return n;
     }
 };

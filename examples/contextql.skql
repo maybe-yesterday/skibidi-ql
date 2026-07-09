@@ -21,6 +21,11 @@ yeet-memory convo_123 drip
     (91, 'user', 'I like cat cafes.')
 vibe-tab 'pet stuff';
 
+explain-context convo_123
+only-if 'Find restaurants near me'
+token-budget 200
+receipts on;
+
 spill-context convo_123
 only-if 'Find restaurants near me'
 token-budget 200

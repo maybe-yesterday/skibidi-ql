@@ -49,6 +49,7 @@ std::string CodeGen::generate(const ASTNode* node) {
     if (auto* s = dynamic_cast<const CreateContextStmt*>(node)) return genCreateContext(s);
     if (auto* s = dynamic_cast<const AppendMemoryStmt*>(node)) return genAppendMemory(s);
     if (auto* s = dynamic_cast<const SpillContextStmt*>(node)) return genSpillContext(s);
+    if (auto* s = dynamic_cast<const ExplainContextStmt*>(node)) return genExplainContext(s);
     if (auto* s = dynamic_cast<const TagMemoryStmt*>(node)) return genTagMemory(s);
     if (auto* s = dynamic_cast<const ShowTabsStmt*>(node)) return genShowTabs(s);
     if (auto* s = dynamic_cast<const ShowContextSchemasStmt*>(node)) return genShowContextSchemas(s);
@@ -419,6 +420,16 @@ std::string CodeGen::genSpillContext(const SpillContextStmt* s) {
     out << "-- spill-context " << s->context
         << " token-budget " << s->tokenBudget
         << " receipts " << (s->receipts ? "on" : "off");
+    if (!s->tab.empty()) out << " vibe-tab " << quoteString(s->tab);
+    return out.str();
+}
+
+std::string CodeGen::genExplainContext(const ExplainContextStmt* s) {
+    std::ostringstream out;
+    out << "-- explain-context " << s->context
+        << " token-budget " << s->tokenBudget
+        << " receipts " << (s->receipts ? "on" : "off");
+    if (!s->query.empty()) out << " query " << quoteString(s->query);
     if (!s->tab.empty()) out << " vibe-tab " << quoteString(s->tab);
     return out.str();
 }

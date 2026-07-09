@@ -33,8 +33,11 @@ struct FastCompilationResult {
 
 class QueryCompiler {
 public:
-    explicit QueryCompiler(std::size_t cacheEntries = 128,
-                           std::size_t cacheBytes = 4 * 1024 * 1024);
+    explicit QueryCompiler(
+        std::size_t cacheEntries =
+            skibidi::config::defaultCompilationCacheEntries(),
+        std::size_t cacheBytes =
+            skibidi::config::kDefaultMaxCompilationCacheBytes);
 
     CompilationResult compile(const std::string& source,
                               const Catalog& catalog,

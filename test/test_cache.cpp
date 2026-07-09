@@ -2,8 +2,11 @@
 
 #include "cache.h"
 #include "compiler.h"
+#include "hash_utils.h"
 #include "metadata.h"
+#include "skibidi_config.h"
 
+#include <cstdint>
 #include <string>
 
 static CachedCompilation cachedSql(const std::string& sql) {
@@ -31,6 +34,16 @@ static TableMeta usersMetadata() {
     table.columns.push_back(std::move(id));
     table.columns.push_back(std::move(name));
     return table;
+}
+
+TEST(stable_hash_and_config_constants_are_named) {
+    ASSERT_EQ(skibidi::hash::fnv1a64("skibidi"),
+              (std::uint64_t)10967903845824559790ULL);
+    ASSERT_EQ(skibidi::hash::kFnv1a64Prime,
+              (std::uint64_t)1099511628211ULL);
+    ASSERT_EQ(skibidi::config::kPageSizeBytes, (std::size_t)4096);
+    ASSERT_EQ(skibidi::config::kSlottedPageMagic,
+              (std::uint32_t)0x534B5047);
 }
 
 TEST(cache_records_hits_and_misses) {

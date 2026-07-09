@@ -6,6 +6,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -82,6 +83,35 @@ bool containsAny(const std::string& lower,
         if (lower.find(needle) != std::string::npos) return true;
     }
     return false;
+}
+
+bool isQueryStopword(const std::string& token) {
+    static const std::unordered_set<std::string> stopwords = {
+        "and", "are", "can", "for", "find", "from", "how",
+        "near", "the", "this", "that", "with", "you"};
+    return stopwords.find(token) != stopwords.end();
+}
+
+int queryValueOverlapScore(const std::string& lowerValue,
+                           const std::string& lowerQuery) {
+    int score = 0;
+    std::string token;
+    auto flush = [&]() {
+        if (token.size() >= 3 && !isQueryStopword(token) &&
+            lowerValue.find(token) != std::string::npos) {
+            score += 20;
+        }
+        token.clear();
+    };
+    for (unsigned char ch : lowerQuery) {
+        if (std::isalnum(ch)) {
+            token.push_back(static_cast<char>(ch));
+        } else {
+            flush();
+        }
+    }
+    flush();
+    return std::min(score, 80);
 }
 
 std::vector<std::string> inferAccessLabels(const std::string& text) {
@@ -318,6 +348,7 @@ int contextAtomUtilityLower(const ContextAtomMeta& atom,
     if (lowerQuery.find(value) != std::string::npos && !value.empty()) {
         score += 40;
     }
+    score += queryValueOverlapScore(value, lowerQuery);
     if (atom.key == "user_location" &&
         (lowerQuery.find("near me") != std::string::npos ||
          lowerQuery.find("nearby") != std::string::npos ||
@@ -333,6 +364,13 @@ int contextAtomUtilityLower(const ContextAtomMeta& atom,
          lowerQuery.find("choose") != std::string::npos ||
          lowerQuery.find("prefer") != std::string::npos)) {
         score += 60;
+    }
+    if (atom.type == "preference" &&
+        containsAny(lowerQuery, {
+            "restaurant", "cafe", "food", "dinner", "lunch"}) &&
+        containsAny(value, {
+            "restaurant", "cafe", "food", "quiet", "coffee"})) {
+        score += 90;
     }
     if (atom.type == "task") score += 50;
     if (atom.type == "decision") score += 70;
@@ -371,6 +409,11 @@ std::string renderContextAtom(const ContextAtomMeta& atom,
         }
     }
     return rendered;
+}
+
+std::string contextAtomDiversityKey(const ContextAtomMeta& atom) {
+    return atom.type + '\x1f' + atom.key + '\x1f' +
+           lowerText(atom.value);
 }
 
 std::string resolveContextTab(const ConversationContextMeta& context,
@@ -861,6 +904,223 @@ NativeQueryResult NativeEngine::executeMergeTabs(
     return result;
 }
 
+NativeQueryResult NativeEngine::executeExplainContext(
+    const ExplainContextStmt& statement) {
+    const std::string key =
+        contextCacheKey(catalog_.revision(),
+                        {"explain", statement.context, statement.tab,
+                         statement.query,
+                         std::to_string(statement.tokenBudget),
+                         statement.receipts ? "receipts:on"
+                                            : "receipts:off"});
+    auto cached = contextResultCache_.find(key);
+    if (cached != contextResultCache_.end()) {
+        ++stats_.contextCacheHits;
+        return cached->second;
+    }
+    ++stats_.contextCacheMisses;
+
+    const auto* context = catalog_.getContext(statement.context);
+    if (!context) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+
+    struct PlanAtom {
+        const ContextAtomMeta* atom = nullptr;
+        int utility = 0;
+        std::size_t ordinal = 0;
+        std::size_t tokenCost = 0;
+        bool redacted = false;
+    };
+
+    const std::string tabFilter = statement.tab.empty()
+        ? std::string{}
+        : resolveContextTab(*context, statement.tab);
+    const std::string lowerQuery = lowerText(statement.query);
+
+    std::size_t scannedMessages = 0;
+    std::size_t scannedAtoms = 0;
+    std::size_t prunedTabMessages = 0;
+    std::size_t prunedTabAtoms = 0;
+    std::size_t prunedInvalidatedAtoms = 0;
+    std::size_t allActiveTokenCost = 0;
+    std::vector<std::string> accessLabels;
+    std::vector<std::string> mentionedEntities;
+    std::vector<PlanAtom> active;
+    std::unordered_map<std::string, std::size_t> activeByDiversityKey;
+    active.reserve(context->atoms.size());
+    activeByDiversityKey.reserve(context->atoms.size());
+
+    for (const auto& message : context->messages) {
+        const std::string tab = resolveContextTab(*context, message.tab);
+        if (!tabFilter.empty() && tab != tabFilter) {
+            ++prunedTabMessages;
+            continue;
+        }
+        ++scannedMessages;
+        for (const auto& label : message.accessLabels) {
+            addUnique(accessLabels, label);
+        }
+        for (const auto& entity : message.mentionedEntities) {
+            addUnique(mentionedEntities, entity);
+        }
+    }
+
+    for (std::size_t index = 0; index < context->atoms.size(); ++index) {
+        const auto& atom = context->atoms[index];
+        const std::string atomTab = resolveContextTab(*context, atom.tab);
+        if (!tabFilter.empty() && atomTab != tabFilter) {
+            ++prunedTabAtoms;
+            continue;
+        }
+        ++scannedAtoms;
+        for (const auto& label : atom.accessLabels) {
+            addUnique(accessLabels, label);
+        }
+        if (atom.status != "active") {
+            ++prunedInvalidatedAtoms;
+            continue;
+        }
+        bool redacted = false;
+        const auto rendered =
+            renderContextAtom(atom, statement.receipts, &redacted);
+        const auto tokenCost = estimateContextTokens(rendered);
+        PlanAtom candidate{&atom,
+                           contextAtomUtilityLower(atom, lowerQuery),
+                           index,
+                           tokenCost,
+                           redacted};
+        auto diversityKey = contextAtomDiversityKey(atom);
+        auto existing = activeByDiversityKey.find(diversityKey);
+        if (existing == activeByDiversityKey.end()) {
+            activeByDiversityKey.emplace(
+                std::move(diversityKey), active.size());
+            active.push_back(candidate);
+            allActiveTokenCost += tokenCost;
+        } else {
+            auto& current = active[existing->second];
+            if (candidate.utility > current.utility ||
+                (candidate.utility == current.utility &&
+                 candidate.ordinal > current.ordinal)) {
+                allActiveTokenCost -= current.tokenCost;
+                current = candidate;
+                allActiveTokenCost += tokenCost;
+            }
+        }
+    }
+
+    std::stable_sort(active.begin(), active.end(),
+        [](const PlanAtom& left, const PlanAtom& right) {
+        if (left.utility != right.utility) {
+            return left.utility > right.utility;
+        }
+        return left.ordinal > right.ordinal;
+    });
+
+    std::size_t renderedAtoms = 0;
+    std::size_t tokenCost = 0;
+    std::size_t redactedAtoms = 0;
+    for (const auto& atom : active) {
+        if (renderedAtoms > 0 &&
+            tokenCost + atom.tokenCost > statement.tokenBudget) {
+            continue;
+        }
+        if (renderedAtoms == 0 &&
+            atom.tokenCost > statement.tokenBudget) {
+            continue;
+        }
+        ++renderedAtoms;
+        tokenCost += atom.tokenCost;
+        if (atom.redacted) ++redactedAtoms;
+    }
+
+    const auto savedTokens =
+        allActiveTokenCost > tokenCost ? allActiveTokenCost - tokenCost : 0;
+    const auto budgetPrunedAtoms =
+        active.size() > renderedAtoms ? active.size() - renderedAtoms : 0;
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", context->name);
+    addKeyValue(result, "thesis",
+                "SkibidiQL maintains the prompt as a relational view");
+    addKeyValue(result, "materialized_view",
+                "CURRENT_CONTEXT(context,tab,query,token_budget)");
+    addKeyValue(result, "query", statement.query);
+    addKeyValue(result, "tab",
+                tabFilter.empty() ? "all" : tabFilter);
+    addKeyValue(result, "token_budget",
+                std::to_string(statement.tokenBudget));
+    addKeyValue(result, "plan",
+                "Scan messages -> Scan atoms -> Prune tab/status/ACL -> "
+                "Rank utility+recency -> Budget render -> Emit receipts");
+    addKeyValue(result, "scan_messages",
+                std::to_string(scannedMessages) + "/" +
+                std::to_string(context->messages.size()));
+    addKeyValue(result, "scan_atoms",
+                std::to_string(scannedAtoms) + "/" +
+                std::to_string(context->atoms.size()));
+    addKeyValue(result, "pruned_tab_messages",
+                std::to_string(prunedTabMessages));
+    addKeyValue(result, "pruned_tab_atoms",
+                std::to_string(prunedTabAtoms));
+    addKeyValue(result, "pruned_invalidated_atoms",
+                std::to_string(prunedInvalidatedAtoms));
+    addKeyValue(result, "rank_candidates",
+                std::to_string(active.size()));
+    addKeyValue(result, "rendered_if_spilled",
+                std::to_string(renderedAtoms));
+    addKeyValue(result, "budget_pruned_atoms",
+                std::to_string(budgetPrunedAtoms));
+    addKeyValue(result, "estimated_token_cost",
+                std::to_string(tokenCost));
+    addKeyValue(result, "estimated_full_token_cost",
+                std::to_string(allActiveTokenCost));
+    addKeyValue(result, "optimizer_saved_tokens",
+                std::to_string(savedTokens));
+    addKeyValue(result, "redacted_atoms",
+                std::to_string(redactedAtoms));
+    addKeyValue(result, "ranker",
+                "query utility + atom type weights + recency tie-break");
+    addKeyValue(result, "context_indexes",
+                "tab,status,key,type,source,access_labels,mentioned_entities");
+    addKeyValue(result, "provenance_model",
+                "git-blame-for-prompts: source message, schema, labels, "
+                "invalidated_by");
+    addKeyValue(result, "cache_policy",
+                "revision-aware prompt view IR cache; invalidated on "
+                "context/catalog mutation");
+    addKeyValue(result, "schema_registry",
+                "CSR: ConversationMessage.v1 + ContextAtom.v1");
+    addKeyValue(result, "dcf_storage_route",
+                "structured=catalog.contexts.messages+atoms; "
+                "vector=ConversationMessage.content; blob=tool/object refs");
+    addKeyValue(result, "access_policy",
+                "schema=agent-internal; labels=" +
+                (accessLabels.empty()
+                     ? std::string("AGENT_INTERNAL")
+                     : joinStrings(accessLabels, ",")) +
+                "; redaction=on");
+    addKeyValue(result, "mentioned_entities",
+                joinStrings(mentionedEntities, ","));
+    if (statement.receipts) {
+        for (std::size_t index = 0;
+             index < active.size() && index < 5;
+             ++index) {
+            const auto* atom = active[index].atom;
+            addKeyValue(result, "ranked_atom",
+                        atom->key + "=" +
+                        redactIfNeeded(atom->value, atom->accessLabels) +
+                        " utility=" +
+                        std::to_string(active[index].utility) +
+                        " source=" + atom->source);
+        }
+    }
+    result.message = "explained context view plan for " + context->name;
+    contextResultCache_[key] = result;
+    return result;
+}
+
 NativeQueryResult NativeEngine::executeSpillContext(
     const SpillContextStmt& statement) {
     ++stats_.contextSpillQueries;
@@ -891,8 +1151,10 @@ NativeQueryResult NativeEngine::executeSpillContext(
 
     std::vector<RankedAtom> active;
     std::vector<const ContextAtomMeta*> invalidated;
+    std::unordered_map<std::string, std::size_t> activeByDiversityKey;
     active.reserve(context->atoms.size());
     invalidated.reserve(context->atoms.size() / 4);
+    activeByDiversityKey.reserve(context->atoms.size());
     const std::string tabFilter = statement.tab.empty()
         ? std::string{}
         : resolveContextTab(*context, statement.tab);
@@ -918,11 +1180,23 @@ NativeQueryResult NativeEngine::executeSpillContext(
         }
         if (atom.status == "active") {
             ++stats_.contextAtomsScored;
-            active.push_back(
-                RankedAtom{
-                    &atom,
-                    contextAtomUtilityLower(atom, lowerQuery),
-                    index});
+            RankedAtom candidate{&atom,
+                                 contextAtomUtilityLower(atom, lowerQuery),
+                                 index};
+            auto diversityKey = contextAtomDiversityKey(atom);
+            auto existing = activeByDiversityKey.find(diversityKey);
+            if (existing == activeByDiversityKey.end()) {
+                activeByDiversityKey.emplace(
+                    std::move(diversityKey), active.size());
+                active.push_back(candidate);
+            } else {
+                auto& current = active[existing->second];
+                if (candidate.utility > current.utility ||
+                    (candidate.utility == current.utility &&
+                     candidate.ordinal > current.ordinal)) {
+                    current = candidate;
+                }
+            }
         } else if (atom.status == "invalidated") {
             invalidated.push_back(&atom);
         }

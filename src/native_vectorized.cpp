@@ -1,5 +1,8 @@
 #include "native_engine.h"
 
+#include "hash_utils.h"
+#include "skibidi_config.h"
+
 #include <algorithm>
 #include <cctype>
 #include <functional>
@@ -17,8 +20,7 @@ struct TupleKeyHash {
     std::size_t operator()(const Tuple& tuple) const {
         std::size_t seed = 0;
         for (const auto& value : tuple) {
-            seed ^= value.hash() + 0x9e3779b97f4a7c15ULL +
-                    (seed << 6) + (seed >> 2);
+            seed = skibidi::hash::combine(seed, value.hash());
         }
         return seed;
     }
@@ -566,7 +568,7 @@ std::optional<NativeQueryResult> NativeEngine::executeVectorizedSelect(
     auto file = heap(statement.fromTable);
     ++stats_.tableScans;
     file.scanProjectedBatches(
-        requiredColumns, 1024,
+        requiredColumns, skibidi::config::vectorBatchRows(),
         [&](std::vector<StoredRow>&& stored) {
         VectorBatch batch;
         batch.rowCount = stored.size();

@@ -1,9 +1,15 @@
 # SkibidiQL
 
-A standalone relational database for the SkibidiQL query language.
-It includes its own persistent page storage, heap files, buffer pool, B+ tree
-indexes, relational execution engine, and transactions. SQLite is optional and
-used only as a compatibility and benchmark backend.
+A standalone relational runtime for LLM context and the SkibidiQL query
+language. Traditional databases maintain tables. Vector databases maintain
+embeddings. SkibidiQL maintains the prompt itself: conversation messages become
+rows, semantic facts become indexed atoms, contradictions become invalidations,
+receipts become provenance, and `SPILL CONTEXT` renders a token-budgeted
+current-context view.
+
+It also includes its own persistent page storage, heap files, buffer pool,
+B+ tree indexes, relational execution engine, and transactions. SQLite is
+optional and used only as a compatibility and benchmark backend.
 
 No SQLite library is required for the default build or runtime.
 
@@ -64,6 +70,7 @@ reproduction details.
 | `manifest-context` | `CREATE CONTEXT` | Create a prompt-context log |
 | `yeet-memory` | `APPEND MEMORY` | Append a message and extract semantic atoms |
 | `spill-context` | `SPILL CONTEXT` | Render the maintained current context view |
+| `explain-context` | `EXPLAIN CONTEXT` | Explain the prompt-view plan / optimizer savings |
 | `show-tabs` | `SHOW TABS` | List prompt-context topic tabs |
 | `show-context-schemas` | `SHOW CONTEXT SCHEMAS` | Inspect the built-in context schema registry |
 | `show-context-objects` | `SHOW CONTEXT OBJECTS` | Inspect schema-aware messages and atoms |
@@ -276,12 +283,11 @@ loader = DataLoader(ds, batch_size=None, num_workers=4)
 PyTorch tensors when PyTorch is installed; text/blob columns stay as Python
 lists for now.
 
-### Prompt Views
+### ContextQL: prompts as maintained views
 
-SkibidiQL also has a small prototype for the idea:
-
-> Prompt context should be a maintained database view over an append-only
-> conversation log, not raw chat history.
+This is the part that makes SkibidiQL more than "a database with some AI
+features." ContextQL treats prompt context as an incremental, maintained view
+over an append-only conversation log.
 
 The core loop is:
 
@@ -289,6 +295,7 @@ The core loop is:
 raw messages
   -> semantic atoms
   -> invalidation / provenance
+  -> cached prompt-view IR
   -> token-budgeted current context view
 ```
 
@@ -298,10 +305,11 @@ Create a context log:
 manifest-context convo_123;
 ```
 
-Append messages. The current prototype uses deterministic rule extraction for
-facts, preferences, constraints, tasks, open questions, decisions, debug
-follow-ups, and a few demo-friendly dog facts, which keeps the demo
-inspectable:
+Append messages. The current implementation uses deterministic rule extraction
+for facts, preferences, constraints, tasks, open questions, decisions, debug
+follow-ups, and a few demo-friendly dog facts. It is intentionally inspectable:
+you can see exactly which rows became prompt atoms and which older atoms were
+invalidated.
 
 ```skql
 yeet-memory convo_123 drip
@@ -330,10 +338,33 @@ field=token_budget | value=200
 field=token_cost | value=8
 ```
 
-This is intentionally not “RAG but with chat logs.” The database bit is view
-maintenance: active/invalidated atoms, provenance, contradiction handling, and
-budget-aware rendering. The prototype persists contexts in the native catalog
-alongside tables and snapshots.
+This is intentionally not "RAG but with chat logs." The database bit is view
+maintenance: active/invalidated atoms, provenance, contradiction handling,
+revision-aware prompt-view caching, and budget-aware rendering. Contexts
+persist in the native catalog alongside tables and snapshots.
+
+You can also ask for the prompt-view plan before rendering:
+
+```skql
+explain-context convo_123
+only-if 'Find restaurants near me'
+token-budget 200
+receipts on;
+```
+
+Example plan rows:
+
+```text
+field=thesis | value=SkibidiQL maintains the prompt as a relational view
+field=plan | value=Scan messages -> Scan atoms -> Prune tab/status/ACL -> Rank utility+recency -> Budget render -> Emit receipts
+field=pruned_invalidated_atoms | value=1
+field=optimizer_saved_tokens | value=37
+field=provenance_model | value=git-blame-for-prompts: source message, schema, labels, invalidated_by
+```
+
+So the pitch is crisp: contexts are tables, facts are rows, prompts are
+materialized-ish views, token limits are query budgets, contradictions are view
+invalidations, and receipts are provenance. No cap, this is the sauce.
 
 Topic tabs are first-class too. An agent can put memories in an explicit
 `vibe-tab`, ask SkibidiQL to pick one with `vibe-tab auto`, query tab inventory
@@ -401,6 +432,52 @@ APPEND MEMORY convo_123 drip (1, 'user', 'I live in Seattle.');
 SPILL CONTEXT convo_123 query 'Find restaurants near me' token_budget 200;
 ```
 
+### Agent runtime playbook
+
+Agents should use the SkibidiQL binary as their maintained context store
+instead of dragging the whole raw conversation into every prompt. The short
+version lives in [.agents/contextql-agent.md](.agents/contextql-agent.md).
+
+Use one persistent native DB directory per agent/workspace:
+
+```bash
+./build/skibidi --db .skibidi_agent_ctx --file agent_context.skql
+```
+
+For each useful event, append memory:
+
+```skql
+manifest-context agent_memory;
+
+yeet-memory agent_memory drip
+    (1001, 'user', 'I prefer concise benchmark summaries.')
+vibe-tab auto;
+```
+
+Before a model call, ask SkibidiQL for a compact prompt view:
+
+```skql
+spill-context agent_memory
+only-if 'current task or question here'
+token-budget 1200
+receipts on;
+```
+
+Put the `current_context` row into the model context. Keep `view_atom`,
+`invalidated`, and `show-context-objects` output around when you need
+provenance receipts. If the context feels sus, ask for the plan:
+
+```skql
+explain-context agent_memory
+only-if 'current task or question here'
+token-budget 1200
+receipts on;
+```
+
+This gives the agent a concrete loop: append rows, let ContextQL maintain the
+prompt view, then render only the relevant budgeted slice. Full-history prompt
+stuffing is the baseline; this is the maintained-view glow-up.
+
 ### Transpile Only (No Execution)
 
 ```bash
@@ -436,6 +513,34 @@ cached:
 ```
 
 Use a Release build for performance measurements.
+
+### Runtime knobs and non-cursed constants
+
+Some big constants in the code are stable algorithms, not random aura farming:
+
+- Catalog/schema fingerprints and plan-cache keys use a 64-bit FNV-1a-style
+  hash. The offset is SkibidiQL's historical seed, so it is named in
+  `hash_utils.h` but not "fixed" to a new value: changing it would invalidate
+  cache keys and reproducible context metadata.
+- Snapshot shuffling and Bloom probes use a SplitMix64-style avalanche step.
+  That stays deterministic so `seed + epoch + rowid` gives the same training
+  order later.
+- Page size and the `SKPG` slotted-page magic are on-disk format constants, so
+  they are documented but not environment-configurable.
+
+Perf knobs that are safe to tune can come from env vars. CLI flags still win:
+
+```bash
+SKIBIDI_BUFFER_PAGES=2048 ./build/skibidi --cache-stats
+SKIBIDI_VECTOR_BATCH_ROWS=4096 ./build/skibidi --file examples/hello.skql
+SKIBIDI_BLOOM_BITS_PER_VALUE=16 ./build/skibidi --cache-stats
+SKIBIDI_EXACT_VALUE_COUNT_LIMIT=8192 ./build/skibidi --cache-stats
+```
+
+Available env knobs: `SKIBIDI_BUFFER_PAGES`, `SKIBIDI_CACHE_ENTRIES`,
+`SKIBIDI_STATEMENT_CACHE_ENTRIES`, `SKIBIDI_VECTOR_BATCH_ROWS`,
+`SKIBIDI_BLOOM_MIN_BITS`, `SKIBIDI_BLOOM_BITS_PER_VALUE`, and
+`SKIBIDI_EXACT_VALUE_COUNT_LIMIT`.
 
 ### Read from stdin
 
@@ -755,6 +860,49 @@ scoring, and JIT/SIMD hot paths. Those need bigger design passes and benchmark
 receipts.
 
 ## Benchmarks
+
+### Context strategy benchmark
+
+The most common context baseline is still full-history prompt stuffing: paste
+every prior message into the next model call and hope the token budget survives.
+SkibidiQL includes a dedicated benchmark for that comparison, plus recency and
+keyword-scan baselines that do not use SkibidiQL:
+
+```bash
+cmake --build build --config Release --target skibidi_context_benchmark
+./build/benchmarks/skibidi_context_benchmark \
+  --messages 1000 --iterations 30 --token-budget 512
+```
+
+Direct MSVC/local binary equivalent:
+
+```powershell
+build\codex_skibidi_context_benchmark.exe `
+  --messages 1000 --iterations 30 --token-budget 512
+```
+
+`--messages` seeds that many prior conversation messages once. `--iterations`
+then runs that many retrieval calls against the fixed conversation; it is just
+the timing/sample count, not more stored messages.
+
+Sample local result for query `Find restaurants near me`:
+
+| Method | Simulates | Time | Ops/sec | Avg prompt tokens | Tok/input msg | Avg returned items | Tok/item | Needed hit/total | Needed recall | Avg scanned msgs | Est mem | Cache hits/misses | Atoms scored/rendered |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| full_history_prompt | stuff every raw message into the prompt | 12.752 ms | 2352.6 | 12205 | 12.205 | 1000.0 | 12.2 | 2.0/2 | 100% | 1000 | 0.24 MiB | 0/0 | 0/0 |
+| recency_window | last messages until token budget | 0.721 ms | 41597.3 | 491 | 0.491 | 40.0 | 12.3 | 2.0/2 | 100% | 41 | 0.17 MiB | 0/0 | 0/0 |
+| keyword_scan | scan raw messages for query terms | 4.282 ms | 7005.3 | 480 | 0.480 | 42.0 | 11.4 | 1.0/2 | 50% | 1000 | 0.17 MiB | 0/0 | 0/0 |
+| skibidi_contextql_varied | maintained prompt view, changing query, no cache reuse | 43.319 ms | 692.5 | 185 | 0.185 | 7.0 | 26.4 | 2.0/2 | 100% | 1000 | 1.35 MiB | 0/30 | 25800/210 |
+| skibidi_contextql_cached | maintained prompt view, same query, revision-aware cache | 0.921 ms | 32587.4 | 185 | 0.185 | 7.0 | 26.4 | 2.0/2 | 100% | 0 | 0.05 MiB | 30/0 | 0/0 |
+
+Interpretation: raw speed alone is not the main flex here; recency is always
+going to be cheap because it does almost no thinking. The better scoreboard is
+quality per token. Full-history stuffing has perfect recall but spends 12k
+prompt tokens. Keyword scan is fast-ish but misses the location fact. ContextQL
+returns the needed facts in 185 prompt tokens, or 0.185 tokens per stored input
+message, while keeping provenance/invalidation/ACL receipts. The uncached
+`varied` path still pays to scan and score atoms; the cached path is the hot
+agent loop after the maintained prompt view is warm.
 
 The native benchmark requires no SQLite:
 

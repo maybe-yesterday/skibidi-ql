@@ -97,6 +97,13 @@ static SpillContextStmt* asSpillContext(const std::unique_ptr<ASTNode>& node) {
     return s;
 }
 
+static ExplainContextStmt* asExplainContext(
+    const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<ExplainContextStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
 static TagMemoryStmt* asTagMemory(const std::unique_ptr<ASTNode>& node) {
     auto* s = dynamic_cast<TagMemoryStmt*>(node.get());
     ASSERT_TRUE(s != nullptr);
@@ -559,6 +566,17 @@ TEST(contextql_manifest_yeet_and_spill_parse) {
     ASSERT_EQ(spill->tokenBudget, (unsigned long long)200);
     ASSERT_TRUE(spill->receipts);
 
+    auto explainStmt = parseOne(
+        "explain-context convo_123 vibe-tab 'convo about dog' "
+        "only-if 'restaurants near me' "
+        "token-budget 200 receipts on;");
+    auto* explain = asExplainContext(explainStmt);
+    ASSERT_EQ(explain->context, std::string("convo_123"));
+    ASSERT_EQ(explain->tab, std::string("convo about dog"));
+    ASSERT_EQ(explain->query, std::string("restaurants near me"));
+    ASSERT_EQ(explain->tokenBudget, (unsigned long long)200);
+    ASSERT_TRUE(explain->receipts);
+
     auto tagStmt = parseOne(
         "vibe-tab convo_123 message 88 'convo about dog';");
     auto* tag = asTagMemory(tagStmt);
@@ -617,6 +635,16 @@ TEST(contextql_plain_aliases_parse) {
     ASSERT_EQ(spill->query, std::string("debug perf"));
     ASSERT_EQ(spill->tokenBudget, (unsigned long long)64);
     ASSERT_FALSE(spill->receipts);
+
+    auto explainStmt = parseOne(
+        "explain context convo_123 tab 'debugging sqlite perf' "
+        "query 'debug perf' token_budget 64 receipts off;");
+    auto* explain = asExplainContext(explainStmt);
+    ASSERT_EQ(explain->context, std::string("convo_123"));
+    ASSERT_EQ(explain->tab, std::string("debugging sqlite perf"));
+    ASSERT_EQ(explain->query, std::string("debug perf"));
+    ASSERT_EQ(explain->tokenBudget, (unsigned long long)64);
+    ASSERT_FALSE(explain->receipts);
 
     auto showStmt = parseOne("show tabs convo_123;");
     auto* show = asShowTabs(showStmt);

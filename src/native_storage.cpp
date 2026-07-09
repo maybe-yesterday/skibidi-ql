@@ -1,5 +1,7 @@
 #include "native_storage.h"
 
+#include "hash_utils.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -44,8 +46,7 @@ T readPod(const std::vector<std::uint8_t>& bytes, std::size_t& offset) {
 }
 
 std::size_t combineHash(std::size_t seed, std::size_t value) {
-    return seed ^ (value + 0x9e3779b97f4a7c15ULL +
-                   (seed << 6) + (seed >> 2));
+    return skibidi::hash::combine(seed, value);
 }
 
 } // namespace
@@ -862,7 +863,8 @@ RowId HeapFile::insert(const Tuple& tuple) {
 
 std::vector<StoredRow> HeapFile::scan() {
     std::vector<StoredRow> rows;
-    scanBatches(1024, [&](std::vector<StoredRow>&& batch) {
+    scanBatches(skibidi::config::vectorBatchRows(),
+                [&](std::vector<StoredRow>&& batch) {
         rows.insert(rows.end(),
                     std::make_move_iterator(batch.begin()),
                     std::make_move_iterator(batch.end()));

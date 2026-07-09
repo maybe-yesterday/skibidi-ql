@@ -1,5 +1,7 @@
 #pragma once
 
+#include "skibidi_config.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <list>
@@ -23,8 +25,10 @@ struct StatementCacheStats {
 
 class SqliteExecutor {
 public:
-    explicit SqliteExecutor(sqlite3* database,
-                            std::size_t cacheEntries = 128);
+    explicit SqliteExecutor(
+        sqlite3* database,
+        std::size_t cacheEntries =
+            skibidi::config::defaultSqliteStatementCacheEntries());
     ~SqliteExecutor();
 
     SqliteExecutor(const SqliteExecutor&) = delete;

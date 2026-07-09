@@ -1,5 +1,7 @@
 #include "executor.h"
 
+#include "hash_utils.h"
+
 #include <sqlite3.h>
 
 #include <cstring>
@@ -152,14 +154,7 @@ StatementCacheStats SqliteExecutor::stats() const {
 }
 
 std::uint64_t SqliteExecutor::hashSql(std::string_view sql) {
-    constexpr std::uint64_t offset = 1469598103934665603ULL;
-    constexpr std::uint64_t prime = 1099511628211ULL;
-    std::uint64_t hash = offset;
-    for (unsigned char ch : sql) {
-        hash ^= ch;
-        hash *= prime;
-    }
-    return hash;
+    return skibidi::hash::fnv1a64(sql);
 }
 
 std::list<SqliteExecutor::Entry>::iterator SqliteExecutor::find(

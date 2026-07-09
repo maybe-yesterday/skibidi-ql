@@ -88,8 +88,10 @@ struct NativeEngineStats {
 
 class NativeEngine {
 public:
-    explicit NativeEngine(std::filesystem::path databasePath,
-                          std::size_t bufferPages = 1024);
+    explicit NativeEngine(
+        std::filesystem::path databasePath,
+        std::size_t bufferPages =
+            skibidi::config::defaultBufferPoolPages());
     ~NativeEngine();
 
     NativeEngine(const NativeEngine&) = delete;
@@ -173,7 +175,8 @@ private:
             std::size_t nonNullCount = 0;
             bool numeric = false;
             std::array<double, 5> rawMoments{};
-            std::array<std::size_t, 16> buckets{};
+            std::array<std::size_t,
+                       skibidi::config::kStatisticsBucketCount> buckets{};
             double bucketMin = 0.0;
             double bucketMax = 0.0;
             bool valueCountsExact = false;
@@ -232,6 +235,8 @@ private:
         const AppendMemoryStmt& statement);
     NativeQueryResult executeSpillContext(
         const SpillContextStmt& statement);
+    NativeQueryResult executeExplainContext(
+        const ExplainContextStmt& statement);
     NativeQueryResult executeTagMemory(
         const TagMemoryStmt& statement);
     NativeQueryResult executeShowTabs(

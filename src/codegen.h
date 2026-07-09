@@ -23,6 +23,7 @@ private:
     std::string genCreateContext(const CreateContextStmt* s);
     std::string genAppendMemory(const AppendMemoryStmt* s);
     std::string genSpillContext(const SpillContextStmt* s);
+    std::string genExplainContext(const ExplainContextStmt* s);
     std::string genTagMemory(const TagMemoryStmt* s);
     std::string genShowTabs(const ShowTabsStmt* s);
     std::string genShowContextSchemas(const ShowContextSchemasStmt* s);

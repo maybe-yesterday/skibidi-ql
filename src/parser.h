@@ -54,6 +54,7 @@ private:
     std::unique_ptr<CreateContextStmt> parseCreateContext();
     std::unique_ptr<AppendMemoryStmt> parseAppendMemory();
     std::unique_ptr<SpillContextStmt> parseSpillContext();
+    std::unique_ptr<ExplainContextStmt> parseExplainContext();
     std::unique_ptr<TagMemoryStmt> parseTagMemory();
     std::unique_ptr<ShowTabsStmt> parseShowTabs();
     std::unique_ptr<ShowContextSchemasStmt> parseShowContextSchemas();

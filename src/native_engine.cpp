@@ -1,7 +1,9 @@
 #include "native_engine.h"
 
 #include "codegen.h"
+#include "hash_utils.h"
 #include "native_raw.h"
+#include "skibidi_config.h"
 
 #include <algorithm>
 #include <chrono>
@@ -23,8 +25,7 @@ struct TupleKeyHash {
     std::size_t operator()(const Tuple& tuple) const {
         std::size_t seed = 0;
         for (const auto& value : tuple) {
-            seed ^= value.hash() + 0x9e3779b97f4a7c15ULL +
-                    (seed << 6) + (seed >> 2);
+            seed = skibidi::hash::combine(seed, value.hash());
         }
         return seed;
     }
@@ -112,34 +113,25 @@ RowId parseRowIdString(const std::string& text) {
                  static_cast<std::uint16_t>(slot)};
 }
 
-std::uint64_t fnv1a64(const std::string& text) {
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (unsigned char ch : text) {
-        hash ^= ch;
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-std::uint64_t mix64(std::uint64_t value) {
-    value ^= value >> 33;
-    value *= 0xff51afd7ed558ccdULL;
-    value ^= value >> 33;
-    value *= 0xc4ceb9fe1a85ec53ULL;
-    value ^= value >> 33;
-    return value;
-}
-
 std::uint64_t snapshotHash(std::uint64_t seed,
                            std::uint64_t epoch,
                            const std::string& key) {
-    return mix64(seed ^ (epoch * 0x9e3779b97f4a7c15ULL) ^ fnv1a64(key));
+    return skibidi::hash::avalanche64(
+        seed ^ (epoch * skibidi::hash::kGoldenRatio64) ^
+        skibidi::hash::fnv1a64(key));
 }
 
 std::string splitForKey(std::uint64_t seed, const std::string& key) {
-    const auto bucket = snapshotHash(seed, 0, key) % 100;
-    if (bucket < 80) return "train";
-    if (bucket < 90) return "validation";
+    const auto bucket =
+        snapshotHash(seed, 0, key) %
+        skibidi::config::kSnapshotSplitBuckets;
+    if (bucket < skibidi::config::kDefaultTrainSplitPercent) {
+        return "train";
+    }
+    if (bucket < skibidi::config::kDefaultTrainSplitPercent +
+                     skibidi::config::kDefaultValidationSplitPercent) {
+        return "validation";
+    }
     return "test";
 }
 
@@ -387,6 +379,10 @@ NativeQueryResult NativeEngine::execute(const ASTNode* statement) {
                 dynamic_cast<const SpillContextStmt*>(statement)) {
             return executeSpillContext(*spill);
         }
+        if (auto* explainContext =
+                dynamic_cast<const ExplainContextStmt*>(statement)) {
+            return executeExplainContext(*explainContext);
+        }
         if (auto* tag =
                 dynamic_cast<const TagMemoryStmt*>(statement)) {
             return executeTagMemory(*tag);
@@ -455,7 +451,8 @@ NativeEngineStats NativeEngine::stats() const {
         result.estimatedMemoryBytes +=
             keys * (sizeof(Value) + sizeof(RowId) + 48);
         result.estimatedMemoryBytes +=
-            (item.second ? item.second->height() : 0) * 1024;
+            (item.second ? item.second->height() : 0) *
+            skibidi::config::kEstimatedIndexLevelBytes;
     }
     for (const auto& item : contextResultCache_) {
         result.estimatedMemoryBytes += item.first.capacity();
@@ -542,6 +539,7 @@ std::vector<NativeLockGuard> NativeEngine::acquireStatementLocks(
     } else if (dynamic_cast<const ExportTorchStmt*>(statement) ||
                dynamic_cast<const ExplainBatchStmt*>(statement) ||
                dynamic_cast<const SpillContextStmt*>(statement) ||
+               dynamic_cast<const ExplainContextStmt*>(statement) ||
                dynamic_cast<const ShowTabsStmt*>(statement) ||
                dynamic_cast<const ShowContextSchemasStmt*>(statement) ||
                dynamic_cast<const ShowContextObjectsStmt*>(statement)) {
@@ -1746,7 +1744,8 @@ NativeEngine::ensureColumnRange(const std::string& table,
     std::size_t rows = 0;
     std::vector<double> numericSamples;
     bool valueCountsExact = true;
-    constexpr std::size_t maxExactValueCounts = 4096;
+    const std::size_t maxExactValueCounts =
+        skibidi::config::exactValueCountLimit();
     auto file = heap(table);
     file.scanRawRowsFast(
         [&](RowId, const std::uint8_t* data, std::size_t length) {

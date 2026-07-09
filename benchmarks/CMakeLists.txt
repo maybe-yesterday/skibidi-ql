@@ -2,6 +2,10 @@ add_executable(skibidi_native_benchmark native_benchmark.cpp)
 target_link_libraries(skibidi_native_benchmark PRIVATE skibidi_core)
 skibidi_warnings(skibidi_native_benchmark)
 
+add_executable(skibidi_context_benchmark context_benchmark.cpp)
+target_link_libraries(skibidi_context_benchmark PRIVATE skibidi_core)
+skibidi_warnings(skibidi_context_benchmark)
+
 if(SKIBIDI_WITH_SQLITE)
     add_executable(skibidi_benchmark benchmark.cpp)
     target_link_libraries(skibidi_benchmark PRIVATE skibidi_core)

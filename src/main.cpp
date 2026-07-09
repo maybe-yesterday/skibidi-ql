@@ -10,6 +10,7 @@
 #include "compiler.h"
 #include "native_engine.h"
 #include "parser.h"
+#include "skibidi_config.h"
 
 #ifdef SKIBIDI_WITH_SQLITE
 #include "executor.h"
@@ -26,11 +27,14 @@ struct Options {
     bool transpileOnly = false;
     bool cacheEnabled = true;
     bool cacheStats = false;
-    std::size_t cacheEntries = 128;
-    std::size_t bufferPages = 1024;
+    std::size_t cacheEntries =
+        skibidi::config::defaultCompilationCacheEntries();
+    std::size_t bufferPages =
+        skibidi::config::defaultBufferPoolPages();
 #ifdef SKIBIDI_WITH_SQLITE
     bool statementCacheEnabled = true;
-    std::size_t statementCacheEntries = 128;
+    std::size_t statementCacheEntries =
+        skibidi::config::defaultSqliteStatementCacheEntries();
 #endif
 };
 
@@ -276,19 +280,33 @@ static void printUsage(const char* program) {
 #ifdef SKIBIDI_WITH_SQLITE
         << "  --engine sqlite     Use optional SQLite compatibility backend\n"
 #endif
-        << "  --buffer-pages <n>  Native buffer-pool capacity (default: 1024)\n"
+        << "  --buffer-pages <n>  Native buffer-pool capacity "
+           "(default: env SKIBIDI_BUFFER_PAGES or "
+        << skibidi::config::kDefaultBufferPoolPages << ")\n"
         << "  --verbose           Print tokens, AST, optimizer report, and SQL\n"
         << "  --transpile-only    Generate SQL without executing\n"
         << "  --no-cache          Disable compilation cache\n"
-        << "  --cache-entries <n> Maximum compiled plans (default: 128)\n"
+        << "  --cache-entries <n> Maximum compiled plans "
+           "(default: env SKIBIDI_CACHE_ENTRIES or "
+        << skibidi::config::kDefaultCompilationCacheEntries << ")\n"
         << "  --cache-stats       Print runtime cache and engine statistics\n"
 #ifdef SKIBIDI_WITH_SQLITE
         << "  --no-statement-cache\n"
         << "                      Disable SQLite prepared-statement reuse\n"
         << "  --statement-cache-entries <n>\n"
-        << "                      Maximum SQLite prepared statements\n"
+        << "                      Maximum SQLite prepared statements "
+           "(default: env SKIBIDI_STATEMENT_CACHE_ENTRIES or "
+        << skibidi::config::kDefaultSqliteStatementCacheEntries << ")\n"
 #endif
-        << "  --help              Print this help\n";
+        << "  --help              Print this help\n"
+        << "\nEnvironment tuning knobs:\n"
+        << "  SKIBIDI_BUFFER_PAGES, SKIBIDI_CACHE_ENTRIES,\n"
+#ifdef SKIBIDI_WITH_SQLITE
+        << "  SKIBIDI_STATEMENT_CACHE_ENTRIES,\n"
+#endif
+        << "  SKIBIDI_VECTOR_BATCH_ROWS, SKIBIDI_BLOOM_MIN_BITS,\n"
+        << "  SKIBIDI_BLOOM_BITS_PER_VALUE, "
+           "SKIBIDI_EXACT_VALUE_COUNT_LIMIT\n";
 }
 
 int main(int argc, char** argv) {

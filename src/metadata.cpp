@@ -976,17 +976,12 @@ std::vector<std::string> Catalog::contextNames() const {
 }
 
 void Catalog::recomputeFingerprint() {
-    constexpr std::uint64_t offset = 1469598103934665603ULL;
-    constexpr std::uint64_t prime = 1099511628211ULL;
-    std::uint64_t hash = offset;
+    std::uint64_t hash = skibidi::hash::kFnv1a64OffsetBasis;
 
     auto append = [&](const std::string& value) {
-        for (unsigned char ch : value) {
-            hash ^= ch;
-            hash *= prime;
-        }
-        hash ^= 0xff;
-        hash *= prime;
+        hash = skibidi::hash::fnv1a64Append(hash, value);
+        hash = skibidi::hash::fnv1a64AppendByte(
+            hash, skibidi::hash::kFnv1a64FieldSeparator);
     };
 
     auto names = tableNames();

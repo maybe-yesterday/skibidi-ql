@@ -28,6 +28,7 @@ set(SKIBIDI_CORE_SOURCES
     src/native_wal.cpp
     src/optimizer.cpp
     src/parser.cpp
+    src/skibidi_config.cpp
 )
 
 if(SKIBIDI_WITH_SQLITE)

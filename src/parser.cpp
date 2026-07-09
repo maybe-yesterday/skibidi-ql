@@ -160,6 +160,8 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
             stmt = parseAppendMemory(); break;
         case TokenType::SPILL_CONTEXT:
             stmt = parseSpillContext(); break;
+        case TokenType::EXPLAIN_CONTEXT:
+            stmt = parseExplainContext(); break;
         case TokenType::VIBE_TAB:
             stmt = parseTagMemory(); break;
         case TokenType::SHOW_TABS:
@@ -210,10 +212,13 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
                 stmt = parseExportTorch();
             } else if (checkWord("explain") && wordEquals(peek(1), "batch")) {
                 stmt = parseExplainBatch();
+            } else if (checkWord("explain") &&
+                       wordEquals(peek(1), "context")) {
+                stmt = parseExplainContext();
             } else if (checkWord("spill") && wordEquals(peek(1), "context")) {
                 stmt = parseSpillContext();
             } else {
-                throw ParseError("Expected statement keyword (slay, yeet-into, glow-up, ratio, manifest, rizz-down, manifest-snapshot, ship-torch, spill-batch, manifest-context, yeet-memory, spill-context, show-tabs, show-context-schemas, show-context-objects, alias-tab, merge-tabs, vibe-tab)", tok.line, tok.col);
+                throw ParseError("Expected statement keyword (slay, yeet-into, glow-up, ratio, manifest, rizz-down, manifest-snapshot, ship-torch, spill-batch, manifest-context, yeet-memory, spill-context, explain-context, show-tabs, show-context-schemas, show-context-objects, alias-tab, merge-tabs, vibe-tab)", tok.line, tok.col);
             }
     }
 
@@ -645,6 +650,46 @@ std::unique_ptr<SpillContextStmt> Parser::parseSpillContext() {
             }
         } else {
             throw ParseError("Expected context option",
+                             current().line,
+                             current().col);
+        }
+    }
+    return stmt;
+}
+
+std::unique_ptr<ExplainContextStmt> Parser::parseExplainContext() {
+    auto stmt = std::make_unique<ExplainContextStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::EXPLAIN_CONTEXT)) {
+        // native keyword
+    } else {
+        expectWord("explain", "Expected 'explain'");
+        expectWord("context", "Expected 'context'");
+    }
+
+    stmt->context = expectName("Expected context name").value;
+    while (!check(TokenType::SEMICOLON) &&
+           !check(TokenType::EOF_TOKEN)) {
+        if (match(TokenType::ONLY_IF) || matchWord("query")) {
+            stmt->query =
+                expect(TokenType::STRING_LIT, "Expected query string").value;
+        } else if (match(TokenType::TOKEN_BUDGET) ||
+                   matchWord("token_budget")) {
+            stmt->tokenBudget = parseUnsignedOption("token-budget");
+        } else if (match(TokenType::VIBE_TAB) || matchWord("tab")) {
+            stmt->tab =
+                expect(TokenType::STRING_LIT, "Expected tab string").value;
+        } else if (matchWord("receipts")) {
+            if (matchWord("off")) {
+                stmt->receipts = false;
+            } else {
+                (void)matchWord("on");
+                stmt->receipts = true;
+            }
+        } else {
+            throw ParseError("Expected context explain option",
                              current().line,
                              current().col);
         }

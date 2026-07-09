@@ -489,6 +489,13 @@ TEST(generate_prompt_view_tab_statements) {
     ASSERT_CONTAINS(spill, "receipts off");
     ASSERT_CONTAINS(spill, "vibe-tab 'dog'");
 
+    std::string explain = toSQL(
+        "explain-context convo vibe-tab 'dog' only-if 'pet' "
+        "token-budget 64 receipts on;");
+    ASSERT_CONTAINS(explain, "-- explain-context convo");
+    ASSERT_CONTAINS(explain, "query 'pet'");
+    ASSERT_CONTAINS(explain, "token-budget 64");
+
     ASSERT_CONTAINS(toSQL("show-tabs convo;"), "-- show-tabs convo");
     ASSERT_CONTAINS(toSQL("show-context-schemas;"),
                     "-- show-context-schemas");

@@ -1,6 +1,8 @@
 #include "native_engine.h"
 
+#include "hash_utils.h"
 #include "native_raw.h"
+#include "skibidi_config.h"
 
 #include <algorithm>
 #include <limits>
@@ -16,8 +18,7 @@ struct TupleKeyHash {
     std::size_t operator()(const Tuple& tuple) const {
         std::size_t seed = 0;
         for (const auto& value : tuple) {
-            seed ^= value.hash() + 0x9e3779b97f4a7c15ULL +
-                    (seed << 6) + (seed >> 2);
+            seed = skibidi::hash::combine(seed, value.hash());
         }
         return seed;
     }
@@ -459,8 +460,8 @@ std::optional<NativeQueryResult> NativeEngine::executeDirectAggregateSelect(
                 const auto minimum = range.min.asInteger();
                 const auto maximum = range.max.asInteger();
                 const auto span = maximum - minimum;
-                constexpr std::int64_t maxDenseSpan = 4095;
-                if (maximum >= minimum && span <= maxDenseSpan) {
+                if (maximum >= minimum &&
+                    span < skibidi::config::kDenseGroupMaxDomainSpan) {
                     struct DenseGroupState {
                         bool present = false;
                         Value key = Value::null();

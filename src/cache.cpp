@@ -1,5 +1,7 @@
 #include "cache.h"
 
+#include "hash_utils.h"
+
 #include <cstring>
 #include <iterator>
 #include <utility>
@@ -96,16 +98,12 @@ std::size_t CompilationCache::estimateBytes(
 std::uint64_t CompilationCache::hashKey(
     std::string_view source,
     std::uint64_t schemaFingerprint) {
-    constexpr std::uint64_t offset = 1469598103934665603ULL;
-    constexpr std::uint64_t prime = 1099511628211ULL;
-    std::uint64_t hash = offset;
-    for (unsigned char ch : source) {
-        hash ^= ch;
-        hash *= prime;
-    }
+    std::uint64_t hash = skibidi::hash::fnv1a64(source);
     for (int shift = 0; shift < 64; shift += 8) {
-        hash ^= (schemaFingerprint >> shift) & 0xff;
-        hash *= prime;
+        hash = skibidi::hash::fnv1a64AppendByte(
+            hash,
+            static_cast<unsigned char>(
+                (schemaFingerprint >> shift) & 0xff));
     }
     return hash;
 }
