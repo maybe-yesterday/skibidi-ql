@@ -13,7 +13,7 @@ Matched Release-build sample results against prepared, file-backed SQLite on the
 same 1,000 rows and warm caches:
 
 | Workload | Native | SQLite | Native / SQLite | Native peak RSS | SQLite peak RSS | Native est mem | Native buffer mem | Native raw point | Native value count | Native dense agg | Native ctx cache hits |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+|---|---|---|---|---|---|---|---|---|---|---|---|
 | point | 22.0 ms | 26.9 ms | 0.82x | 13.2 MiB | 13.2 MiB | 0.15 MiB | 0.06 MiB | 10000 | 0 | 0 | 0 |
 | scan | 0.3 ms | 2.3 ms | 0.12x | 13.2 MiB | 13.2 MiB | 0.15 MiB | 0.06 MiB | 0 | 100 | 0 | 0 |
 | count_miss | 0.1 ms | 0.2 ms | 0.47x | 13.2 MiB | 13.2 MiB | 0.23 MiB | 0.06 MiB | 0 | 0 | 0 | 0 |
