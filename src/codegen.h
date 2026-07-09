@@ -24,6 +24,11 @@ private:
     std::string genAppendMemory(const AppendMemoryStmt* s);
     std::string genSpillContext(const SpillContextStmt* s);
     std::string genTagMemory(const TagMemoryStmt* s);
+    std::string genShowTabs(const ShowTabsStmt* s);
+    std::string genShowContextSchemas(const ShowContextSchemasStmt* s);
+    std::string genShowContextObjects(const ShowContextObjectsStmt* s);
+    std::string genAliasTab(const AliasTabStmt* s);
+    std::string genMergeTabs(const MergeTabsStmt* s);
     std::string genExpr(const ASTNode* node);
     std::string genFunctionCall(const FunctionCall* fc);
     std::string genWindowFunc(const WindowFunc* wf);

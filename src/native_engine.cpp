@@ -1,11 +1,11 @@
 #include "native_engine.h"
 
 #include "codegen.h"
+#include "native_raw.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cctype>
-#include <cstring>
 #include <cmath>
 #include <fstream>
 #include <iterator>
@@ -33,57 +33,6 @@ struct TupleKeyHash {
 struct TupleKeyEqual {
     bool operator()(const Tuple& left, const Tuple& right) const {
         return left == right;
-    }
-};
-
-class BloomFilter {
-public:
-    explicit BloomFilter(std::size_t expectedValues) {
-        std::size_t bits = 64;
-        const std::size_t wanted =
-            std::max<std::size_t>(64, expectedValues * 12);
-        while (bits < wanted) bits <<= 1;
-        bitMask_ = bits - 1;
-        words_.assign((bits + 63) / 64, 0);
-    }
-
-    void add(const Value& value) {
-        const auto hash = value.hash();
-        set(hash);
-        set(hash + mix(hash));
-        set(hash + mix(hash ^ 0x9e3779b97f4a7c15ULL));
-    }
-
-    bool mayContain(const Value& value) const {
-        const auto hash = value.hash();
-        return test(hash) &&
-               test(hash + mix(hash)) &&
-               test(hash + mix(hash ^ 0x9e3779b97f4a7c15ULL));
-    }
-
-private:
-    std::vector<std::uint64_t> words_;
-    std::size_t bitMask_ = 63;
-
-    static std::size_t mix(std::size_t value) {
-        value ^= value >> 33;
-        value *= static_cast<std::size_t>(0xff51afd7ed558ccdULL);
-        value ^= value >> 33;
-        value *= static_cast<std::size_t>(0xc4ceb9fe1a85ec53ULL);
-        value ^= value >> 33;
-        return value | 1U;
-    }
-
-    void set(std::size_t hash) {
-        const auto bit = hash & bitMask_;
-        words_[bit / 64] |=
-            static_cast<std::uint64_t>(1) << (bit % 64);
-    }
-
-    bool test(std::size_t hash) const {
-        const auto bit = hash & bitMask_;
-        return (words_[bit / 64] &
-                (static_cast<std::uint64_t>(1) << (bit % 64))) != 0;
     }
 };
 
@@ -115,314 +64,37 @@ std::string expressionAlias(const ASTNode* expression,
     return "expr" + std::to_string(fallback + 1);
 }
 
-std::int64_t integerLiteral(const ASTNode* expression,
-                            std::int64_t fallback) {
-    auto* literal = dynamic_cast<const Literal*>(expression);
-    if (!literal) return fallback;
-    if (literal->kind == LiteralKind::INT) return literal->ival;
-    if (literal->kind == LiteralKind::FLOAT) {
-        return static_cast<std::int64_t>(literal->fval);
+std::size_t estimateValueBytes(const Value& value) {
+    std::size_t bytes = sizeof(Value);
+    if (value.type() == ValueType::Text) {
+        bytes += value.asText().capacity();
+    } else if (value.type() == ValueType::Blob) {
+        bytes += value.asBlob().capacity();
     }
-    return fallback;
+    return bytes;
 }
 
-template <typename T>
-T readRawPod(const std::uint8_t* data,
-             std::size_t length,
-             std::size_t& offset) {
-    if (offset + sizeof(T) > length) {
-        throw std::runtime_error("Corrupt tuple payload");
+std::size_t estimateTupleBytes(const Tuple& tuple) {
+    std::size_t bytes = sizeof(Tuple) +
+        tuple.capacity() * sizeof(Value);
+    for (const auto& value : tuple) {
+        bytes += estimateValueBytes(value);
     }
-    T value{};
-    std::memcpy(&value, data + offset, sizeof(T));
-    offset += sizeof(T);
-    return value;
+    return bytes;
 }
 
-struct RawField {
-    ValueType type = ValueType::Null;
-    bool isNull = true;
-    std::int64_t integer = 0;
-    double real = 0.0;
-    bool boolean = false;
-    std::string text;
-    Value::Blob blob;
-
-    bool numeric() const {
-        return !isNull &&
-               (type == ValueType::Integer ||
-                type == ValueType::Real ||
-                type == ValueType::Boolean);
+std::size_t estimateResultBytes(const NativeQueryResult& result) {
+    std::size_t bytes = sizeof(NativeQueryResult) +
+        result.columns.capacity() * sizeof(std::string) +
+        result.rows.capacity() * sizeof(Tuple) +
+        result.message.capacity();
+    for (const auto& column : result.columns) {
+        bytes += column.capacity();
     }
-
-    double asReal() const {
-        if (type == ValueType::Real) return real;
-        if (type == ValueType::Integer) {
-            return static_cast<double>(integer);
-        }
-        if (type == ValueType::Boolean) return boolean ? 1.0 : 0.0;
-        throw std::runtime_error("Raw field is not numeric");
+    for (const auto& row : result.rows) {
+        bytes += estimateTupleBytes(row);
     }
-
-    Value toValue() const {
-        if (isNull) return Value::null();
-        switch (type) {
-            case ValueType::Integer:
-                return Value(integer);
-            case ValueType::Real:
-                return Value(real);
-            case ValueType::Text:
-                return Value(text);
-            case ValueType::Boolean:
-                return Value(boolean);
-            case ValueType::Blob:
-                return Value(blob);
-            case ValueType::Null:
-                return Value::null();
-        }
-        return Value::null();
-    }
-};
-
-Value literalValue(const Literal& literal) {
-    switch (literal.kind) {
-        case LiteralKind::INT:
-            return Value(static_cast<std::int64_t>(literal.ival));
-        case LiteralKind::FLOAT:
-            return Value(literal.fval);
-        case LiteralKind::STRING:
-            return Value(literal.sval);
-        case LiteralKind::NUL:
-            return Value::null();
-        case LiteralKind::BOOL:
-            return Value(literal.bval);
-    }
-    return Value::null();
-}
-
-void decodeRawProjectedInto(
-    const std::uint8_t* data,
-    std::size_t length,
-    const std::vector<std::size_t>& columns,
-    std::vector<RawField>& fields) {
-    fields.clear();
-    if (columns.empty()) return;
-
-    std::size_t offset = 0;
-    const std::uint16_t count =
-        readRawPod<std::uint16_t>(data, length, offset);
-    if (!columns.empty() &&
-        (columns.back() >= count ||
-         !std::is_sorted(columns.begin(), columns.end()) ||
-             std::adjacent_find(columns.begin(), columns.end()) !=
-             columns.end())) {
-        throw std::runtime_error("Invalid projected tuple columns");
-    }
-
-    fields.resize(columns.size());
-    std::size_t projected = 0;
-    for (std::uint16_t index = 0; index < count; ++index) {
-        if (offset >= length) {
-            throw std::runtime_error("Corrupt tuple type tag");
-        }
-        const auto type = static_cast<ValueType>(data[offset++]);
-        const bool materialize =
-            projected < columns.size() &&
-            columns[projected] == index;
-        RawField field;
-        field.type = type;
-        field.isNull = type == ValueType::Null;
-        switch (type) {
-            case ValueType::Null:
-                break;
-            case ValueType::Integer:
-                field.integer =
-                    readRawPod<std::int64_t>(data, length, offset);
-                break;
-            case ValueType::Real:
-                field.real = readRawPod<double>(data, length, offset);
-                break;
-            case ValueType::Boolean:
-                if (offset >= length) {
-                    throw std::runtime_error(
-                        "Corrupt boolean tuple field");
-                }
-                field.boolean = data[offset++] != 0;
-                break;
-            case ValueType::Text: {
-                const auto textLength =
-                    readRawPod<std::uint32_t>(data, length, offset);
-                if (offset + textLength > length) {
-                    throw std::runtime_error(
-                        "Corrupt text tuple field");
-                }
-                if (materialize) {
-                    field.text.assign(
-                        reinterpret_cast<const char*>(data + offset),
-                        textLength);
-                }
-                offset += textLength;
-                break;
-            }
-            case ValueType::Blob: {
-                const auto blobLength =
-                    readRawPod<std::uint32_t>(data, length, offset);
-                if (offset + blobLength > length) {
-                    throw std::runtime_error(
-                        "Corrupt blob tuple field");
-                }
-                if (materialize) {
-                    field.blob.assign(data + offset,
-                                      data + offset + blobLength);
-                }
-                offset += blobLength;
-                break;
-            }
-            default:
-                throw std::runtime_error("Unknown tuple field type");
-        }
-        if (materialize) {
-            fields[projected] = std::move(field);
-            ++projected;
-            if (projected == columns.size()) break;
-        }
-    }
-}
-
-RawField decodeRawColumn(const std::uint8_t* data,
-                         std::size_t length,
-                         std::size_t column) {
-    std::size_t offset = 0;
-    const std::uint16_t count =
-        readRawPod<std::uint16_t>(data, length, offset);
-    if (column >= count) {
-        throw std::runtime_error("Invalid projected tuple column");
-    }
-
-    for (std::uint16_t index = 0; index < count; ++index) {
-        if (offset >= length) {
-            throw std::runtime_error("Corrupt tuple type tag");
-        }
-        const auto type = static_cast<ValueType>(data[offset++]);
-        const bool materialize = index == column;
-        RawField field;
-        field.type = type;
-        field.isNull = type == ValueType::Null;
-        switch (type) {
-            case ValueType::Null:
-                break;
-            case ValueType::Integer:
-                field.integer =
-                    readRawPod<std::int64_t>(data, length, offset);
-                break;
-            case ValueType::Real:
-                field.real = readRawPod<double>(data, length, offset);
-                break;
-            case ValueType::Boolean:
-                if (offset >= length) {
-                    throw std::runtime_error(
-                        "Corrupt boolean tuple field");
-                }
-                field.boolean = data[offset++] != 0;
-                break;
-            case ValueType::Text: {
-                const auto textLength =
-                    readRawPod<std::uint32_t>(data, length, offset);
-                if (offset + textLength > length) {
-                    throw std::runtime_error(
-                        "Corrupt text tuple field");
-                }
-                if (materialize) {
-                    field.text.assign(
-                        reinterpret_cast<const char*>(data + offset),
-                        textLength);
-                }
-                offset += textLength;
-                break;
-            }
-            case ValueType::Blob: {
-                const auto blobLength =
-                    readRawPod<std::uint32_t>(data, length, offset);
-                if (offset + blobLength > length) {
-                    throw std::runtime_error(
-                        "Corrupt blob tuple field");
-                }
-                if (materialize) {
-                    field.blob.assign(data + offset,
-                                      data + offset + blobLength);
-                }
-                offset += blobLength;
-                break;
-            }
-            default:
-                throw std::runtime_error("Unknown tuple field type");
-        }
-        if (materialize) return field;
-    }
-    throw std::runtime_error("Invalid projected tuple column");
-}
-
-int compareRawToValue(const RawField& left, const Value& right) {
-    if (left.isNull || right.isNull()) {
-        if (left.isNull && right.isNull()) return 0;
-        return left.isNull ? -1 : 1;
-    }
-    if (left.numeric() && right.isNumeric()) {
-        const double l = left.asReal();
-        const double r = right.asReal();
-        return l < r ? -1 : (l > r ? 1 : 0);
-    }
-    return left.toValue().compare(right);
-}
-
-bool comparisonMatches(const std::string& op, int order) {
-    if (op == "=") return order == 0;
-    if (op == "!=") return order != 0;
-    if (op == "<") return order < 0;
-    if (op == ">") return order > 0;
-    if (op == "<=") return order <= 0;
-    if (op == ">=") return order >= 0;
-    throw std::runtime_error("Unsupported comparison operator: " + op);
-}
-
-bool isLoneWolfName(const std::string& name) {
-    return name == "LONE-WOLF" || name == "lone-wolf";
-}
-
-bool isSimpleAggregateName(const std::string& name) {
-    return name == "headcount" || name == "stack" || name == "mid" ||
-           name == "goat" || name == "L" || isLoneWolfName(name);
-}
-
-std::int64_t countLoneWolves(const std::vector<double>& samples) {
-    if (samples.size() < 2) return 0;
-    double sum = 0.0;
-    double sumSquares = 0.0;
-    for (const double value : samples) {
-        sum += value;
-        sumSquares += value * value;
-    }
-    const double count = static_cast<double>(samples.size());
-    const double mean = sum / count;
-    const double variance = std::max(0.0, sumSquares / count - mean * mean);
-    const double sigma = std::sqrt(variance);
-    if (sigma == 0.0) return 0;
-    std::int64_t outliers = 0;
-    const double threshold = sigma * 3.0;
-    for (const double value : samples) {
-        if (std::fabs(value - mean) > threshold) ++outliers;
-    }
-    return outliers;
-}
-
-std::string normalizeColumnPredicateOp(std::string op,
-                                       bool columnOnLeft) {
-    if (columnOnLeft) return op;
-    if (op == "<") return ">";
-    if (op == ">") return "<";
-    if (op == "<=") return ">=";
-    if (op == ">=") return "<=";
-    return op;
+    return bytes;
 }
 
 std::string rowIdString(RowId row) {
@@ -534,339 +206,14 @@ std::optional<std::size_t> tableColumnIndex(const TableMeta& table,
     return std::nullopt;
 }
 
-std::string lowerText(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char ch) {
-                       return static_cast<char>(std::tolower(ch));
-                   });
-    return value;
-}
-
-std::string trimText(const std::string& value) {
-    std::size_t first = 0;
-    while (first < value.size() &&
-           std::isspace(static_cast<unsigned char>(value[first]))) {
-        ++first;
-    }
-    std::size_t last = value.size();
-    while (last > first &&
-           std::isspace(static_cast<unsigned char>(value[last - 1]))) {
-        --last;
-    }
-    return value.substr(first, last - first);
-}
-
-std::string cleanAtomValue(std::string value) {
-    value = trimText(value);
-    const auto lower = lowerText(value);
-    for (const std::string& stop : {" but ", " and ", " because "}) {
-        const auto pos = lower.find(stop);
-        if (pos != std::string::npos) {
-            value = value.substr(0, pos);
-            break;
-        }
-    }
-    while (!value.empty() &&
-           (value.back() == '.' || value.back() == '!' ||
-            value.back() == '?' || value.back() == ',' ||
-            value.back() == ';')) {
-        value.pop_back();
-    }
-    return trimText(value);
-}
-
-std::optional<std::string> extractAfterMarker(const std::string& text,
-                                              const std::string& marker) {
-    const auto lower = lowerText(text);
-    const auto pos = lower.find(marker);
-    if (pos == std::string::npos) return std::nullopt;
-    auto value = text.substr(pos + marker.size());
-    const auto punctuation = value.find_first_of(".!?;\n\r");
-    if (punctuation != std::string::npos) {
-        value = value.substr(0, punctuation);
-    }
-    value = cleanAtomValue(value);
-    if (value.empty()) return std::nullopt;
-    return value;
-}
-
-std::string normalizedTab(const std::string& tab);
-
-std::vector<ContextAtomMeta> extractContextAtoms(const AppendMemoryStmt& statement) {
-    std::vector<ContextAtomMeta> atoms;
-    const std::string source =
-        "message_" + std::to_string(statement.messageId);
-    auto add = [&](std::string key,
-                   std::string value,
-                   std::string type) {
-        if (value.empty()) return;
-        ContextAtomMeta atom;
-        atom.key = std::move(key);
-        atom.value = std::move(value);
-        atom.type = std::move(type);
-        atom.status = "active";
-        atom.source = source;
-        atom.tab = normalizedTab(statement.tab);
-        atoms.push_back(std::move(atom));
-    };
-
-    for (const std::string& marker : {
-             "i live in ", "i moved to ", "moved to ",
-             "i am in ", "i'm in ", "my location is ",
-             "i live near "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("user_location", *value, "fact");
-            break;
-        }
-    }
-    for (const std::string& marker : {"i prefer ", "i like "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("user_preference", *value, "preference");
-            break;
-        }
-    }
-    for (const std::string& marker : {
-             "my dog likes ", "my dog loves ", "my dog prefers "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("dog_preference", *value, "preference");
-            break;
-        }
-    }
-    for (const std::string& marker : {
-             "my dog is named ", "my dog's name is "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("dog_name", *value, "fact");
-            break;
-        }
-    }
-    if (auto value = extractAfterMarker(statement.text, "remember that ")) {
-        add("user_constraint", *value, "constraint");
-    }
-    for (const std::string& marker : {"i need ", "i want "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("current_task", *value, "task");
-            break;
-        }
-    }
-    return atoms;
-}
-
-int contextAtomUtility(const ContextAtomMeta& atom,
-                       const std::string& query) {
-    const auto q = lowerText(query);
-    const auto value = lowerText(atom.value);
-    int score = 10;
-    if (q.find(value) != std::string::npos && !value.empty()) score += 40;
-    if (atom.key == "user_location" &&
-        (q.find("near me") != std::string::npos ||
-         q.find("nearby") != std::string::npos ||
-         q.find("restaurant") != std::string::npos ||
-         q.find("weather") != std::string::npos ||
-         q.find("location") != std::string::npos ||
-         q.find("near ") != std::string::npos)) {
-        score += 100;
-    }
-    if (atom.type == "constraint") score += 80;
-    if (atom.type == "preference" &&
-        (q.find("recommend") != std::string::npos ||
-         q.find("choose") != std::string::npos ||
-         q.find("prefer") != std::string::npos)) {
-        score += 60;
-    }
-    if (atom.type == "task") score += 50;
-    return score;
-}
-
-std::size_t estimateContextTokens(const std::string& text) {
-    return std::max<std::size_t>(1, (text.size() + 3) / 4);
-}
-
-std::string renderContextAtom(const ContextAtomMeta& atom,
-                              bool receipts) {
-    std::string rendered = atom.type + " " + atom.key + "=" + atom.value;
-    if (receipts) rendered += " @" + atom.source;
-    return rendered;
-}
-
-std::string normalizedTab(const std::string& tab) {
-    const auto cleaned = cleanAtomValue(tab);
-    return cleaned.empty() ? "main" : cleaned;
-}
-
-void recomputeContextAtomStatus(ConversationContextMeta& context) {
-    for (auto& atom : context.atoms) {
-        atom.tab = normalizedTab(atom.tab);
-        atom.status = "active";
-        atom.invalidatedBy.clear();
-    }
-
-    for (std::size_t index = 0; index < context.atoms.size(); ++index) {
-        const auto& atom = context.atoms[index];
-        for (std::size_t prior = 0; prior < index; ++prior) {
-            auto& existing = context.atoms[prior];
-            if (existing.status == "active" &&
-                existing.key == atom.key &&
-                existing.tab == atom.tab &&
-                existing.value != atom.value) {
-                existing.status = "invalidated";
-                existing.invalidatedBy = atom.source;
-            }
-        }
-    }
-}
-
 } // namespace
-
-NativeEngine::TypedVector::TypedVector(ValueType valueType)
-    : type(valueType) {
-    switch (type) {
-        case ValueType::Null:
-            storage = std::monostate{};
-            break;
-        case ValueType::Integer:
-            storage = std::vector<std::int64_t>{};
-            break;
-        case ValueType::Real:
-            storage = std::vector<double>{};
-            break;
-        case ValueType::Text:
-            storage = std::vector<std::string>{};
-            break;
-        case ValueType::Boolean:
-            storage = std::vector<std::uint8_t>{};
-            break;
-        case ValueType::Blob:
-            storage = std::vector<Value::Blob>{};
-            break;
-    }
-}
-
-void NativeEngine::TypedVector::reserve(std::size_t capacity) {
-    nullBitmap.reserve((capacity + 63) / 64);
-    switch (type) {
-        case ValueType::Integer:
-            std::get<std::vector<std::int64_t>>(storage).reserve(capacity);
-            break;
-        case ValueType::Real:
-            std::get<std::vector<double>>(storage).reserve(capacity);
-            break;
-        case ValueType::Text:
-            std::get<std::vector<std::string>>(storage).reserve(capacity);
-            break;
-        case ValueType::Boolean:
-            std::get<std::vector<std::uint8_t>>(storage).reserve(capacity);
-            break;
-        case ValueType::Blob:
-            std::get<std::vector<Value::Blob>>(storage).reserve(capacity);
-            break;
-        case ValueType::Null:
-            break;
-    }
-}
-
-void NativeEngine::TypedVector::append(const Value& input) {
-    if (nullBitmap.size() <= size / 64) {
-        nullBitmap.push_back(0);
-    }
-    if (input.isNull()) {
-        nullBitmap[size / 64] |=
-            static_cast<std::uint64_t>(1) << (size % 64);
-    } else if (type == ValueType::Null) {
-        type = input.type();
-        switch (type) {
-            case ValueType::Integer:
-                storage = std::vector<std::int64_t>(size, 0);
-                break;
-            case ValueType::Real:
-                storage = std::vector<double>(size, 0.0);
-                break;
-            case ValueType::Text:
-                storage = std::vector<std::string>(size);
-                break;
-            case ValueType::Boolean:
-                storage = std::vector<std::uint8_t>(size, 0);
-                break;
-            case ValueType::Blob:
-                storage = std::vector<Value::Blob>(size);
-                break;
-            case ValueType::Null:
-                break;
-        }
-    } else if (type == ValueType::Integer &&
-               input.type() == ValueType::Real) {
-        const auto& integers =
-            std::get<std::vector<std::int64_t>>(storage);
-        std::vector<double> reals;
-        reals.reserve(integers.size() + 1);
-        for (const auto value : integers) {
-            reals.push_back(static_cast<double>(value));
-        }
-        storage = std::move(reals);
-        type = ValueType::Real;
-    }
-
-    switch (type) {
-        case ValueType::Null:
-            break;
-        case ValueType::Integer:
-            std::get<std::vector<std::int64_t>>(storage).push_back(
-                input.isNull() ? 0 : input.asInteger());
-            break;
-        case ValueType::Real:
-            std::get<std::vector<double>>(storage).push_back(
-                input.isNull() ? 0.0 : input.asReal());
-            break;
-        case ValueType::Text:
-            std::get<std::vector<std::string>>(storage).push_back(
-                input.isNull() ? std::string{} : input.toString());
-            break;
-        case ValueType::Boolean:
-            std::get<std::vector<std::uint8_t>>(storage).push_back(
-                input.isNull() ? 0 :
-                static_cast<std::uint8_t>(input.asBoolean()));
-            break;
-        case ValueType::Blob:
-            std::get<std::vector<Value::Blob>>(storage).push_back(
-                input.isNull() ? Value::Blob{} : input.asBlob());
-            break;
-    }
-    ++size;
-}
-
-bool NativeEngine::TypedVector::isNull(std::size_t index) const {
-    if (index >= size) throw std::out_of_range("Vector row out of range");
-    return (nullBitmap[index / 64] &
-            (static_cast<std::uint64_t>(1) << (index % 64))) != 0;
-}
-
-Value NativeEngine::TypedVector::value(std::size_t index) const {
-    if (isNull(index) || type == ValueType::Null) return Value::null();
-    switch (type) {
-        case ValueType::Integer:
-            return Value(
-                std::get<std::vector<std::int64_t>>(storage)[index]);
-        case ValueType::Real:
-            return Value(std::get<std::vector<double>>(storage)[index]);
-        case ValueType::Text:
-            return Value(
-                std::get<std::vector<std::string>>(storage)[index]);
-        case ValueType::Boolean:
-            return Value(
-                std::get<std::vector<std::uint8_t>>(storage)[index] != 0);
-        case ValueType::Blob:
-            return Value(
-                std::get<std::vector<Value::Blob>>(storage)[index]);
-        case ValueType::Null:
-            return Value::null();
-    }
-    return Value::null();
-}
 
 NativeEngine::NativeEngine(std::filesystem::path databasePath,
                            std::size_t bufferPages)
     : root_(std::move(databasePath)),
       catalog_((root_ / "catalog.json").string()),
-      bufferPool_(bufferPages) {
+      bufferPool_(bufferPages),
+      wal_(root_) {
     if (root_ == ":memory:") {
         temporary_ = true;
         const auto stamp =
@@ -875,10 +222,17 @@ NativeEngine::NativeEngine(std::filesystem::path databasePath,
         root_ = std::filesystem::temp_directory_path() /
                 ("skibidi-native-" + std::to_string(stamp));
         catalog_ = Catalog((root_ / "catalog.json").string());
+        wal_.resetRoot(root_);
     }
     root_ = std::filesystem::absolute(root_).lexically_normal();
     catalog_ = Catalog((root_ / "catalog.json").string());
+    wal_.resetRoot(root_);
+    auto startupLocks = NativeLockManager::global().acquireAll({
+        {root_.generic_string() + "|!database",
+         NativeLockMode::Exclusive},
+    });
     std::filesystem::create_directories(root_ / "tables");
+    wal_.recover();
     catalog_.load();
 }
 
@@ -895,33 +249,55 @@ NativeEngine::~NativeEngine() {
 }
 
 void NativeEngine::beginTransaction() {
+    std::lock_guard<std::recursive_mutex> guard(operationMutex_);
     if (transactionActive_) {
         throw std::runtime_error("A transaction is already active");
     }
-    flush();
-    transactionSnapshot_.clear();
-    if (std::filesystem::exists(root_)) {
-        for (const auto& entry :
-             std::filesystem::recursive_directory_iterator(root_)) {
-            if (!entry.is_regular_file()) continue;
-            const auto relative =
-                std::filesystem::relative(entry.path(), root_).generic_string();
-            transactionSnapshot_[relative] = readFile(entry.path());
+
+    transactionLocks_ = NativeLockManager::global().acquireAll({
+        {root_.generic_string() + "|!database",
+         NativeLockMode::Exclusive},
+    });
+
+    try {
+        flushUnlocked();
+        transactionSnapshot_.clear();
+        if (std::filesystem::exists(root_)) {
+            for (const auto& entry :
+                 std::filesystem::recursive_directory_iterator(root_)) {
+                if (!entry.is_regular_file()) continue;
+                const auto relative =
+                    std::filesystem::relative(entry.path(), root_)
+                        .generic_string();
+                transactionSnapshot_[relative] = readFile(entry.path());
+            }
         }
+        beginWalTransaction();
+        transactionActive_ = true;
+    } catch (...) {
+        walTransactionId_ = 0;
+        walLoggedFiles_.clear();
+        transactionSnapshot_.clear();
+        transactionLocks_.clear();
+        throw;
     }
-    transactionActive_ = true;
 }
 
 void NativeEngine::commitTransaction() {
+    std::lock_guard<std::recursive_mutex> guard(operationMutex_);
     if (!transactionActive_) {
         throw std::runtime_error("No transaction is active");
     }
-    flush();
+    flushUnlocked();
+    commitWalTransaction();
+    wal_.checkpoint();
     transactionSnapshot_.clear();
     transactionActive_ = false;
+    transactionLocks_.clear();
 }
 
 void NativeEngine::rollbackTransaction() {
+    std::lock_guard<std::recursive_mutex> guard(operationMutex_);
     if (!transactionActive_) {
         throw std::runtime_error("No transaction is active");
     }
@@ -947,76 +323,301 @@ void NativeEngine::rollbackTransaction() {
     reloadCatalog();
     transactionSnapshot_.clear();
     transactionActive_ = false;
+    walTransactionId_ = 0;
+    walLoggedFiles_.clear();
+    wal_.checkpoint();
+    transactionLocks_.clear();
+}
+
+bool NativeEngine::transactionActive() const {
+    std::lock_guard<std::recursive_mutex> guard(operationMutex_);
+    return transactionActive_;
 }
 
 NativeQueryResult NativeEngine::execute(const ASTNode* statement) {
     if (!statement) return {};
-    if (auto* create = dynamic_cast<const CreateStmt*>(statement)) {
-        return executeCreate(*create);
+    std::lock_guard<std::recursive_mutex> guard(operationMutex_);
+    std::vector<NativeLockGuard> locks;
+    if (!transactionActive_) {
+        locks = acquireStatementLocks(statement);
     }
-    if (auto* drop = dynamic_cast<const DropStmt*>(statement)) {
-        return executeDrop(*drop);
+    const bool autoWal =
+        !transactionActive_ && statementMutatesPersistentState(statement);
+
+    auto runStatement = [&]() -> NativeQueryResult {
+        if (auto* create = dynamic_cast<const CreateStmt*>(statement)) {
+            return executeCreate(*create);
+        }
+        if (auto* drop = dynamic_cast<const DropStmt*>(statement)) {
+            return executeDrop(*drop);
+        }
+        if (auto* insert = dynamic_cast<const InsertStmt*>(statement)) {
+            return executeInsert(*insert);
+        }
+        if (auto* update = dynamic_cast<const UpdateStmt*>(statement)) {
+            return executeUpdate(*update);
+        }
+        if (auto* remove = dynamic_cast<const DeleteStmt*>(statement)) {
+            return executeDelete(*remove);
+        }
+        if (auto* select = dynamic_cast<const SelectStmt*>(statement)) {
+            return executeSelect(*select);
+        }
+        if (auto* snapshot =
+                dynamic_cast<const CreateSnapshotStmt*>(statement)) {
+            return executeCreateSnapshot(*snapshot);
+        }
+        if (auto* exportTorch =
+                dynamic_cast<const ExportTorchStmt*>(statement)) {
+            return executeExportTorch(*exportTorch);
+        }
+        if (auto* explain =
+                dynamic_cast<const ExplainBatchStmt*>(statement)) {
+            return executeExplainBatch(*explain);
+        }
+        if (auto* context =
+                dynamic_cast<const CreateContextStmt*>(statement)) {
+            return executeCreateContext(*context);
+        }
+        if (auto* memory =
+                dynamic_cast<const AppendMemoryStmt*>(statement)) {
+            return executeAppendMemory(*memory);
+        }
+        if (auto* spill =
+                dynamic_cast<const SpillContextStmt*>(statement)) {
+            return executeSpillContext(*spill);
+        }
+        if (auto* tag =
+                dynamic_cast<const TagMemoryStmt*>(statement)) {
+            return executeTagMemory(*tag);
+        }
+        if (auto* showTabs =
+                dynamic_cast<const ShowTabsStmt*>(statement)) {
+            return executeShowTabs(*showTabs);
+        }
+        if (auto* showSchemas =
+                dynamic_cast<const ShowContextSchemasStmt*>(statement)) {
+            return executeShowContextSchemas(*showSchemas);
+        }
+        if (auto* showObjects =
+                dynamic_cast<const ShowContextObjectsStmt*>(statement)) {
+            return executeShowContextObjects(*showObjects);
+        }
+        if (auto* aliasTab =
+                dynamic_cast<const AliasTabStmt*>(statement)) {
+            return executeAliasTab(*aliasTab);
+        }
+        if (auto* mergeTabs =
+                dynamic_cast<const MergeTabsStmt*>(statement)) {
+            return executeMergeTabs(*mergeTabs);
+        }
+        throw std::runtime_error("Unsupported native statement");
+    };
+
+    try {
+        if (autoWal) beginWalTransaction();
+        NativeQueryResult result = runStatement();
+        if (autoWal) {
+            flushUnlocked();
+            commitWalTransaction();
+            wal_.checkpoint();
+        }
+        return result;
+    } catch (...) {
+        if (autoWal) discardWalTransaction();
+        throw;
     }
-    if (auto* insert = dynamic_cast<const InsertStmt*>(statement)) {
-        return executeInsert(*insert);
-    }
-    if (auto* update = dynamic_cast<const UpdateStmt*>(statement)) {
-        return executeUpdate(*update);
-    }
-    if (auto* remove = dynamic_cast<const DeleteStmt*>(statement)) {
-        return executeDelete(*remove);
-    }
-    if (auto* select = dynamic_cast<const SelectStmt*>(statement)) {
-        return executeSelect(*select);
-    }
-    if (auto* snapshot =
-            dynamic_cast<const CreateSnapshotStmt*>(statement)) {
-        return executeCreateSnapshot(*snapshot);
-    }
-    if (auto* exportTorch =
-            dynamic_cast<const ExportTorchStmt*>(statement)) {
-        return executeExportTorch(*exportTorch);
-    }
-    if (auto* explain =
-            dynamic_cast<const ExplainBatchStmt*>(statement)) {
-        return executeExplainBatch(*explain);
-    }
-    if (auto* context =
-            dynamic_cast<const CreateContextStmt*>(statement)) {
-        return executeCreateContext(*context);
-    }
-    if (auto* memory =
-            dynamic_cast<const AppendMemoryStmt*>(statement)) {
-        return executeAppendMemory(*memory);
-    }
-    if (auto* spill =
-            dynamic_cast<const SpillContextStmt*>(statement)) {
-        return executeSpillContext(*spill);
-    }
-    if (auto* tag =
-            dynamic_cast<const TagMemoryStmt*>(statement)) {
-        return executeTagMemory(*tag);
-    }
-    throw std::runtime_error("Unsupported native statement");
 }
 
 void NativeEngine::flush() {
-    bufferPool_.flushAll();
-    catalog_.save();
+    std::lock_guard<std::recursive_mutex> guard(operationMutex_);
+    std::vector<NativeLockGuard> locks;
+    if (!transactionActive_) {
+        locks = NativeLockManager::global().acquireAll({
+            {root_.generic_string() + "|!database",
+             NativeLockMode::Exclusive},
+        });
+    }
+    flushUnlocked();
 }
 
 NativeEngineStats NativeEngine::stats() const {
+    std::lock_guard<std::recursive_mutex> guard(operationMutex_);
     auto result = stats_;
     result.residentPages = bufferPool_.residentPages();
     result.bufferCapacityPages = bufferPool_.capacityPages();
     result.bufferPageReads = bufferPool_.pageReads();
     result.bufferEvictions = bufferPool_.evictions();
+    result.estimatedMemoryBytes =
+        result.residentPages * SlottedPage::PAGE_SIZE;
+    for (const auto& item : primaryIndexes_) {
+        const auto keys = item.second ? item.second->size() : 0;
+        result.estimatedMemoryBytes +=
+            keys * (sizeof(Value) + sizeof(RowId) + 48);
+        result.estimatedMemoryBytes +=
+            (item.second ? item.second->height() : 0) * 1024;
+    }
+    for (const auto& item : contextResultCache_) {
+        result.estimatedMemoryBytes += item.first.capacity();
+        result.estimatedMemoryBytes += estimateResultBytes(item.second);
+    }
+    result.estimatedMemoryBytes +=
+        mappedHeaps_.size() * sizeof(MappedHeapFile);
+    for (const auto& table : tableStatistics_) {
+        result.estimatedMemoryBytes +=
+            table.first.capacity() +
+            sizeof(TableStatistics) +
+            table.second.distinctCounts.size() *
+                (sizeof(std::string) + sizeof(std::size_t)) +
+            table.second.columnRanges.size() *
+                (sizeof(std::string) +
+                 sizeof(TableStatistics::ColumnRange));
+        for (const auto& range : table.second.columnRanges) {
+            result.estimatedMemoryBytes +=
+                range.first.capacity() +
+                range.second.valueCounts.size() *
+                    (sizeof(Value) + sizeof(std::size_t) + 32);
+        }
+    }
     return result;
 }
 
 void NativeEngine::resetStats() {
+    std::lock_guard<std::recursive_mutex> guard(operationMutex_);
     stats_ = {};
     bufferPool_.resetStats();
+}
+
+std::vector<NativeLockGuard> NativeEngine::acquireStatementLocks(
+    const ASTNode* statement) const {
+    auto scoped = [&](const std::string& resource) {
+        return root_.generic_string() + "|" + resource;
+    };
+    auto tableResource = [&](const std::string& table) {
+        return scoped("table:" + table);
+    };
+
+    std::vector<NativeLockRequest> requests;
+    auto catalog = [&](NativeLockMode mode) {
+        requests.push_back({scoped("catalog"), mode});
+    };
+    auto table = [&](const std::string& name, NativeLockMode mode) {
+        if (!name.empty()) requests.push_back({tableResource(name), mode});
+    };
+
+    requests.push_back({
+        scoped("!database"),
+        statementMutatesPersistentState(statement)
+            ? NativeLockMode::Exclusive
+            : NativeLockMode::Shared,
+    });
+
+    if (auto* select = dynamic_cast<const SelectStmt*>(statement)) {
+        catalog(NativeLockMode::Shared);
+        table(select->fromTable, NativeLockMode::Shared);
+        for (const auto& join : select->joins) {
+            table(join.table, NativeLockMode::Shared);
+        }
+    } else if (auto* insert = dynamic_cast<const InsertStmt*>(statement)) {
+        catalog(NativeLockMode::Shared);
+        table(insert->table, NativeLockMode::Exclusive);
+    } else if (auto* update = dynamic_cast<const UpdateStmt*>(statement)) {
+        catalog(NativeLockMode::Shared);
+        table(update->table, NativeLockMode::Exclusive);
+    } else if (auto* remove = dynamic_cast<const DeleteStmt*>(statement)) {
+        catalog(NativeLockMode::Shared);
+        table(remove->table, NativeLockMode::Exclusive);
+    } else if (auto* create = dynamic_cast<const CreateStmt*>(statement)) {
+        catalog(NativeLockMode::Exclusive);
+        table(create->table, NativeLockMode::Exclusive);
+    } else if (auto* drop = dynamic_cast<const DropStmt*>(statement)) {
+        catalog(NativeLockMode::Exclusive);
+        table(drop->table, NativeLockMode::Exclusive);
+    } else if (auto* snapshot =
+                   dynamic_cast<const CreateSnapshotStmt*>(statement)) {
+        catalog(NativeLockMode::Exclusive);
+        if (snapshot->source) {
+            table(snapshot->source->fromTable, NativeLockMode::Shared);
+        }
+    } else if (dynamic_cast<const ExportTorchStmt*>(statement) ||
+               dynamic_cast<const ExplainBatchStmt*>(statement) ||
+               dynamic_cast<const SpillContextStmt*>(statement) ||
+               dynamic_cast<const ShowTabsStmt*>(statement) ||
+               dynamic_cast<const ShowContextSchemasStmt*>(statement) ||
+               dynamic_cast<const ShowContextObjectsStmt*>(statement)) {
+        catalog(NativeLockMode::Shared);
+    } else if (dynamic_cast<const CreateContextStmt*>(statement) ||
+               dynamic_cast<const AppendMemoryStmt*>(statement) ||
+               dynamic_cast<const TagMemoryStmt*>(statement) ||
+               dynamic_cast<const AliasTabStmt*>(statement) ||
+               dynamic_cast<const MergeTabsStmt*>(statement)) {
+        catalog(NativeLockMode::Exclusive);
+    }
+
+    return NativeLockManager::global().acquireAll(std::move(requests));
+}
+
+bool NativeEngine::statementMutatesPersistentState(
+    const ASTNode* statement) const {
+    return dynamic_cast<const CreateStmt*>(statement) ||
+           dynamic_cast<const DropStmt*>(statement) ||
+           dynamic_cast<const InsertStmt*>(statement) ||
+           dynamic_cast<const UpdateStmt*>(statement) ||
+           dynamic_cast<const DeleteStmt*>(statement) ||
+           dynamic_cast<const CreateSnapshotStmt*>(statement) ||
+           dynamic_cast<const CreateContextStmt*>(statement) ||
+           dynamic_cast<const AppendMemoryStmt*>(statement) ||
+           dynamic_cast<const TagMemoryStmt*>(statement) ||
+           dynamic_cast<const AliasTabStmt*>(statement) ||
+           dynamic_cast<const MergeTabsStmt*>(statement);
+}
+
+void NativeEngine::beginWalTransaction() {
+    if (walTransactionId_ == 0) {
+        walTransactionId_ = wal_.begin();
+        walLoggedFiles_.clear();
+    }
+}
+
+void NativeEngine::recordWalBefore(const std::filesystem::path& path) {
+    if (walTransactionId_ == 0) return;
+    const auto absolute =
+        std::filesystem::absolute(path).lexically_normal();
+    const auto key = absolute.generic_string();
+    if (!walLoggedFiles_.insert(key).second) return;
+    const auto before = std::filesystem::exists(absolute)
+        ? std::optional<std::vector<std::uint8_t>>(readFile(absolute))
+        : std::nullopt;
+    wal_.logBefore(walTransactionId_, absolute, before);
+}
+
+void NativeEngine::commitWalTransaction() {
+    if (walTransactionId_ == 0) return;
+    wal_.commit(walTransactionId_);
+    walTransactionId_ = 0;
+    walLoggedFiles_.clear();
+}
+
+void NativeEngine::discardWalTransaction() {
+    if (walTransactionId_ == 0) return;
+    walTransactionId_ = 0;
+    walLoggedFiles_.clear();
+    bufferPool_.discardAll();
+    mappedHeaps_.clear();
+    wal_.recover();
+    primaryIndexes_.clear();
+    tableStatistics_.clear();
+    reloadCatalog();
+}
+
+void NativeEngine::saveCatalog() {
+    recordWalBefore(root_ / "catalog.json");
+    catalog_.save();
+}
+
+void NativeEngine::flushUnlocked() {
+    bufferPool_.flushAll();
+    saveCatalog();
 }
 
 NativeQueryResult NativeEngine::executeCreate(
@@ -1075,11 +676,13 @@ NativeQueryResult NativeEngine::executeCreate(
         table.columns.push_back(std::move(column));
     }
 
+    const auto path = tablePath(statement.table);
+    recordWalBefore(path);
     auto file = heap(statement.table);
     file.create();
     try {
         catalog_.addTable(table);
-        catalog_.save();
+        saveCatalog();
         primaryIndexes_.erase(statement.table);
         tableStatistics_.erase(statement.table);
         invalidateMappedHeap(statement.table);
@@ -1114,6 +717,7 @@ NativeQueryResult NativeEngine::executeDrop(const DropStmt& statement) {
     bufferPool_.flushFile(path);
     std::optional<std::vector<std::uint8_t>> bytes;
     if (std::filesystem::exists(path)) bytes = readFile(path);
+    recordWalBefore(path);
 
     try {
         invalidateMappedHeap(statement.table);
@@ -1121,11 +725,11 @@ NativeQueryResult NativeEngine::executeDrop(const DropStmt& statement) {
         primaryIndexes_.erase(statement.table);
         tableStatistics_.erase(statement.table);
         catalog_.removeTable(statement.table);
-        catalog_.save();
+        saveCatalog();
     } catch (...) {
         catalog_.addTable(backup);
         restoreFile(path, bytes);
-        catalog_.save();
+        saveCatalog();
         throw;
     }
     NativeQueryResult result;
@@ -1145,6 +749,7 @@ NativeQueryResult NativeEngine::executeInsert(
     const auto before = std::filesystem::exists(path)
         ? std::optional<std::vector<std::uint8_t>>(readFile(path))
         : std::nullopt;
+    recordWalBefore(path);
 
     NativeQueryResult result;
     try {
@@ -1219,6 +824,7 @@ NativeQueryResult NativeEngine::executeUpdate(
     file.flush();
     const auto path = tablePath(statement.table);
     const auto before = readFile(path);
+    recordWalBefore(path);
 
     NativeQueryResult result;
     try {
@@ -1276,6 +882,7 @@ NativeQueryResult NativeEngine::executeDelete(
     file.flush();
     const auto path = tablePath(statement.table);
     const auto before = readFile(path);
+    recordWalBefore(path);
 
     NativeQueryResult result;
     try {
@@ -1461,7 +1068,7 @@ NativeQueryResult NativeEngine::executeCreateSnapshot(
     }
 
     catalog_.addSnapshot(snapshot);
-    catalog_.save();
+    saveCatalog();
 
     std::size_t train = 0;
     std::size_t validation = 0;
@@ -1622,219 +1229,12 @@ NativeQueryResult NativeEngine::executeExplainBatch(
     return result;
 }
 
-NativeQueryResult NativeEngine::executeCreateContext(
-    const CreateContextStmt& statement) {
-    if (catalog_.hasContext(statement.name)) {
-        throw std::runtime_error(
-            "Context already exists: " + statement.name);
-    }
-    ConversationContextMeta context;
-    context.name = statement.name;
-    catalog_.addContext(context);
-    catalog_.save();
-
-    NativeQueryResult result;
-    result.columns = {"field", "value"};
-    addKeyValue(result, "context", statement.name);
-    addKeyValue(result, "messages", "0");
-    addKeyValue(result, "atoms", "0");
-    result.message = "manifested context " + statement.name;
-    return result;
-}
-
-NativeQueryResult NativeEngine::executeAppendMemory(
-    const AppendMemoryStmt& statement) {
-    const auto* existing = catalog_.getContext(statement.context);
-    if (!existing) {
-        throw std::runtime_error("Unknown context: " + statement.context);
-    }
-    ConversationContextMeta context = *existing;
-    for (const auto& message : context.messages) {
-        if (message.id == statement.messageId) {
-            throw std::runtime_error(
-                "Duplicate context message id: " +
-                std::to_string(statement.messageId));
-        }
-    }
-
-    ContextMessageMeta message;
-    message.id = statement.messageId;
-    message.speaker = statement.speaker;
-    message.text = statement.text;
-    message.tab = normalizedTab(statement.tab);
-    context.messages.push_back(message);
-
-    auto atoms = extractContextAtoms(statement);
-    const std::string invalidator =
-        "message_" + std::to_string(statement.messageId);
-    std::size_t invalidated = 0;
-    for (const auto& atom : atoms) {
-        for (auto& existingAtom : context.atoms) {
-            if (existingAtom.status == "active" &&
-                existingAtom.key == atom.key &&
-                existingAtom.tab == atom.tab &&
-                existingAtom.value != atom.value) {
-                existingAtom.status = "invalidated";
-                existingAtom.invalidatedBy = invalidator;
-                ++invalidated;
-            }
-        }
-        context.atoms.push_back(atom);
-    }
-
-    catalog_.addContext(context);
-    catalog_.save();
-
-    NativeQueryResult result;
-    result.columns = {"field", "value"};
-    addKeyValue(result, "context", statement.context);
-    addKeyValue(result, "message", invalidator);
-    addKeyValue(result, "speaker", statement.speaker);
-    addKeyValue(result, "tab", message.tab);
-    addKeyValue(result, "extracted_atoms", std::to_string(atoms.size()));
-    addKeyValue(result, "invalidated_atoms", std::to_string(invalidated));
-    for (const auto& atom : atoms) {
-        addKeyValue(result, "atom",
-                    atom.key + "=" + atom.value + " @" + atom.source);
-    }
-    result.message = "yeeted memory into " + statement.context;
-    return result;
-}
-
-NativeQueryResult NativeEngine::executeTagMemory(
-    const TagMemoryStmt& statement) {
-    const auto* existing = catalog_.getContext(statement.context);
-    if (!existing) {
-        throw std::runtime_error("Unknown context: " + statement.context);
-    }
-    ConversationContextMeta context = *existing;
-    const std::string source =
-        "message_" + std::to_string(statement.messageId);
-    const std::string tab = normalizedTab(statement.tab);
-
-    bool found = false;
-    for (auto& message : context.messages) {
-        if (message.id == statement.messageId) {
-            message.tab = tab;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        throw std::runtime_error(
-            "Unknown context message id: " +
-            std::to_string(statement.messageId));
-    }
-
-    std::size_t retaggedAtoms = 0;
-    for (auto& atom : context.atoms) {
-        if (atom.source == source) {
-            atom.tab = tab;
-            ++retaggedAtoms;
-        }
-    }
-    recomputeContextAtomStatus(context);
-
-    catalog_.addContext(context);
-    catalog_.save();
-
-    NativeQueryResult result;
-    result.columns = {"field", "value"};
-    addKeyValue(result, "context", statement.context);
-    addKeyValue(result, "message", source);
-    addKeyValue(result, "tab", tab);
-    addKeyValue(result, "retagged_atoms", std::to_string(retaggedAtoms));
-    result.message = "vibe-tabbed memory in " + statement.context;
-    return result;
-}
-
-NativeQueryResult NativeEngine::executeSpillContext(
-    const SpillContextStmt& statement) {
-    const auto* context = catalog_.getContext(statement.context);
-    if (!context) {
-        throw std::runtime_error("Unknown context: " + statement.context);
-    }
-
-    struct RankedAtom {
-        const ContextAtomMeta* atom = nullptr;
-        int utility = 0;
-        std::size_t ordinal = 0;
-    };
-
-    std::vector<RankedAtom> active;
-    std::vector<const ContextAtomMeta*> invalidated;
-    const std::string tabFilter = statement.tab.empty()
-        ? std::string{}
-        : normalizedTab(statement.tab);
-    for (std::size_t index = 0; index < context->atoms.size(); ++index) {
-        const auto& atom = context->atoms[index];
-        if (!tabFilter.empty() && atom.tab != tabFilter) continue;
-        if (atom.status == "active") {
-            active.push_back(
-                RankedAtom{&atom, contextAtomUtility(atom, statement.query),
-                           index});
-        } else if (atom.status == "invalidated") {
-            invalidated.push_back(&atom);
-        }
-    }
-    std::stable_sort(active.begin(), active.end(),
-        [](const RankedAtom& left, const RankedAtom& right) {
-        if (left.utility != right.utility) {
-            return left.utility > right.utility;
-        }
-        return left.ordinal > right.ordinal;
-    });
-
-    std::vector<std::string> renderedAtoms;
-    std::size_t tokenCost = 0;
-    for (const auto& ranked : active) {
-        std::string rendered =
-            renderContextAtom(*ranked.atom, statement.receipts);
-        const auto cost = estimateContextTokens(rendered);
-        if (!renderedAtoms.empty() &&
-            tokenCost + cost > statement.tokenBudget) {
-            continue;
-        }
-        if (renderedAtoms.empty() && cost > statement.tokenBudget) {
-            continue;
-        }
-        renderedAtoms.push_back(std::move(rendered));
-        tokenCost += cost;
-    }
-
-    NativeQueryResult result;
-    result.columns = {"field", "value"};
-    addKeyValue(result, "context", context->name);
-    addKeyValue(result, "query", statement.query);
-    addKeyValue(result, "tab",
-                tabFilter.empty() ? "all" : tabFilter);
-    addKeyValue(result, "token_budget",
-                std::to_string(statement.tokenBudget));
-    addKeyValue(result, "token_cost", std::to_string(tokenCost));
-    addKeyValue(result, "messages",
-                std::to_string(context->messages.size()));
-    addKeyValue(result, "active_atoms", std::to_string(active.size()));
-    addKeyValue(result, "rendered_atoms",
-                std::to_string(renderedAtoms.size()));
-    addKeyValue(result, "current_context",
-                joinStrings(renderedAtoms, " | "));
-
-    for (const auto& rendered : renderedAtoms) {
-        addKeyValue(result, "view_atom", rendered);
-    }
-    if (statement.receipts) {
-        for (const auto* atom : invalidated) {
-            addKeyValue(result, "invalidated",
-                atom->key + "=" + atom->value + " @" + atom->source +
-                " invalidated_by=" + atom->invalidatedBy);
-        }
-    }
-    result.message = "spilled context view for " + context->name;
-    return result;
-}
-
 NativeQueryResult NativeEngine::executeSelect(
     const SelectStmt& statement) {
+    if (auto rawPoint = executeRawPointSelect(statement)) {
+        return std::move(*rawPoint);
+    }
+
     if (!primaryKeyPredicate(statement.fromTable,
                              statement.fromAlias,
                              statement.where.get())) {
@@ -1867,128 +1267,8 @@ NativeQueryResult NativeEngine::executeSelect(
         for (auto& item : base) rows.push_back(std::move(item.row));
     }
 
-    if (!plannedRows) for (const auto& join : statement.joins) {
-        auto rightScan = scanTable(join.table, join.alias);
-        std::vector<EvalRow> right;
-        right.reserve(rightScan.size());
-        for (auto& item : rightScan) right.push_back(std::move(item.row));
-        const auto leftSchema = !rows.empty()
-            ? rows.front().columns
-            : boundSchema(statement.fromTable, statement.fromAlias);
-        const auto rightSchema = !right.empty()
-            ? right.front().columns
-            : boundSchema(join.table, join.alias);
-        const auto joinedSchema =
-            combineSchemas(leftSchema, rightSchema);
-
-        std::vector<EvalRow> joined;
-        const auto* equality =
-            dynamic_cast<const BinaryOp*>(join.condition.get());
-        const ColumnRef* leftKey = nullptr;
-        const ColumnRef* rightKey = nullptr;
-        if (equality && equality->op == "=") {
-            auto* first =
-                dynamic_cast<const ColumnRef*>(equality->left.get());
-            auto* second =
-                dynamic_cast<const ColumnRef*>(equality->right.get());
-            auto belongsToRight = [&](const ColumnRef* column) {
-                return column && !column->table.empty() &&
-                       (column->table == join.table ||
-                        column->table == join.alias);
-            };
-            if (belongsToRight(first) && !belongsToRight(second)) {
-                rightKey = first;
-                leftKey = second;
-            } else if (belongsToRight(second) &&
-                       !belongsToRight(first)) {
-                rightKey = second;
-                leftKey = first;
-            }
-        }
-
-        if (leftKey && rightKey) {
-            std::unordered_multimap<Value, const EvalRow*, ValueHash> index;
-            BloomFilter bloom(right.size());
-            ++stats_.bloomFilterBuilds;
-            for (const auto& rightRow : right) {
-                Value key = resolveColumn(*rightKey, rightRow);
-                if (!key.isNull()) {
-                    bloom.add(key);
-                    index.emplace(std::move(key), &rightRow);
-                }
-            }
-            for (const auto& leftRow : rows) {
-                Value key = resolveColumn(*leftKey, leftRow);
-                bool matched = false;
-                if (!key.isNull()) {
-                    ++stats_.bloomFilterChecks;
-                    if (!bloom.mayContain(key)) {
-                        ++stats_.bloomFilterRejects;
-                    } else {
-                    const auto range = index.equal_range(key);
-                    ++stats_.hashJoinProbes;
-                    for (auto match = range.first;
-                         match != range.second;
-                        ++match) {
-                        EvalRow combined = leftRow;
-                        combined.columns = joinedSchema;
-                        combined.values.insert(
-                            combined.values.end(),
-                            match->second->values.begin(),
-                            match->second->values.end());
-                        joined.push_back(std::move(combined));
-                        matched = true;
-                    }
-                    }
-                }
-                if (!matched && join.type == JoinType::LEFT) {
-                    EvalRow combined = leftRow;
-                    combined.columns = joinedSchema;
-                    const auto* metadata = catalog_.getTable(join.table);
-                    if (metadata) {
-                        combined.values.insert(
-                            combined.values.end(),
-                            metadata->columns.size(), Value::null());
-                    }
-                    joined.push_back(std::move(combined));
-                }
-            }
-            rows = std::move(joined);
-            continue;
-        }
-
-        for (const auto& leftRow : rows) {
-            bool matched = false;
-            for (const auto& rightRow : right) {
-                ++stats_.nestedLoopComparisons;
-                EvalRow combined = leftRow;
-                combined.columns = joinedSchema;
-                combined.values.insert(combined.values.end(),
-                                       rightRow.values.begin(),
-                                       rightRow.values.end());
-                if (!join.condition ||
-                    eval(join.condition.get(), combined).asBoolean()) {
-                    joined.push_back(std::move(combined));
-                    matched = true;
-                }
-            }
-            if (!matched && join.type == JoinType::LEFT) {
-                EvalRow combined = leftRow;
-                combined.columns = joinedSchema;
-                if (!right.empty()) {
-                    combined.values.insert(
-                        combined.values.end(),
-                        right.front().values.size(), Value::null());
-                } else if (const auto* metadata =
-                               catalog_.getTable(join.table)) {
-                    combined.values.insert(
-                        combined.values.end(),
-                        metadata->columns.size(), Value::null());
-                }
-                joined.push_back(std::move(combined));
-            }
-        }
-        rows = std::move(joined);
+    if (!plannedRows) {
+        executeSourceOrderJoins(statement, rows);
     }
 
     if (statement.where) {
@@ -2318,2078 +1598,6 @@ NativeQueryResult NativeEngine::executeSelect(
     return result;
 }
 
-std::optional<NativeQueryResult>
-NativeEngine::executeRowIdSeekJoinAggregateSelect(
-    const SelectStmt& statement) {
-    if (statement.joins.empty() || statement.distinct ||
-        statement.where || statement.having || !statement.orderBy.empty() ||
-        statement.limit || statement.offset ||
-        !selectHasAggregate(statement)) {
-        return std::nullopt;
-    }
-    for (const auto& join : statement.joins) {
-        if (join.type != JoinType::INNER) return std::nullopt;
-    }
-    for (const auto& expression : statement.columns) {
-        if (dynamic_cast<const Wildcard*>(expression.get())) {
-            return std::nullopt;
-        }
-    }
-
-    const auto* baseMetadata = catalog_.getTable(statement.fromTable);
-    if (!baseMetadata) {
-        throw std::runtime_error(
-            "Unknown table: " + statement.fromTable);
-    }
-
-    const auto matchesRelation =
-        [](const std::string& qualifier,
-           const std::string& table,
-           const std::string& alias) {
-        return !qualifier.empty() &&
-               (qualifier == table ||
-                (!alias.empty() && qualifier == alias));
-    };
-    const auto columnIndex =
-        [](const TableMeta& metadata,
-           const std::string& columnName) -> std::optional<std::size_t> {
-        auto found = std::find_if(
-            metadata.columns.begin(), metadata.columns.end(),
-            [&](const ColumnMeta& column) {
-                return column.name == columnName;
-            });
-        if (found == metadata.columns.end()) return std::nullopt;
-        return static_cast<std::size_t>(
-            std::distance(metadata.columns.begin(), found));
-    };
-    const auto primaryKeyIndex =
-        [](const TableMeta& metadata) -> std::optional<std::size_t> {
-        auto found = std::find_if(
-            metadata.columns.begin(), metadata.columns.end(),
-            [](const ColumnMeta& column) {
-                return column.primary_key;
-            });
-        if (found == metadata.columns.end()) return std::nullopt;
-        return static_cast<std::size_t>(
-            std::distance(metadata.columns.begin(), found));
-    };
-
-    struct JoinSeekPlan {
-        std::string table;
-        std::string alias;
-        const TableMeta* metadata = nullptr;
-        std::size_t primaryKeyColumn = 0;
-        std::size_t baseKeyColumn = 0;
-        std::set<std::size_t> requiredSet;
-        std::vector<std::size_t> requiredColumns;
-        std::vector<std::size_t> fieldPositions;
-    };
-
-    std::vector<JoinSeekPlan> joins;
-    joins.reserve(statement.joins.size());
-    for (const auto& join : statement.joins) {
-        const auto* joinMetadata = catalog_.getTable(join.table);
-        if (!joinMetadata) {
-            throw std::runtime_error("Unknown table: " + join.table);
-        }
-        const auto primary = primaryKeyIndex(*joinMetadata);
-        if (!primary) return std::nullopt;
-
-        const auto* equality =
-            dynamic_cast<const BinaryOp*>(join.condition.get());
-        if (!equality || equality->op != "=") return std::nullopt;
-        const auto* left =
-            dynamic_cast<const ColumnRef*>(equality->left.get());
-        const auto* right =
-            dynamic_cast<const ColumnRef*>(equality->right.get());
-        if (!left || !right) return std::nullopt;
-
-        const auto baseAlias = statement.fromAlias;
-        const bool leftBase = matchesRelation(
-            left->table, statement.fromTable, baseAlias);
-        const bool rightBase = matchesRelation(
-            right->table, statement.fromTable, baseAlias);
-        const bool leftJoin =
-            matchesRelation(left->table, join.table, join.alias);
-        const bool rightJoin =
-            matchesRelation(right->table, join.table, join.alias);
-
-        const ColumnRef* baseColumn = nullptr;
-        const ColumnRef* joinedColumn = nullptr;
-        if (leftBase && rightJoin) {
-            baseColumn = left;
-            joinedColumn = right;
-        } else if (rightBase && leftJoin) {
-            baseColumn = right;
-            joinedColumn = left;
-        } else {
-            return std::nullopt;
-        }
-
-        const auto baseKey = columnIndex(*baseMetadata, baseColumn->column);
-        const auto joinedKey = columnIndex(
-            *joinMetadata, joinedColumn->column);
-        if (!baseKey || !joinedKey || *joinedKey != *primary) {
-            return std::nullopt;
-        }
-
-        JoinSeekPlan plan;
-        plan.table = join.table;
-        plan.alias = join.alias;
-        plan.metadata = joinMetadata;
-        plan.primaryKeyColumn = *primary;
-        plan.baseKeyColumn = *baseKey;
-        joins.push_back(std::move(plan));
-    }
-
-    enum class SourceKind { Base, Join };
-    struct ColumnAccess {
-        SourceKind source = SourceKind::Base;
-        std::size_t join = 0;
-        std::size_t column = 0;
-    };
-    const auto sameColumn =
-        [](const ColumnAccess& left, const ColumnAccess& right) {
-        return left.source == right.source &&
-               left.join == right.join &&
-               left.column == right.column;
-    };
-
-    auto resolveColumn =
-        [&](const ColumnRef& column) -> std::optional<ColumnAccess> {
-        if (!column.table.empty()) {
-            if (matchesRelation(column.table,
-                                statement.fromTable,
-                                statement.fromAlias)) {
-                const auto index =
-                    columnIndex(*baseMetadata, column.column);
-                if (!index) return std::nullopt;
-                return ColumnAccess{SourceKind::Base, 0, *index};
-            }
-            for (std::size_t joinIndex = 0;
-                 joinIndex < joins.size();
-                 ++joinIndex) {
-                if (!matchesRelation(column.table,
-                                     joins[joinIndex].table,
-                                     joins[joinIndex].alias)) {
-                    continue;
-                }
-                const auto index = columnIndex(
-                    *joins[joinIndex].metadata, column.column);
-                if (!index) return std::nullopt;
-                return ColumnAccess{SourceKind::Join,
-                                    joinIndex,
-                                    *index};
-            }
-            return std::nullopt;
-        }
-
-        std::optional<ColumnAccess> result;
-        if (const auto index =
-                columnIndex(*baseMetadata, column.column)) {
-            result = ColumnAccess{SourceKind::Base, 0, *index};
-        }
-        for (std::size_t joinIndex = 0;
-             joinIndex < joins.size();
-             ++joinIndex) {
-            if (const auto index = columnIndex(
-                    *joins[joinIndex].metadata, column.column)) {
-                if (result) return std::nullopt;
-                result = ColumnAccess{SourceKind::Join,
-                                      joinIndex,
-                                      *index};
-            }
-        }
-        return result;
-    };
-
-    std::set<std::size_t> baseRequiredSet;
-    auto requireColumn = [&](const ColumnAccess& column) {
-        if (column.source == SourceKind::Base) {
-            baseRequiredSet.insert(column.column);
-        } else {
-            joins[column.join].requiredSet.insert(column.column);
-        }
-    };
-    for (const auto& join : joins) {
-        baseRequiredSet.insert(join.baseKeyColumn);
-    }
-
-    std::vector<ColumnAccess> groupColumns;
-    groupColumns.reserve(statement.groupBy.size());
-    for (const auto& expression : statement.groupBy) {
-        const auto* column =
-            dynamic_cast<const ColumnRef*>(expression.get());
-        if (!column) return std::nullopt;
-        auto access = resolveColumn(*column);
-        if (!access) return std::nullopt;
-        requireColumn(*access);
-        groupColumns.push_back(*access);
-    }
-
-    enum class AggregateKind { Count, Sum, Average, Max, Min, LoneWolf };
-    struct AggregatePlan {
-        AggregateKind kind = AggregateKind::Count;
-        std::optional<ColumnAccess> argument;
-    };
-    struct ProjectionPlan {
-        bool aggregate = false;
-        std::optional<ColumnAccess> representative;
-        AggregatePlan aggregatePlan;
-    };
-
-    std::vector<ProjectionPlan> projections;
-    projections.reserve(statement.columns.size());
-    bool hasAggregateProjection = false;
-    for (const auto& expression : statement.columns) {
-        if (const auto* function =
-                dynamic_cast<const FunctionCall*>(expression.get())) {
-            if (function->distinct ||
-                !isSimpleAggregateName(function->name)) {
-                return std::nullopt;
-            }
-            ProjectionPlan projection;
-            projection.aggregate = true;
-            hasAggregateProjection = true;
-            if (function->name == "headcount") {
-                projection.aggregatePlan.kind = AggregateKind::Count;
-            } else if (function->name == "stack") {
-                projection.aggregatePlan.kind = AggregateKind::Sum;
-            } else if (function->name == "mid") {
-                projection.aggregatePlan.kind = AggregateKind::Average;
-            } else if (function->name == "goat") {
-                projection.aggregatePlan.kind = AggregateKind::Max;
-            } else if (function->name == "L") {
-                projection.aggregatePlan.kind = AggregateKind::Min;
-            } else if (isLoneWolfName(function->name)) {
-                projection.aggregatePlan.kind = AggregateKind::LoneWolf;
-            }
-
-            const bool countWildcard =
-                function->name == "headcount" &&
-                (function->args.empty() ||
-                 dynamic_cast<const Wildcard*>(
-                     function->args.front().get()));
-            if (!countWildcard) {
-                if (function->args.size() != 1) return std::nullopt;
-                const auto* argument =
-                    dynamic_cast<const ColumnRef*>(
-                        function->args.front().get());
-                if (!argument) return std::nullopt;
-                auto access = resolveColumn(*argument);
-                if (!access) return std::nullopt;
-                requireColumn(*access);
-                projection.aggregatePlan.argument = *access;
-            }
-            projections.push_back(std::move(projection));
-            continue;
-        }
-
-        const auto* column =
-            dynamic_cast<const ColumnRef*>(expression.get());
-        if (!column || hasAggregate(expression.get())) {
-            return std::nullopt;
-        }
-        auto access = resolveColumn(*column);
-        if (!access) return std::nullopt;
-        bool groupedColumn = false;
-        for (const auto& groupColumn : groupColumns) {
-            if (sameColumn(*access, groupColumn)) {
-                groupedColumn = true;
-                break;
-            }
-        }
-        if (!groupedColumn) return std::nullopt;
-        requireColumn(*access);
-        ProjectionPlan projection;
-        projection.representative = *access;
-        projections.push_back(std::move(projection));
-    }
-    if (!hasAggregateProjection) return std::nullopt;
-
-    const std::size_t missing =
-        std::numeric_limits<std::size_t>::max();
-    const std::vector<std::size_t> baseRequiredColumns(
-        baseRequiredSet.begin(), baseRequiredSet.end());
-    std::vector<std::size_t> baseFieldPositions(
-        baseMetadata->columns.size(), missing);
-    for (std::size_t index = 0;
-         index < baseRequiredColumns.size();
-         ++index) {
-        baseFieldPositions[baseRequiredColumns[index]] = index;
-    }
-    for (auto& join : joins) {
-        join.requiredColumns.assign(
-            join.requiredSet.begin(), join.requiredSet.end());
-        join.fieldPositions.assign(
-            join.metadata->columns.size(), missing);
-        for (std::size_t index = 0;
-             index < join.requiredColumns.size();
-             ++index) {
-            join.fieldPositions[join.requiredColumns[index]] = index;
-        }
-    }
-
-    struct AggregateState {
-        std::int64_t count = 0;
-        double sum = 0.0;
-        bool allIntegers = true;
-        std::optional<Value> extremum;
-        std::vector<double> samples;
-    };
-    struct GroupState {
-        Tuple representatives;
-        std::vector<AggregateState> aggregates;
-    };
-
-    std::unordered_map<Tuple, GroupState,
-                       TupleKeyHash, TupleKeyEqual> groups;
-    auto initializeGroup = [&](GroupState& group) {
-        if (!group.representatives.empty() ||
-            !group.aggregates.empty()) {
-            return;
-        }
-        group.representatives.resize(
-            projections.size(), Value::null());
-        group.aggregates.resize(projections.size());
-    };
-    if (groupColumns.empty()) {
-        initializeGroup(groups[{}]);
-    }
-
-    std::vector<RawField> baseFields;
-    baseFields.reserve(baseRequiredColumns.size());
-    std::vector<std::vector<RawField>> joinedFields(joins.size());
-    for (std::size_t joinIndex = 0;
-         joinIndex < joins.size();
-         ++joinIndex) {
-        joinedFields[joinIndex].reserve(
-            joins[joinIndex].requiredColumns.size());
-    }
-
-    auto fieldAt =
-        [&](const ColumnAccess& column) -> const RawField& {
-        if (column.source == SourceKind::Base) {
-            const auto position = baseFieldPositions[column.column];
-            if (position == missing || position >= baseFields.size()) {
-                throw std::runtime_error(
-                    "Rowid-seek join base column was not decoded");
-            }
-            return baseFields[position];
-        }
-        const auto& join = joins[column.join];
-        const auto position = join.fieldPositions[column.column];
-        if (position == missing ||
-            position >= joinedFields[column.join].size()) {
-            throw std::runtime_error(
-                "Rowid-seek join column was not decoded");
-        }
-        return joinedFields[column.join][position];
-    };
-
-    auto makeOutput = [&](GroupState& group) {
-        initializeGroup(group);
-        Tuple output;
-        output.reserve(projections.size());
-        for (std::size_t index = 0;
-             index < projections.size();
-             ++index) {
-            const auto& projection = projections[index];
-            if (!projection.aggregate) {
-                output.push_back(group.representatives[index]);
-                continue;
-            }
-            const auto& aggregate = projection.aggregatePlan;
-            const auto& state = group.aggregates[index];
-            if (aggregate.kind == AggregateKind::Count) {
-                output.push_back(Value(state.count));
-            } else if (aggregate.kind == AggregateKind::LoneWolf) {
-                output.push_back(Value(countLoneWolves(state.samples)));
-            } else if (state.count == 0) {
-                output.push_back(Value::null());
-            } else if (aggregate.kind == AggregateKind::Average) {
-                output.push_back(Value(
-                    state.sum / static_cast<double>(state.count)));
-            } else if (aggregate.kind == AggregateKind::Sum) {
-                output.push_back(state.allIntegers
-                    ? Value(static_cast<std::int64_t>(state.sum))
-                    : Value(state.sum));
-            } else {
-                output.push_back(
-                    state.extremum.value_or(Value::null()));
-            }
-        }
-        return output;
-    };
-
-    auto joinDomainProvesEmpty = [&]() {
-        for (const auto& join : joins) {
-            ++stats_.joinDomainFiltersChecked;
-            const auto& baseRange = ensureColumnRange(
-                statement.fromTable,
-                baseMetadata->columns[join.baseKeyColumn].name);
-            const auto& joinRange = ensureColumnRange(
-                join.table,
-                join.metadata->columns[join.primaryKeyColumn].name);
-            if (!baseRange.present || !joinRange.present) return true;
-            if (baseRange.max.compare(joinRange.min) < 0 ||
-                baseRange.min.compare(joinRange.max) > 0) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    if (joinDomainProvesEmpty()) {
-        ++stats_.joinDomainScansSkipped;
-        stats_.joinDomainRowsSkipped +=
-            tableStatistics_[statement.fromTable].rowCount;
-        NativeQueryResult result;
-        result.columns = outputNames(statement, nullptr);
-        if (groupColumns.empty()) {
-            result.rows.push_back(makeOutput(groups[{}]));
-        }
-        ++stats_.rowIdSeekJoinQueries;
-        return result;
-    }
-
-    std::vector<MappedHeapFile*> joinMappedFiles;
-    joinMappedFiles.reserve(joins.size());
-    for (const auto& join : joins) {
-        joinMappedFiles.push_back(&mappedHeap(join.table));
-    }
-
-    auto decodeJoinRow =
-        [&](std::size_t joinIndex,
-            RowId rowId) {
-        auto& join = joins[joinIndex];
-        joinedFields[joinIndex].clear();
-        if (join.requiredColumns.empty()) return true;
-        auto decode = [&](const std::uint8_t* data, std::size_t length) {
-            decodeRawProjectedInto(
-                data, length,
-                join.requiredColumns,
-                joinedFields[joinIndex]);
-        };
-        bool usedMapping = false;
-        bool found = false;
-        if (joinMappedFiles[joinIndex]->isMapped()) {
-            found = joinMappedFiles[joinIndex]->readRawRowFast(
-                rowId, decode);
-            usedMapping = found;
-        }
-        if (!found) {
-            auto file = heap(join.table);
-            found = file.readRawRowFast(rowId, decode);
-        }
-        if (found) {
-            ++stats_.rowsRead;
-            ++stats_.rowCopiesAvoided;
-            if (usedMapping) ++stats_.virtualMemoryRowIdReads;
-            stats_.decodedColumns += join.requiredColumns.size();
-            stats_.skippedColumns +=
-                join.metadata->columns.size() -
-                join.requiredColumns.size();
-        }
-        return found;
-    };
-
-    auto lookupJoin =
-        [&](std::size_t joinIndex, const Value& key) {
-        auto& join = joins[joinIndex];
-        ++stats_.indexLookups;
-        ++stats_.rowIdSeekJoinLookups;
-        auto rowId = primaryIndex(join.table).find(key);
-        if (!rowId) {
-            ++stats_.rowIdSeekJoinMisses;
-            return false;
-        }
-        if (decodeJoinRow(joinIndex, *rowId)) return true;
-
-        primaryIndexes_.erase(join.table);
-        ++stats_.indexLookups;
-        ++stats_.rowIdSeekJoinLookups;
-        rowId = primaryIndex(join.table).find(key);
-        if (!rowId || !decodeJoinRow(joinIndex, *rowId)) {
-            ++stats_.rowIdSeekJoinMisses;
-            return false;
-        }
-        return true;
-    };
-
-    auto file = heap(statement.fromTable);
-    auto& mappedFile = mappedHeap(statement.fromTable);
-    ++stats_.tableScans;
-    auto visitBaseRow =
-        [&](RowId, const std::uint8_t* data, std::size_t length) {
-        decodeRawProjectedInto(
-            data, length, baseRequiredColumns, baseFields);
-        ++stats_.rowsRead;
-        ++stats_.rawRowsScanned;
-        ++stats_.rowCopiesAvoided;
-        ++stats_.rowIdSeekJoinBaseRows;
-        stats_.decodedColumns += baseRequiredColumns.size();
-        stats_.skippedColumns +=
-            baseMetadata->columns.size() - baseRequiredColumns.size();
-
-        for (std::size_t joinIndex = 0;
-             joinIndex < joins.size();
-             ++joinIndex) {
-            const auto& join = joins[joinIndex];
-            const auto position =
-                baseFieldPositions[join.baseKeyColumn];
-            if (position == missing || position >= baseFields.size()) {
-                throw std::runtime_error(
-                    "Rowid-seek join key was not decoded");
-            }
-            const auto& keyField = baseFields[position];
-            if (keyField.isNull ||
-                !lookupJoin(joinIndex, keyField.toValue())) {
-                return;
-            }
-        }
-
-        Tuple key;
-        key.reserve(groupColumns.size());
-        for (const auto& column : groupColumns) {
-            key.push_back(fieldAt(column).toValue());
-        }
-        auto& group = groups[key];
-        initializeGroup(group);
-        for (std::size_t index = 0;
-             index < projections.size();
-             ++index) {
-            const auto& projection = projections[index];
-            if (!projection.aggregate) {
-                if (group.representatives[index].isNull()) {
-                    group.representatives[index] =
-                        fieldAt(*projection.representative).toValue();
-                }
-                continue;
-            }
-
-            auto& state = group.aggregates[index];
-            const auto& aggregate = projection.aggregatePlan;
-            if (!aggregate.argument) {
-                ++state.count;
-                continue;
-            }
-            const auto& field = fieldAt(*aggregate.argument);
-            if (field.isNull) continue;
-            if (aggregate.kind == AggregateKind::Count) {
-                ++state.count;
-                continue;
-            }
-            if (aggregate.kind == AggregateKind::Sum ||
-                aggregate.kind == AggregateKind::Average ||
-                aggregate.kind == AggregateKind::LoneWolf) {
-                if (!field.numeric()) {
-                    throw std::runtime_error(
-                        "Numeric aggregate on non-number");
-                }
-                ++state.count;
-                const double numeric = field.asReal();
-                state.sum += numeric;
-                state.allIntegers =
-                    state.allIntegers &&
-                    field.type == ValueType::Integer;
-                if (aggregate.kind == AggregateKind::LoneWolf) {
-                    state.samples.push_back(numeric);
-                }
-                continue;
-            }
-
-            Value value = field.toValue();
-            ++state.count;
-            if (!state.extremum) {
-                state.extremum = std::move(value);
-                continue;
-            }
-            const int comparison = value.compare(*state.extremum);
-            if ((aggregate.kind == AggregateKind::Max &&
-                 comparison > 0) ||
-                (aggregate.kind == AggregateKind::Min &&
-                 comparison < 0)) {
-                state.extremum = std::move(value);
-            }
-        }
-    };
-    if (mappedFile.isMapped()) {
-        ++stats_.virtualMemoryScanQueries;
-        mappedFile.scanRawRowsFast(
-            [&](RowId rowId,
-                const std::uint8_t* data,
-                std::size_t length) {
-            ++stats_.virtualMemoryRowsScanned;
-            visitBaseRow(rowId, data, length);
-        });
-    } else {
-        file.scanRawRowsFast(visitBaseRow);
-    }
-
-    NativeQueryResult result;
-    result.columns = outputNames(statement, nullptr);
-    for (auto& item : groups) {
-        result.rows.push_back(makeOutput(item.second));
-    }
-    ++stats_.rowIdSeekJoinQueries;
-    return result;
-}
-
-std::optional<std::vector<NativeEngine::EvalRow>>
-NativeEngine::executeCostBasedJoins(const SelectStmt& statement) {
-    if (statement.joins.size() < 2 ||
-        statement.joins.size() >= sizeof(std::size_t) * 8) {
-        return std::nullopt;
-    }
-    for (const auto& join : statement.joins) {
-        if (join.type != JoinType::INNER) return std::nullopt;
-    }
-    for (const auto& expression : statement.columns) {
-        if (dynamic_cast<const Wildcard*>(expression.get())) {
-            return std::nullopt;
-        }
-    }
-
-    struct JoinPredicate {
-        std::size_t leftRelation = 0;
-        std::size_t rightRelation = 0;
-        const ColumnRef* left = nullptr;
-        const ColumnRef* right = nullptr;
-        const ASTNode* expression = nullptr;
-    };
-
-    std::vector<RelationData> relations;
-    relations.reserve(statement.joins.size() + 1);
-    relations.push_back(
-        {statement.fromTable, statement.fromAlias, {}, {}});
-    for (const auto& join : statement.joins) {
-        relations.push_back({join.table, join.alias, {}, {}});
-    }
-
-    auto relationFor = [&](const ColumnRef& column)
-        -> std::optional<std::size_t> {
-        if (column.table.empty()) return std::nullopt;
-        for (std::size_t index = 0; index < relations.size(); ++index) {
-            if (column.table == relations[index].table ||
-                (!relations[index].alias.empty() &&
-                 column.table == relations[index].alias)) {
-                return index;
-            }
-        }
-        return std::nullopt;
-    };
-
-    std::vector<JoinPredicate> predicates;
-    predicates.reserve(statement.joins.size());
-    for (const auto& join : statement.joins) {
-        auto* equality =
-            dynamic_cast<const BinaryOp*>(join.condition.get());
-        if (!equality || equality->op != "=") return std::nullopt;
-        auto* left =
-            dynamic_cast<const ColumnRef*>(equality->left.get());
-        auto* right =
-            dynamic_cast<const ColumnRef*>(equality->right.get());
-        if (!left || !right) return std::nullopt;
-        auto leftRelation = relationFor(*left);
-        auto rightRelation = relationFor(*right);
-        if (!leftRelation || !rightRelation ||
-            *leftRelation == *rightRelation) {
-            return std::nullopt;
-        }
-        predicates.push_back(
-            {*leftRelation, *rightRelation, left, right,
-             join.condition.get()});
-    }
-
-    for (std::size_t relationIndex = 0;
-         relationIndex < relations.size();
-         ++relationIndex) {
-        auto& relation = relations[relationIndex];
-        auto scan = scanTable(relation.table, relation.alias);
-        relation.rows.reserve(scan.size());
-        for (auto& row : scan) {
-            relation.rows.push_back(std::move(row.row));
-        }
-        const auto* metadata = catalog_.getTable(relation.table);
-        if (!metadata) {
-            throw std::runtime_error(
-                "Unknown table: " + relation.table);
-        }
-        auto& cached = tableStatistics_[relation.table];
-        if (cached.rowCount != relation.rows.size()) {
-            cached = {};
-            cached.rowCount = relation.rows.size();
-        }
-        std::unordered_set<std::string> requiredColumns;
-        for (const auto& predicate : predicates) {
-            if (predicate.leftRelation == relationIndex) {
-                requiredColumns.insert(predicate.left->column);
-            }
-            if (predicate.rightRelation == relationIndex) {
-                requiredColumns.insert(predicate.right->column);
-            }
-        }
-        for (const auto& columnName : requiredColumns) {
-            auto foundCached =
-                cached.distinctCounts.find(columnName);
-            if (foundCached != cached.distinctCounts.end()) {
-                relation.distinctCounts[columnName] =
-                    foundCached->second;
-                continue;
-            }
-            auto foundColumn = std::find_if(
-                metadata->columns.begin(), metadata->columns.end(),
-                [&](const ColumnMeta& column) {
-                    return column.name == columnName;
-                });
-            if (foundColumn == metadata->columns.end()) {
-                throw std::runtime_error(
-                    "Unknown statistics column: " + columnName);
-            }
-            const auto column = static_cast<std::size_t>(
-                std::distance(metadata->columns.begin(), foundColumn));
-            std::unordered_set<Value, ValueHash> distinct;
-            for (const auto& row : relation.rows) {
-                if (!row.values[column].isNull()) {
-                    distinct.insert(row.values[column]);
-                }
-            }
-            const auto count =
-                std::max<std::size_t>(1, distinct.size());
-            cached.distinctCounts[columnName] = count;
-            relation.distinctCounts[columnName] = count;
-        }
-    }
-
-    struct Plan {
-        bool valid = false;
-        double cost = 0.0;
-        double rows = 0.0;
-        std::vector<std::size_t> order;
-    };
-    const std::size_t relationCount = relations.size();
-    const std::size_t stateCount =
-        static_cast<std::size_t>(1) << relationCount;
-    std::vector<Plan> plans(stateCount);
-    for (std::size_t relation = 0;
-         relation < relationCount;
-         ++relation) {
-        auto& plan = plans[static_cast<std::size_t>(1) << relation];
-        plan.valid = true;
-        plan.rows = static_cast<double>(
-            relations[relation].rows.size());
-        plan.cost = plan.rows;
-        plan.order.push_back(relation);
-    }
-
-    auto distinctCount = [&](std::size_t relation,
-                             const ColumnRef& column) {
-        const auto found =
-            relations[relation].distinctCounts.find(column.column);
-        return static_cast<double>(
-            found == relations[relation].distinctCounts.end()
-                ? std::max<std::size_t>(
-                      1, relations[relation].rows.size())
-                : found->second);
-    };
-
-    for (std::size_t mask = 1; mask < stateCount; ++mask) {
-        if (!plans[mask].valid) continue;
-        for (std::size_t next = 0;
-             next < relationCount;
-             ++next) {
-            const std::size_t bit =
-                static_cast<std::size_t>(1) << next;
-            if ((mask & bit) != 0) continue;
-            double selectivity = 1.0;
-            bool connected = false;
-            for (const auto& predicate : predicates) {
-                const bool leftIn =
-                    (mask & (static_cast<std::size_t>(1)
-                             << predicate.leftRelation)) != 0;
-                const bool rightIn =
-                    (mask & (static_cast<std::size_t>(1)
-                             << predicate.rightRelation)) != 0;
-                if (predicate.leftRelation == next && rightIn) {
-                    connected = true;
-                    selectivity *= 1.0 / std::max(
-                        distinctCount(next, *predicate.left),
-                        distinctCount(predicate.rightRelation,
-                                      *predicate.right));
-                } else if (predicate.rightRelation == next && leftIn) {
-                    connected = true;
-                    selectivity *= 1.0 / std::max(
-                        distinctCount(predicate.leftRelation,
-                                      *predicate.left),
-                        distinctCount(next, *predicate.right));
-                }
-            }
-            if (!connected) continue;
-            const double nextRows = static_cast<double>(
-                relations[next].rows.size());
-            const double outputRows = std::max(
-                plans[mask].rows * nextRows * selectivity,
-                (plans[mask].rows == 0.0 || nextRows == 0.0)
-                    ? 0.0 : 1.0);
-            const double cost = plans[mask].cost +
-                                plans[mask].rows +
-                                nextRows + outputRows;
-            const std::size_t combined = mask | bit;
-            ++stats_.joinPlansEnumerated;
-            if (!plans[combined].valid ||
-                cost < plans[combined].cost) {
-                plans[combined] = plans[mask];
-                plans[combined].valid = true;
-                plans[combined].cost = cost;
-                plans[combined].rows = outputRows;
-                plans[combined].order.push_back(next);
-            }
-        }
-    }
-
-    const auto& best = plans[stateCount - 1];
-    if (!best.valid) return std::nullopt;
-    stats_.estimatedJoinCost = best.cost;
-    bool changed = false;
-    for (std::size_t index = 0; index < best.order.size(); ++index) {
-        if (best.order[index] != index) {
-            changed = true;
-            break;
-        }
-    }
-    if (changed) ++stats_.joinOrderChanges;
-
-    std::vector<EvalRow> rows =
-        std::move(relations[best.order.front()].rows);
-    std::size_t joinedMask =
-        static_cast<std::size_t>(1) << best.order.front();
-    for (std::size_t orderIndex = 1;
-         orderIndex < best.order.size();
-         ++orderIndex) {
-        const std::size_t next = best.order[orderIndex];
-        const JoinPredicate* keyPredicate = nullptr;
-        bool nextIsLeft = false;
-        for (const auto& predicate : predicates) {
-            const bool leftJoined =
-                (joinedMask & (static_cast<std::size_t>(1)
-                               << predicate.leftRelation)) != 0;
-            const bool rightJoined =
-                (joinedMask & (static_cast<std::size_t>(1)
-                               << predicate.rightRelation)) != 0;
-            if (predicate.leftRelation == next && rightJoined) {
-                keyPredicate = &predicate;
-                nextIsLeft = true;
-                break;
-            }
-            if (predicate.rightRelation == next && leftJoined) {
-                keyPredicate = &predicate;
-                nextIsLeft = false;
-                break;
-            }
-        }
-        if (!keyPredicate) return std::nullopt;
-        const ColumnRef& nextKey = nextIsLeft
-            ? *keyPredicate->left : *keyPredicate->right;
-        const ColumnRef& joinedKey = nextIsLeft
-            ? *keyPredicate->right : *keyPredicate->left;
-        auto& nextRows = relations[next].rows;
-        std::vector<EvalRow> joined;
-        const auto joinedSchema = combineSchemas(
-            rows.empty()
-                ? boundSchema(relations[best.order.front()].table,
-                              relations[best.order.front()].alias)
-                : rows.front().columns,
-            nextRows.empty()
-                ? boundSchema(relations[next].table,
-                              relations[next].alias)
-                : nextRows.front().columns);
-
-        if (rows.size() <= nextRows.size()) {
-            std::unordered_multimap<Value, const EvalRow*, ValueHash>
-                index;
-            index.reserve(rows.size());
-            BloomFilter bloom(rows.size());
-            ++stats_.bloomFilterBuilds;
-            for (const auto& row : rows) {
-                Value key = resolveColumn(joinedKey, row);
-                if (!key.isNull()) {
-                    bloom.add(key);
-                    index.emplace(std::move(key), &row);
-                }
-            }
-            for (const auto& nextRow : nextRows) {
-                Value key = resolveColumn(nextKey, nextRow);
-                if (key.isNull()) continue;
-                ++stats_.bloomFilterChecks;
-                if (!bloom.mayContain(key)) {
-                    ++stats_.bloomFilterRejects;
-                    continue;
-                }
-                ++stats_.hashJoinProbes;
-                const auto range = index.equal_range(key);
-                for (auto match = range.first;
-                     match != range.second;
-                     ++match) {
-                    EvalRow combined = *match->second;
-                    combined.columns = joinedSchema;
-                    combined.values.insert(
-                        combined.values.end(),
-                        nextRow.values.begin(),
-                        nextRow.values.end());
-                    joined.push_back(std::move(combined));
-                }
-            }
-        } else {
-            std::unordered_multimap<Value, const EvalRow*, ValueHash>
-                index;
-            index.reserve(nextRows.size());
-            BloomFilter bloom(nextRows.size());
-            ++stats_.bloomFilterBuilds;
-            for (const auto& row : nextRows) {
-                Value key = resolveColumn(nextKey, row);
-                if (!key.isNull()) {
-                    bloom.add(key);
-                    index.emplace(std::move(key), &row);
-                }
-            }
-            for (const auto& row : rows) {
-                Value key = resolveColumn(joinedKey, row);
-                if (key.isNull()) continue;
-                ++stats_.bloomFilterChecks;
-                if (!bloom.mayContain(key)) {
-                    ++stats_.bloomFilterRejects;
-                    continue;
-                }
-                ++stats_.hashJoinProbes;
-                const auto range = index.equal_range(key);
-                for (auto match = range.first;
-                     match != range.second;
-                     ++match) {
-                    EvalRow combined = row;
-                    combined.columns = joinedSchema;
-                    combined.values.insert(
-                        combined.values.end(),
-                        match->second->values.begin(),
-                        match->second->values.end());
-                    joined.push_back(std::move(combined));
-                }
-            }
-        }
-
-        joinedMask |= static_cast<std::size_t>(1) << next;
-        joined.erase(std::remove_if(
-            joined.begin(), joined.end(),
-            [&](const EvalRow& row) {
-                for (const auto& predicate : predicates) {
-                    const std::size_t leftBit =
-                        static_cast<std::size_t>(1)
-                        << predicate.leftRelation;
-                    const std::size_t rightBit =
-                        static_cast<std::size_t>(1)
-                        << predicate.rightRelation;
-                    if ((joinedMask & leftBit) != 0 &&
-                        (joinedMask & rightBit) != 0 &&
-                        !eval(predicate.expression, row).asBoolean()) {
-                        return true;
-                    }
-                }
-                return false;
-            }), joined.end());
-        rows = std::move(joined);
-    }
-    return rows;
-}
-
-std::optional<NativeQueryResult> NativeEngine::executeDirectAggregateSelect(
-    const SelectStmt& statement) {
-    if (!statement.joins.empty() || statement.distinct ||
-        statement.having || !statement.orderBy.empty() ||
-        statement.limit || statement.offset ||
-        !selectHasAggregate(statement)) {
-        return std::nullopt;
-    }
-
-    const auto* metadata = catalog_.getTable(statement.fromTable);
-    if (!metadata) {
-        throw std::runtime_error(
-            "Unknown table: " + statement.fromTable);
-    }
-
-    auto resolveColumnIndex = [&](const ColumnRef& column) {
-        if (!column.table.empty() &&
-            column.table != statement.fromTable &&
-            column.table != statement.fromAlias) {
-            throw std::runtime_error(
-                "Unknown table qualifier: " + column.table);
-        }
-        std::optional<std::size_t> result;
-        for (std::size_t index = 0;
-             index < metadata->columns.size();
-             ++index) {
-            if (metadata->columns[index].name != column.column) {
-                continue;
-            }
-            if (result && column.table.empty()) {
-                throw std::runtime_error(
-                    "Ambiguous column: " + column.column);
-            }
-            result = index;
-        }
-        if (!result) {
-            throw std::runtime_error("Unknown column: " +
-                (column.table.empty() ? "" : column.table + ".") +
-                column.column);
-        }
-        return *result;
-    };
-
-    struct PredicatePlan {
-        std::size_t column = 0;
-        std::string op;
-        Value literal;
-        bool columnOnLeft = true;
-    };
-    std::optional<PredicatePlan> predicate;
-    auto comparisonOperator = [](const std::string& op) {
-        return op == "=" || op == "!=" || op == "<" || op == ">" ||
-               op == "<=" || op == ">=";
-    };
-    if (statement.where) {
-        const auto* binary =
-            dynamic_cast<const BinaryOp*>(statement.where.get());
-        if (!binary || !comparisonOperator(binary->op)) {
-            return std::nullopt;
-        }
-        const auto* leftColumn =
-            dynamic_cast<const ColumnRef*>(binary->left.get());
-        const auto* rightColumn =
-            dynamic_cast<const ColumnRef*>(binary->right.get());
-        const auto* leftLiteral =
-            dynamic_cast<const Literal*>(binary->left.get());
-        const auto* rightLiteral =
-            dynamic_cast<const Literal*>(binary->right.get());
-        if (leftColumn && rightLiteral) {
-            predicate = PredicatePlan{
-                resolveColumnIndex(*leftColumn),
-                binary->op,
-                literalValue(*rightLiteral),
-                true};
-        } else if (rightColumn && leftLiteral) {
-            predicate = PredicatePlan{
-                resolveColumnIndex(*rightColumn),
-                binary->op,
-                literalValue(*leftLiteral),
-                false};
-        } else {
-            return std::nullopt;
-        }
-    }
-
-    enum class AggregateKind { Count, Sum, Average, Max, Min, LoneWolf };
-    struct AggregatePlan {
-        AggregateKind kind = AggregateKind::Count;
-        std::optional<std::size_t> argumentColumn;
-    };
-    struct ProjectionPlan {
-        bool aggregate = false;
-        std::optional<std::size_t> representativeColumn;
-        AggregatePlan aggregatePlan;
-    };
-
-    std::set<std::size_t> requiredSet;
-    auto require = [&](std::size_t column) {
-        requiredSet.insert(column);
-    };
-    if (predicate) require(predicate->column);
-
-    std::vector<std::size_t> groupColumns;
-    groupColumns.reserve(statement.groupBy.size());
-    for (const auto& expression : statement.groupBy) {
-        const auto* column =
-            dynamic_cast<const ColumnRef*>(expression.get());
-        if (!column) return std::nullopt;
-        const auto index = resolveColumnIndex(*column);
-        groupColumns.push_back(index);
-        require(index);
-    }
-
-    std::vector<ProjectionPlan> projections;
-    projections.reserve(statement.columns.size());
-    bool hasAggregateProjection = false;
-    for (const auto& expression : statement.columns) {
-        if (auto* function =
-                dynamic_cast<const FunctionCall*>(expression.get())) {
-            if (function->distinct) return std::nullopt;
-            ProjectionPlan plan;
-            plan.aggregate = true;
-            hasAggregateProjection = true;
-            if (function->name == "headcount") {
-                plan.aggregatePlan.kind = AggregateKind::Count;
-            } else if (function->name == "stack") {
-                plan.aggregatePlan.kind = AggregateKind::Sum;
-            } else if (function->name == "mid") {
-                plan.aggregatePlan.kind = AggregateKind::Average;
-            } else if (function->name == "goat") {
-                plan.aggregatePlan.kind = AggregateKind::Max;
-            } else if (function->name == "L") {
-                plan.aggregatePlan.kind = AggregateKind::Min;
-            } else if (isLoneWolfName(function->name)) {
-                plan.aggregatePlan.kind = AggregateKind::LoneWolf;
-            } else {
-                return std::nullopt;
-            }
-
-            const bool countWildcard =
-                function->name == "headcount" &&
-                (function->args.empty() ||
-                 dynamic_cast<const Wildcard*>(
-                     function->args.front().get()));
-            if (!countWildcard) {
-                if (function->args.size() != 1) return std::nullopt;
-                const auto* argument =
-                    dynamic_cast<const ColumnRef*>(
-                        function->args.front().get());
-                if (!argument) return std::nullopt;
-                const auto index = resolveColumnIndex(*argument);
-                plan.aggregatePlan.argumentColumn = index;
-                require(index);
-            }
-            projections.push_back(std::move(plan));
-            continue;
-        }
-
-        const auto* column =
-            dynamic_cast<const ColumnRef*>(expression.get());
-        if (!column) return std::nullopt;
-        const auto index = resolveColumnIndex(*column);
-        if (std::find(groupColumns.begin(),
-                      groupColumns.end(),
-                      index) == groupColumns.end()) {
-            return std::nullopt;
-        }
-        ProjectionPlan plan;
-        plan.representativeColumn = index;
-        require(index);
-        projections.push_back(std::move(plan));
-    }
-    if (!hasAggregateProjection) return std::nullopt;
-
-    const std::vector<std::size_t> requiredColumns(
-        requiredSet.begin(), requiredSet.end());
-    const std::size_t missing =
-        std::numeric_limits<std::size_t>::max();
-    std::vector<std::size_t> fieldPositions(
-        metadata->columns.size(), missing);
-    for (std::size_t index = 0;
-         index < requiredColumns.size();
-         ++index) {
-        fieldPositions[requiredColumns[index]] = index;
-    }
-
-    struct AggregateState {
-        std::int64_t count = 0;
-        double sum = 0.0;
-        bool allIntegers = true;
-        std::optional<Value> extremum;
-        std::vector<double> samples;
-    };
-    struct GroupState {
-        Tuple representatives;
-        std::vector<AggregateState> aggregates;
-    };
-
-    const bool scalarAggregate = groupColumns.empty();
-    GroupState scalarGroup;
-    std::unordered_map<Tuple, GroupState,
-                       TupleKeyHash, TupleKeyEqual> groups;
-    auto initializeGroup = [&](GroupState& group) {
-        if (!group.representatives.empty() ||
-            !group.aggregates.empty()) {
-            return;
-        }
-        group.representatives.resize(
-            projections.size(), Value::null());
-        group.aggregates.resize(projections.size());
-    };
-    if (scalarAggregate) initializeGroup(scalarGroup);
-
-    auto makeOutput = [&](GroupState& group) {
-        initializeGroup(group);
-        Tuple output;
-        output.reserve(projections.size());
-        for (std::size_t index = 0;
-             index < projections.size();
-             ++index) {
-            const auto& projection = projections[index];
-            if (!projection.aggregate) {
-                output.push_back(group.representatives[index]);
-                continue;
-            }
-            const auto& aggregate = projection.aggregatePlan;
-            const auto& state = group.aggregates[index];
-            if (aggregate.kind == AggregateKind::Count) {
-                output.push_back(Value(state.count));
-            } else if (aggregate.kind == AggregateKind::LoneWolf) {
-                output.push_back(Value(countLoneWolves(state.samples)));
-            } else if (state.count == 0) {
-                output.push_back(Value::null());
-            } else if (aggregate.kind == AggregateKind::Average) {
-                output.push_back(Value(
-                    state.sum / static_cast<double>(state.count)));
-            } else if (aggregate.kind == AggregateKind::Sum) {
-                output.push_back(state.allIntegers
-                    ? Value(static_cast<std::int64_t>(state.sum))
-                    : Value(state.sum));
-            } else {
-                output.push_back(
-                    state.extremum.value_or(Value::null()));
-            }
-        }
-        return output;
-    };
-
-    auto minMaxProvesEmpty =
-        [&](const PredicatePlan& plan) {
-            ++stats_.minMaxFiltersChecked;
-            const auto& range = ensureColumnRange(
-                statement.fromTable,
-                metadata->columns[plan.column].name);
-            if (plan.literal.isNull() || !range.present) return true;
-            const auto op =
-                normalizeColumnPredicateOp(plan.op, plan.columnOnLeft);
-            const int literalVsMin = plan.literal.compare(range.min);
-            const int literalVsMax = plan.literal.compare(range.max);
-            if (op == "=") {
-                return literalVsMin < 0 || literalVsMax > 0;
-            }
-            if (op == "!=") {
-                return range.min.compare(plan.literal) == 0 &&
-                       range.max.compare(plan.literal) == 0;
-            }
-            if (op == "<") {
-                return range.min.compare(plan.literal) >= 0;
-            }
-            if (op == "<=") {
-                return range.min.compare(plan.literal) > 0;
-            }
-            if (op == ">") {
-                return range.max.compare(plan.literal) <= 0;
-            }
-            if (op == ">=") {
-                return range.max.compare(plan.literal) < 0;
-            }
-            return false;
-        };
-
-    if (predicate && minMaxProvesEmpty(*predicate)) {
-        ++stats_.minMaxScansSkipped;
-        stats_.minMaxRowsSkipped += tableStatistics_[
-            statement.fromTable].rowCount;
-        NativeQueryResult result;
-        result.columns = outputNames(statement, nullptr);
-        if (scalarAggregate) {
-            result.rows.push_back(makeOutput(scalarGroup));
-        }
-        ++stats_.directAggregateQueries;
-        return result;
-    }
-
-    auto fieldAt = [&](const std::vector<RawField>& fields,
-                       std::size_t column) -> const RawField& {
-        const auto position = fieldPositions[column];
-        if (position == missing || position >= fields.size()) {
-            throw std::runtime_error(
-                "Direct aggregate column was not decoded");
-        }
-        return fields[position];
-    };
-
-    auto predicateMatches = [&](const std::vector<RawField>& fields) {
-        if (!predicate) return true;
-        const auto& field = fieldAt(fields, predicate->column);
-        if (field.isNull || predicate->literal.isNull()) {
-            return false;
-        }
-        int order = compareRawToValue(field, predicate->literal);
-        if (!predicate->columnOnLeft) order = -order;
-        return comparisonMatches(predicate->op, order);
-    };
-
-    if (scalarAggregate && projections.size() == 1 &&
-        projections.front().aggregate &&
-        projections.front().aggregatePlan.kind ==
-            AggregateKind::Count) {
-        const auto argumentColumn =
-            projections.front().aggregatePlan.argumentColumn;
-        std::int64_t count = 0;
-        auto file = heap(statement.fromTable);
-        ++stats_.tableScans;
-        file.scanRawRowsFast(
-            [&](RowId, const std::uint8_t* data, std::size_t length) {
-            ++stats_.rowsRead;
-            ++stats_.rawRowsScanned;
-            ++stats_.rowCopiesAvoided;
-            stats_.decodedColumns += requiredColumns.size();
-            stats_.skippedColumns +=
-                metadata->columns.size() - requiredColumns.size();
-
-            RawField predicateField;
-            if (predicate) {
-                predicateField =
-                    decodeRawColumn(data, length, predicate->column);
-                if (predicateField.isNull ||
-                    predicate->literal.isNull()) {
-                    return;
-                }
-                int order =
-                    compareRawToValue(predicateField,
-                                      predicate->literal);
-                if (!predicate->columnOnLeft) order = -order;
-                if (!comparisonMatches(predicate->op, order)) return;
-            }
-
-            if (!argumentColumn) {
-                ++count;
-                return;
-            }
-            RawField argumentField =
-                (predicate && *argumentColumn == predicate->column)
-                    ? predicateField
-                    : decodeRawColumn(data, length, *argumentColumn);
-            if (!argumentField.isNull) ++count;
-        });
-
-        NativeQueryResult result;
-        result.columns = outputNames(statement, nullptr);
-        result.rows.push_back(Tuple{Value(count)});
-        ++stats_.directAggregateQueries;
-        return result;
-    }
-
-    auto file = heap(statement.fromTable);
-    ++stats_.tableScans;
-    std::vector<RawField> fields;
-    fields.reserve(requiredColumns.size());
-    file.scanRawRowsFast(
-        [&](RowId, const std::uint8_t* data, std::size_t length) {
-        decodeRawProjectedInto(data, length, requiredColumns, fields);
-        ++stats_.rowsRead;
-        ++stats_.rawRowsScanned;
-        ++stats_.rowCopiesAvoided;
-        stats_.decodedColumns += requiredColumns.size();
-        stats_.skippedColumns +=
-            metadata->columns.size() - requiredColumns.size();
-        if (!predicateMatches(fields)) return;
-
-        GroupState* targetGroup = &scalarGroup;
-        if (!scalarAggregate) {
-            Tuple key;
-            key.reserve(groupColumns.size());
-            for (const auto column : groupColumns) {
-                key.push_back(fieldAt(fields, column).toValue());
-            }
-            targetGroup = &groups[key];
-        }
-        auto& group = *targetGroup;
-        initializeGroup(group);
-        for (std::size_t index = 0;
-             index < projections.size();
-             ++index) {
-            const auto& projection = projections[index];
-            if (!projection.aggregate) {
-                if (group.representatives[index].isNull()) {
-                    group.representatives[index] =
-                        fieldAt(fields,
-                                *projection.representativeColumn)
-                            .toValue();
-                }
-                continue;
-            }
-
-            auto& state = group.aggregates[index];
-            const auto& aggregate = projection.aggregatePlan;
-            if (!aggregate.argumentColumn) {
-                ++state.count;
-                continue;
-            }
-            const auto& field =
-                fieldAt(fields, *aggregate.argumentColumn);
-            if (field.isNull) continue;
-            if (aggregate.kind == AggregateKind::Count) {
-                ++state.count;
-                continue;
-            }
-            if (aggregate.kind == AggregateKind::Sum ||
-                aggregate.kind == AggregateKind::Average ||
-                aggregate.kind == AggregateKind::LoneWolf) {
-                if (!field.numeric()) {
-                    throw std::runtime_error(
-                        "Numeric aggregate on non-number");
-                }
-                ++state.count;
-                const double numeric = field.asReal();
-                state.sum += numeric;
-                state.allIntegers =
-                    state.allIntegers &&
-                    field.type == ValueType::Integer;
-                if (aggregate.kind == AggregateKind::LoneWolf) {
-                    state.samples.push_back(numeric);
-                }
-                continue;
-            }
-
-            Value value = field.toValue();
-            ++state.count;
-            if (!state.extremum) {
-                state.extremum = std::move(value);
-                continue;
-            }
-            const int comparison =
-                value.compare(*state.extremum);
-            if ((aggregate.kind == AggregateKind::Max &&
-                 comparison > 0) ||
-                (aggregate.kind == AggregateKind::Min &&
-                 comparison < 0)) {
-                state.extremum = std::move(value);
-            }
-        }
-    });
-
-    NativeQueryResult result;
-    result.columns = outputNames(statement, nullptr);
-    if (scalarAggregate) {
-        result.rows.push_back(makeOutput(scalarGroup));
-    } else {
-        for (auto& item : groups) {
-            result.rows.push_back(makeOutput(item.second));
-        }
-    }
-    ++stats_.directAggregateQueries;
-    return result;
-}
-
-bool NativeEngine::canVectorize(const SelectStmt& statement) const {
-    if (!statement.joins.empty() || statement.distinct ||
-        !statement.orderBy.empty() || statement.limit || statement.offset ||
-        statement.having) {
-        return false;
-    }
-
-    std::function<bool(const ASTNode*, bool)> supported =
-        [&](const ASTNode* expression, bool allowAggregate) {
-            if (!expression) return true;
-            if (dynamic_cast<const Literal*>(expression) ||
-                dynamic_cast<const ColumnRef*>(expression) ||
-                dynamic_cast<const Wildcard*>(expression)) {
-                return true;
-            }
-            if (auto* binary =
-                    dynamic_cast<const BinaryOp*>(expression)) {
-                return supported(binary->left.get(), false) &&
-                       supported(binary->right.get(), false);
-            }
-            if (auto* unary =
-                    dynamic_cast<const UnaryOp*>(expression)) {
-                return supported(unary->operand.get(), false);
-            }
-            if (auto* function =
-                    dynamic_cast<const FunctionCall*>(expression)) {
-                if (!allowAggregate ||
-                    (function->name != "headcount" &&
-                     function->name != "stack" &&
-                     function->name != "mid" &&
-                     function->name != "goat" &&
-                     function->name != "L")) {
-                    return false;
-                }
-                if (function->args.empty()) {
-                    return function->name == "headcount";
-                }
-                if (dynamic_cast<const Wildcard*>(
-                        function->args.front().get())) {
-                    return function->name == "headcount";
-                }
-                return supported(function->args.front().get(), false);
-            }
-            return false;
-        };
-
-    if (!supported(statement.where.get(), false)) return false;
-    for (const auto& expression : statement.groupBy) {
-        if (!supported(expression.get(), false)) return false;
-    }
-    for (const auto& expression : statement.columns) {
-        if (!supported(expression.get(), true)) return false;
-        if (hasAggregate(expression.get()) &&
-            !dynamic_cast<const FunctionCall*>(expression.get())) {
-            return false;
-        }
-    }
-    return true;
-}
-
-std::size_t NativeEngine::resolveVectorColumn(
-    const ColumnRef& column,
-    const VectorBatch& batch) const {
-    std::optional<std::size_t> result;
-    for (std::size_t index = 0; index < batch.columns.size(); ++index) {
-        const auto& candidate = batch.columns[index];
-        const bool qualifierMatches =
-            column.table.empty() ||
-            column.table == candidate.table ||
-            (!candidate.alias.empty() &&
-             column.table == candidate.alias);
-        if (candidate.name != column.column || !qualifierMatches) continue;
-        if (result && column.table.empty()) {
-            throw std::runtime_error(
-                "Ambiguous column: " + column.column);
-        }
-        result = index;
-    }
-    if (!result) {
-        throw std::runtime_error("Unknown column: " +
-            (column.table.empty() ? "" : column.table + ".") +
-            column.column);
-    }
-    return *result;
-}
-
-NativeEngine::VectorPtr NativeEngine::evalVector(
-    const ASTNode* expression,
-    const VectorBatch& batch) const {
-    if (!expression) {
-        auto result = std::make_shared<TypedVector>();
-        result->reserve(batch.rowCount);
-        for (std::size_t row = 0; row < batch.rowCount; ++row) {
-            result->append(Value::null());
-        }
-        return result;
-    }
-    if (auto* column = dynamic_cast<const ColumnRef*>(expression)) {
-        return batch.values[resolveVectorColumn(*column, batch)];
-    }
-    if (auto* literal = dynamic_cast<const Literal*>(expression)) {
-        Value value;
-        switch (literal->kind) {
-            case LiteralKind::INT:
-                value = Value(static_cast<std::int64_t>(literal->ival));
-                break;
-            case LiteralKind::FLOAT:
-                value = Value(literal->fval);
-                break;
-            case LiteralKind::STRING:
-                value = Value(literal->sval);
-                break;
-            case LiteralKind::NUL:
-                value = Value::null();
-                break;
-            case LiteralKind::BOOL:
-                value = Value(literal->bval);
-                break;
-        }
-        auto result = std::make_shared<TypedVector>(value.type());
-        result->reserve(batch.rowCount);
-        for (std::size_t row = 0; row < batch.rowCount; ++row) {
-            result->append(value);
-        }
-        return result;
-    }
-    if (auto* binary = dynamic_cast<const BinaryOp*>(expression)) {
-        const auto* leftColumn =
-            dynamic_cast<const ColumnRef*>(binary->left.get());
-        const auto* rightColumn =
-            dynamic_cast<const ColumnRef*>(binary->right.get());
-        const auto* leftLiteral =
-            dynamic_cast<const Literal*>(binary->left.get());
-        const auto* rightLiteral =
-            dynamic_cast<const Literal*>(binary->right.get());
-        const bool comparison =
-            binary->op == "=" || binary->op == "!=" ||
-            binary->op == "<" || binary->op == ">" ||
-            binary->op == "<=" || binary->op == ">=";
-        if (comparison &&
-            ((leftColumn && rightLiteral) ||
-             (rightColumn && leftLiteral))) {
-            const bool columnOnLeft = leftColumn != nullptr;
-            const auto* column =
-                columnOnLeft ? leftColumn : rightColumn;
-            const auto* literal =
-                columnOnLeft ? rightLiteral : leftLiteral;
-            auto values = batch.values[
-                resolveVectorColumn(*column, batch)];
-            Value scalar;
-            switch (literal->kind) {
-                case LiteralKind::INT:
-                    scalar = Value(
-                        static_cast<std::int64_t>(literal->ival));
-                    break;
-                case LiteralKind::FLOAT:
-                    scalar = Value(literal->fval);
-                    break;
-                case LiteralKind::STRING:
-                    scalar = Value(literal->sval);
-                    break;
-                case LiteralKind::NUL:
-                    scalar = Value::null();
-                    break;
-                case LiteralKind::BOOL:
-                    scalar = Value(literal->bval);
-                    break;
-            }
-            auto result = std::make_shared<TypedVector>(
-                ValueType::Boolean);
-            result->reserve(batch.rowCount);
-            const bool numeric =
-                values->type != ValueType::Text &&
-                values->type != ValueType::Blob &&
-                values->type != ValueType::Null &&
-                scalar.isNumeric();
-            for (std::size_t row = 0;
-                 row < batch.rowCount;
-                 ++row) {
-                if (values->isNull(row) || scalar.isNull()) {
-                    result->append(Value::null());
-                    continue;
-                }
-                int order = 0;
-                if (numeric) {
-                    double current = 0.0;
-                    if (values->type == ValueType::Integer) {
-                        current = static_cast<double>(
-                            std::get<std::vector<std::int64_t>>(
-                                values->storage)[row]);
-                    } else if (values->type == ValueType::Real) {
-                        current = std::get<std::vector<double>>(
-                            values->storage)[row];
-                    } else {
-                        current =
-                            std::get<std::vector<std::uint8_t>>(
-                                values->storage)[row] != 0
-                            ? 1.0 : 0.0;
-                    }
-                    const double constant = scalar.asReal();
-                    order = current < constant ? -1 :
-                            (current > constant ? 1 : 0);
-                } else {
-                    order = values->value(row).compare(scalar);
-                }
-                if (!columnOnLeft) order = -order;
-                bool matches = false;
-                if (binary->op == "=") matches = order == 0;
-                else if (binary->op == "!=") matches = order != 0;
-                else if (binary->op == "<") matches = order < 0;
-                else if (binary->op == ">") matches = order > 0;
-                else if (binary->op == "<=") matches = order <= 0;
-                else matches = order >= 0;
-                result->append(Value(matches));
-            }
-            return result;
-        }
-        auto left = evalVector(binary->left.get(), batch);
-        auto right = evalVector(binary->right.get(), batch);
-        auto result = std::make_shared<TypedVector>();
-        result->reserve(batch.rowCount);
-        for (std::size_t row = 0; row < batch.rowCount; ++row) {
-            result->append(applyBinary(
-                binary->op, left->value(row), right->value(row)));
-        }
-        return result;
-    }
-    if (auto* unary = dynamic_cast<const UnaryOp*>(expression)) {
-        auto values = evalVector(unary->operand.get(), batch);
-        auto result = std::make_shared<TypedVector>();
-        result->reserve(batch.rowCount);
-        for (std::size_t row = 0; row < batch.rowCount; ++row) {
-            result->append(
-                applyUnary(unary->op, values->value(row)));
-        }
-        return result;
-    }
-    throw std::runtime_error("Unsupported vector expression");
-}
-
-ValueType NativeEngine::declaredValueType(const ColumnMeta& column) {
-    const auto type = upper(column.type);
-    if (type == "INTEGER" || type == "INT") {
-        return ValueType::Integer;
-    }
-    if (type == "REAL" || type == "FLOAT" || type == "DOUBLE") {
-        return ValueType::Real;
-    }
-    if (type == "TEXT" || type == "VARCHAR" || type == "STRING") {
-        return ValueType::Text;
-    }
-    if (type == "BLOB") return ValueType::Blob;
-    throw std::runtime_error("Unsupported column type: " + column.type);
-}
-
-std::optional<NativeQueryResult> NativeEngine::executeVectorizedSelect(
-    const SelectStmt& statement) {
-    if (!canVectorize(statement)) return std::nullopt;
-    const auto* metadata = catalog_.getTable(statement.fromTable);
-    if (!metadata) {
-        throw std::runtime_error(
-            "Unknown table: " + statement.fromTable);
-    }
-
-    struct AggregateState {
-        std::string name;
-        std::int64_t count = 0;
-        double sum = 0.0;
-        bool allIntegers = true;
-        std::optional<Value> extremum;
-        std::unordered_set<Value, ValueHash> distinct;
-    };
-    struct GroupState {
-        Tuple representatives;
-        std::vector<AggregateState> aggregates;
-    };
-
-    const bool grouped = !statement.groupBy.empty() ||
-                         selectHasAggregate(statement);
-    std::unordered_map<Tuple, GroupState,
-                       TupleKeyHash, TupleKeyEqual> groups;
-    NativeQueryResult result;
-    result.columns = outputNames(statement, nullptr);
-    if (grouped && statement.groupBy.empty()) {
-        groups.emplace(Tuple{}, GroupState{});
-    }
-
-    auto initializeGroup = [&](GroupState& group) {
-        if (!group.representatives.empty() ||
-            !group.aggregates.empty()) {
-            return;
-        }
-        group.representatives.resize(
-            statement.columns.size(), Value::null());
-        group.aggregates.resize(statement.columns.size());
-        for (std::size_t index = 0;
-             index < statement.columns.size();
-             ++index) {
-            if (auto* function = dynamic_cast<const FunctionCall*>(
-                    statement.columns[index].get())) {
-                group.aggregates[index].name = function->name;
-            }
-        }
-    };
-
-    std::set<std::size_t> requiredSet;
-    auto requireColumn = [&](const ColumnRef& column) {
-        if (!column.table.empty() &&
-            column.table != statement.fromTable &&
-            column.table != statement.fromAlias) {
-            throw std::runtime_error(
-                "Unknown table qualifier: " + column.table);
-        }
-        auto found = std::find_if(
-            metadata->columns.begin(), metadata->columns.end(),
-            [&](const ColumnMeta& candidate) {
-                return candidate.name == column.column;
-            });
-        if (found == metadata->columns.end()) {
-            throw std::runtime_error(
-                "Unknown column: " + column.column);
-        }
-        requiredSet.insert(static_cast<std::size_t>(
-            std::distance(metadata->columns.begin(), found)));
-    };
-    std::function<void(const ASTNode*)> collectColumns =
-        [&](const ASTNode* expression) {
-            if (!expression || dynamic_cast<const Literal*>(expression)) {
-                return;
-            }
-            if (auto* column =
-                    dynamic_cast<const ColumnRef*>(expression)) {
-                requireColumn(*column);
-                return;
-            }
-            if (dynamic_cast<const Wildcard*>(expression)) {
-                for (std::size_t index = 0;
-                     index < metadata->columns.size();
-                     ++index) {
-                    requiredSet.insert(index);
-                }
-                return;
-            }
-            if (auto* binary =
-                    dynamic_cast<const BinaryOp*>(expression)) {
-                collectColumns(binary->left.get());
-                collectColumns(binary->right.get());
-                return;
-            }
-            if (auto* unary =
-                    dynamic_cast<const UnaryOp*>(expression)) {
-                collectColumns(unary->operand.get());
-                return;
-            }
-            if (auto* function =
-                    dynamic_cast<const FunctionCall*>(expression)) {
-                if (function->name == "headcount" &&
-                    (function->args.empty() ||
-                     dynamic_cast<const Wildcard*>(
-                         function->args.front().get()))) {
-                    return;
-                }
-                for (const auto& argument : function->args) {
-                    collectColumns(argument.get());
-                }
-            }
-        };
-    collectColumns(statement.where.get());
-    for (const auto& expression : statement.groupBy) {
-        collectColumns(expression.get());
-    }
-    for (const auto& expression : statement.columns) {
-        collectColumns(expression.get());
-    }
-    const std::vector<std::size_t> requiredColumns(
-        requiredSet.begin(), requiredSet.end());
-
-    auto file = heap(statement.fromTable);
-    ++stats_.tableScans;
-    file.scanProjectedBatches(
-        requiredColumns, 1024,
-        [&](std::vector<StoredRow>&& stored) {
-        VectorBatch batch;
-        batch.rowCount = stored.size();
-        batch.values.reserve(requiredColumns.size());
-        batch.columns.reserve(requiredColumns.size());
-        for (const auto column : requiredColumns) {
-            batch.columns.push_back(
-                {statement.fromTable, statement.fromAlias,
-                 metadata->columns[column].name});
-            auto values = std::make_shared<TypedVector>(
-                declaredValueType(metadata->columns[column]));
-            values->reserve(batch.rowCount);
-            batch.values.push_back(std::move(values));
-        }
-        for (auto& row : stored) {
-            if (row.values.size() != requiredColumns.size()) {
-                throw std::runtime_error(
-                    "Projected tuple width mismatch in " +
-                    statement.fromTable);
-            }
-            for (std::size_t column = 0;
-                 column < row.values.size();
-                 ++column) {
-                if (row.values[column].isNull()) {
-                    ++stats_.vectorNulls;
-                }
-                batch.values[column]->append(row.values[column]);
-            }
-        }
-
-        ++stats_.vectorBatches;
-        stats_.vectorRows += batch.rowCount;
-        stats_.rowsRead += batch.rowCount;
-        stats_.decodedColumns +=
-            batch.rowCount * requiredColumns.size();
-        stats_.skippedColumns +=
-            batch.rowCount *
-            (metadata->columns.size() - requiredColumns.size());
-        auto predicate = statement.where
-            ? evalVector(statement.where.get(), batch)
-            : std::make_shared<TypedVector>(ValueType::Boolean);
-        if (!statement.where) {
-            predicate->reserve(batch.rowCount);
-            for (std::size_t row = 0;
-                 row < batch.rowCount;
-                 ++row) {
-                predicate->append(Value(true));
-            }
-        }
-        std::vector<VectorPtr> groupVectors;
-        for (const auto& expression : statement.groupBy) {
-            groupVectors.push_back(
-                evalVector(expression.get(), batch));
-        }
-        std::vector<VectorPtr> projected(
-            statement.columns.size());
-        for (std::size_t index = 0;
-             index < statement.columns.size();
-             ++index) {
-            const auto* expression = statement.columns[index].get();
-            if (auto* function =
-                    dynamic_cast<const FunctionCall*>(expression)) {
-                if (!function->args.empty() &&
-                    !dynamic_cast<const Wildcard*>(
-                        function->args.front().get())) {
-                    projected[index] = evalVector(
-                        function->args.front().get(), batch);
-                }
-            } else if (!dynamic_cast<const Wildcard*>(expression)) {
-                projected[index] = evalVector(expression, batch);
-            }
-        }
-
-        for (std::size_t row = 0; row < batch.rowCount; ++row) {
-            if (!predicate->value(row).asBoolean()) continue;
-            if (!grouped) {
-                Tuple output;
-                for (std::size_t index = 0;
-                     index < statement.columns.size();
-                     ++index) {
-                    if (auto* wildcard =
-                            dynamic_cast<const Wildcard*>(
-                                statement.columns[index].get())) {
-                        for (std::size_t column = 0;
-                             column < batch.columns.size();
-                             ++column) {
-                            if (wildcard->table.empty() ||
-                                wildcard->table ==
-                                    batch.columns[column].table ||
-                                wildcard->table ==
-                                    batch.columns[column].alias) {
-                                output.push_back(
-                                    batch.values[column]->value(row));
-                            }
-                        }
-                    } else {
-                        output.push_back(
-                            projected[index]->value(row));
-                    }
-                }
-                result.rows.push_back(std::move(output));
-                continue;
-            }
-
-            Tuple key;
-            key.reserve(groupVectors.size());
-            for (const auto& values : groupVectors) {
-                key.push_back(values->value(row));
-            }
-            auto& group = groups[key];
-            initializeGroup(group);
-            for (std::size_t index = 0;
-                 index < statement.columns.size();
-                 ++index) {
-                auto* function =
-                    dynamic_cast<const FunctionCall*>(
-                        statement.columns[index].get());
-                if (!function) {
-                    if (group.representatives[index].isNull()) {
-                        group.representatives[index] =
-                            projected[index]->value(row);
-                    }
-                    continue;
-                }
-                auto& state = group.aggregates[index];
-                if (function->name == "headcount" &&
-                    (function->args.empty() ||
-                     dynamic_cast<const Wildcard*>(
-                         function->args.front().get()))) {
-                    ++state.count;
-                    continue;
-                }
-                const auto& vector = projected[index];
-                if (vector->isNull(row)) continue;
-                if (!function->distinct &&
-                    function->name == "headcount") {
-                    ++state.count;
-                    continue;
-                }
-                if (!function->distinct &&
-                    (function->name == "stack" ||
-                     function->name == "mid") &&
-                    (vector->type == ValueType::Integer ||
-                     vector->type == ValueType::Real ||
-                     vector->type == ValueType::Boolean)) {
-                    ++state.count;
-                    if (vector->type == ValueType::Integer) {
-                        state.sum += static_cast<double>(
-                            std::get<std::vector<std::int64_t>>(
-                                vector->storage)[row]);
-                    } else if (vector->type == ValueType::Real) {
-                        state.sum +=
-                            std::get<std::vector<double>>(
-                                vector->storage)[row];
-                    } else {
-                        state.sum +=
-                            std::get<std::vector<std::uint8_t>>(
-                                vector->storage)[row] != 0
-                            ? 1.0 : 0.0;
-                    }
-                    state.allIntegers =
-                        state.allIntegers &&
-                        vector->type == ValueType::Integer;
-                    continue;
-                }
-                Value value = vector->value(row);
-                if (function->distinct &&
-                    !state.distinct.insert(value).second) {
-                    continue;
-                }
-                ++state.count;
-                if (function->name == "headcount") continue;
-                if (function->name == "stack" ||
-                    function->name == "mid") {
-                    if (!value.isNumeric()) {
-                        throw std::runtime_error(
-                            "Numeric aggregate on non-number");
-                    }
-                    state.sum += value.asReal();
-                    state.allIntegers =
-                        state.allIntegers &&
-                        value.type() == ValueType::Integer;
-                } else if (!state.extremum) {
-                    state.extremum = value;
-                } else {
-                    const int comparison =
-                        value.compare(*state.extremum);
-                    if ((function->name == "goat" &&
-                         comparison > 0) ||
-                        (function->name == "L" &&
-                         comparison < 0)) {
-                        state.extremum = value;
-                    }
-                }
-            }
-        }
-    });
-
-    if (grouped) {
-        for (auto& item : groups) {
-            initializeGroup(item.second);
-            Tuple output;
-            output.reserve(statement.columns.size());
-            for (std::size_t index = 0;
-                 index < statement.columns.size();
-                 ++index) {
-                auto* function =
-                    dynamic_cast<const FunctionCall*>(
-                        statement.columns[index].get());
-                if (!function) {
-                    output.push_back(
-                        item.second.representatives[index]);
-                    continue;
-                }
-                const auto& state =
-                    item.second.aggregates[index];
-                if (function->name == "headcount") {
-                    output.push_back(Value(state.count));
-                } else if (state.count == 0) {
-                    output.push_back(Value::null());
-                } else if (function->name == "mid") {
-                    output.push_back(Value(
-                        state.sum /
-                        static_cast<double>(state.count)));
-                } else if (function->name == "stack") {
-                    output.push_back(state.allIntegers
-                        ? Value(static_cast<std::int64_t>(state.sum))
-                        : Value(state.sum));
-                } else {
-                    output.push_back(
-                        state.extremum.value_or(Value::null()));
-                }
-            }
-            result.rows.push_back(std::move(output));
-        }
-    }
-    ++stats_.vectorizedQueries;
-    return result;
-}
-
 std::filesystem::path NativeEngine::tablePath(
     const std::string& table) const {
     for (unsigned char ch : table) {
@@ -4537,6 +1745,8 @@ NativeEngine::ensureColumnRange(const std::string& table,
     TableStatistics::ColumnRange range;
     std::size_t rows = 0;
     std::vector<double> numericSamples;
+    bool valueCountsExact = true;
+    constexpr std::size_t maxExactValueCounts = 4096;
     auto file = heap(table);
     file.scanRawRowsFast(
         [&](RowId, const std::uint8_t* data, std::size_t length) {
@@ -4544,13 +1754,20 @@ NativeEngine::ensureColumnRange(const std::string& table,
         RawField field = decodeRawColumn(data, length, column);
         if (field.isNull) return;
         Value value = field.toValue();
+        if (valueCountsExact) {
+            ++range.valueCounts[value];
+            if (range.valueCounts.size() > maxExactValueCounts) {
+                range.valueCounts.clear();
+                valueCountsExact = false;
+            }
+        }
         if (!range.present) {
             range.present = true;
             range.min = value;
-            range.max = std::move(value);
+            range.max = value;
         } else {
             if (value.compare(range.min) < 0) range.min = value;
-            if (value.compare(range.max) > 0) range.max = std::move(value);
+            if (value.compare(range.max) > 0) range.max = value;
         }
         ++range.nonNullCount;
         if (field.numeric()) {
@@ -4564,6 +1781,7 @@ NativeEngine::ensureColumnRange(const std::string& table,
             numericSamples.push_back(numeric);
         }
     });
+    range.valueCountsExact = valueCountsExact;
 
     if (range.numeric && !numericSamples.empty()) {
         double minimum = numericSamples.front();

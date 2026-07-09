@@ -103,6 +103,38 @@ static TagMemoryStmt* asTagMemory(const std::unique_ptr<ASTNode>& node) {
     return s;
 }
 
+static ShowTabsStmt* asShowTabs(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<ShowTabsStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static ShowContextSchemasStmt* asShowContextSchemas(
+    const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<ShowContextSchemasStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static ShowContextObjectsStmt* asShowContextObjects(
+    const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<ShowContextObjectsStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static AliasTabStmt* asAliasTab(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<AliasTabStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
+static MergeTabsStmt* asMergeTabs(const std::unique_ptr<ASTNode>& node) {
+    auto* s = dynamic_cast<MergeTabsStmt*>(node.get());
+    ASSERT_TRUE(s != nullptr);
+    return s;
+}
+
 // -----------------------------------------------------------------------
 // parseAll() – basic
 // -----------------------------------------------------------------------
@@ -533,6 +565,81 @@ TEST(contextql_manifest_yeet_and_spill_parse) {
     ASSERT_EQ(tag->context, std::string("convo_123"));
     ASSERT_EQ(tag->messageId, (unsigned long long)88);
     ASSERT_EQ(tag->tab, std::string("convo about dog"));
+
+    auto autoTabStmt = parseOne(
+        "yeet-memory convo_123 drip "
+        "(89, 'user', 'My dog likes salmon.') vibe-tab auto;");
+    auto* autoAppend = asAppendMemory(autoTabStmt);
+    ASSERT_TRUE(autoAppend->autoTab);
+    ASSERT_EQ(autoAppend->tab, std::string(""));
+
+    auto showStmt = parseOne("show-tabs convo_123;");
+    auto* show = asShowTabs(showStmt);
+    ASSERT_EQ(show->context, std::string("convo_123"));
+
+    auto schemasStmt = parseOne("show-context-schemas;");
+    ASSERT_TRUE(asShowContextSchemas(schemasStmt) != nullptr);
+
+    auto objectsStmt = parseOne("show-context-objects convo_123;");
+    auto* objects = asShowContextObjects(objectsStmt);
+    ASSERT_EQ(objects->context, std::string("convo_123"));
+
+    auto aliasStmt = parseOne(
+        "alias-tab convo_123 'dog' to 'convo about dog';");
+    auto* alias = asAliasTab(aliasStmt);
+    ASSERT_EQ(alias->context, std::string("convo_123"));
+    ASSERT_EQ(alias->alias, std::string("dog"));
+    ASSERT_EQ(alias->target, std::string("convo about dog"));
+
+    auto mergeStmt = parseOne(
+        "merge-tabs convo_123 'pet stuff' into 'convo about dog';");
+    auto* merge = asMergeTabs(mergeStmt);
+    ASSERT_EQ(merge->context, std::string("convo_123"));
+    ASSERT_EQ(merge->fromTab, std::string("pet stuff"));
+    ASSERT_EQ(merge->toTab, std::string("convo about dog"));
+}
+
+TEST(contextql_plain_aliases_parse) {
+    auto appendStmt = parseOne(
+        "append memory convo_123 drip "
+        "(9, 'user', 'Debug this later: sqlite perf.') tab auto;");
+    auto* append = asAppendMemory(appendStmt);
+    ASSERT_EQ(append->context, std::string("convo_123"));
+    ASSERT_EQ(append->messageId, (unsigned long long)9);
+    ASSERT_TRUE(append->autoTab);
+
+    auto spillStmt = parseOne(
+        "spill context convo_123 tab 'debugging sqlite perf' "
+        "query 'debug perf' token_budget 64 receipts off;");
+    auto* spill = asSpillContext(spillStmt);
+    ASSERT_EQ(spill->context, std::string("convo_123"));
+    ASSERT_EQ(spill->tab, std::string("debugging sqlite perf"));
+    ASSERT_EQ(spill->query, std::string("debug perf"));
+    ASSERT_EQ(spill->tokenBudget, (unsigned long long)64);
+    ASSERT_FALSE(spill->receipts);
+
+    auto showStmt = parseOne("show tabs convo_123;");
+    auto* show = asShowTabs(showStmt);
+    ASSERT_EQ(show->context, std::string("convo_123"));
+
+    auto schemasStmt = parseOne("show context schemas;");
+    ASSERT_TRUE(asShowContextSchemas(schemasStmt) != nullptr);
+
+    auto objectsStmt = parseOne("show context objects convo_123;");
+    auto* objects = asShowContextObjects(objectsStmt);
+    ASSERT_EQ(objects->context, std::string("convo_123"));
+
+    auto aliasStmt = parseOne(
+        "alias tab convo_123 'perf' to 'debugging sqlite perf';");
+    auto* alias = asAliasTab(aliasStmt);
+    ASSERT_EQ(alias->alias, std::string("perf"));
+    ASSERT_EQ(alias->target, std::string("debugging sqlite perf"));
+
+    auto mergeStmt = parseOne(
+        "merge tabs convo_123 'sqlite' into 'debugging sqlite perf';");
+    auto* merge = asMergeTabs(mergeStmt);
+    ASSERT_EQ(merge->fromTab, std::string("sqlite"));
+    ASSERT_EQ(merge->toTab, std::string("debugging sqlite perf"));
 }
 
 TEST(select_lone_wolf_function) {

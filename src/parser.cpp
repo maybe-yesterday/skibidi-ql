@@ -162,6 +162,16 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
             stmt = parseSpillContext(); break;
         case TokenType::VIBE_TAB:
             stmt = parseTagMemory(); break;
+        case TokenType::SHOW_TABS:
+            stmt = parseShowTabs(); break;
+        case TokenType::SHOW_CONTEXT_SCHEMAS:
+            stmt = parseShowContextSchemas(); break;
+        case TokenType::SHOW_CONTEXT_OBJECTS:
+            stmt = parseShowContextObjects(); break;
+        case TokenType::ALIAS_TAB:
+            stmt = parseAliasTab(); break;
+        case TokenType::MERGE_TABS:
+            stmt = parseMergeTabs(); break;
         default:
             if (checkWord("create") &&
                 (wordEquals(peek(1), "dataset") ||
@@ -176,6 +186,26 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
             } else if (checkWord("tag") &&
                        wordEquals(peek(1), "memory")) {
                 stmt = parseTagMemory();
+            } else if (checkWord("show") &&
+                       wordEquals(peek(1), "tabs")) {
+                stmt = parseShowTabs();
+            } else if (checkWord("show") &&
+                       (wordEquals(peek(1), "context-schemas") ||
+                        wordEquals(peek(1), "schemas") ||
+                        (wordEquals(peek(1), "context") &&
+                         wordEquals(peek(2), "schemas")))) {
+                stmt = parseShowContextSchemas();
+            } else if (checkWord("show") &&
+                       (wordEquals(peek(1), "context-objects") ||
+                        (wordEquals(peek(1), "context") &&
+                         wordEquals(peek(2), "objects")))) {
+                stmt = parseShowContextObjects();
+            } else if (checkWord("alias") &&
+                       wordEquals(peek(1), "tab")) {
+                stmt = parseAliasTab();
+            } else if (checkWord("merge") &&
+                       wordEquals(peek(1), "tabs")) {
+                stmt = parseMergeTabs();
             } else if (checkWord("export") && wordEquals(peek(1), "torch")) {
                 stmt = parseExportTorch();
             } else if (checkWord("explain") && wordEquals(peek(1), "batch")) {
@@ -183,7 +213,7 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
             } else if (checkWord("spill") && wordEquals(peek(1), "context")) {
                 stmt = parseSpillContext();
             } else {
-                throw ParseError("Expected statement keyword (slay, yeet-into, glow-up, ratio, manifest, rizz-down, manifest-snapshot, ship-torch, spill-batch, manifest-context, yeet-memory, spill-context, vibe-tab)", tok.line, tok.col);
+                throw ParseError("Expected statement keyword (slay, yeet-into, glow-up, ratio, manifest, rizz-down, manifest-snapshot, ship-torch, spill-batch, manifest-context, yeet-memory, spill-context, show-tabs, show-context-schemas, show-context-objects, alias-tab, merge-tabs, vibe-tab)", tok.line, tok.col);
             }
     }
 
@@ -571,8 +601,13 @@ std::unique_ptr<AppendMemoryStmt> Parser::parseAppendMemory() {
         expect(TokenType::STRING_LIT, "Expected message text").value;
     expect(TokenType::RPAREN, "Expected ')'");
     if (match(TokenType::VIBE_TAB) || matchWord("tab")) {
-        stmt->tab =
-            expect(TokenType::STRING_LIT, "Expected tab string").value;
+        if (matchWord("auto")) {
+            stmt->autoTab = true;
+        } else {
+            stmt->tab =
+                expect(TokenType::STRING_LIT,
+                       "Expected tab string or auto").value;
+        }
     }
     return stmt;
 }
@@ -633,6 +668,103 @@ std::unique_ptr<TagMemoryStmt> Parser::parseTagMemory() {
     expectWord("message", "Expected 'message'");
     stmt->messageId = parseUnsignedOption("message-id");
     stmt->tab = expect(TokenType::STRING_LIT, "Expected tab string").value;
+    return stmt;
+}
+
+std::unique_ptr<ShowTabsStmt> Parser::parseShowTabs() {
+    auto stmt = std::make_unique<ShowTabsStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::SHOW_TABS)) {
+        // native keyword
+    } else {
+        expectWord("show", "Expected 'show'");
+        expectWord("tabs", "Expected 'tabs'");
+    }
+
+    stmt->context = expectName("Expected context name").value;
+    return stmt;
+}
+
+std::unique_ptr<ShowContextSchemasStmt> Parser::parseShowContextSchemas() {
+    auto stmt = std::make_unique<ShowContextSchemasStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::SHOW_CONTEXT_SCHEMAS)) {
+        // native keyword
+    } else {
+        expectWord("show", "Expected 'show'");
+        if (matchWord("context")) {
+            expectWord("schemas", "Expected 'schemas'");
+        } else if (!matchWord("context-schemas")) {
+            expectWord("schemas", "Expected 'schemas'");
+        }
+    }
+
+    return stmt;
+}
+
+std::unique_ptr<ShowContextObjectsStmt> Parser::parseShowContextObjects() {
+    auto stmt = std::make_unique<ShowContextObjectsStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::SHOW_CONTEXT_OBJECTS)) {
+        // native keyword
+    } else {
+        expectWord("show", "Expected 'show'");
+        if (matchWord("context")) {
+            expectWord("objects", "Expected 'objects'");
+        } else {
+            expectWord("context-objects", "Expected 'context-objects'");
+        }
+    }
+
+    stmt->context = expectName("Expected context name").value;
+    return stmt;
+}
+
+std::unique_ptr<AliasTabStmt> Parser::parseAliasTab() {
+    auto stmt = std::make_unique<AliasTabStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::ALIAS_TAB)) {
+        // native keyword
+    } else {
+        expectWord("alias", "Expected 'alias'");
+        expectWord("tab", "Expected 'tab'");
+    }
+
+    stmt->context = expectName("Expected context name").value;
+    stmt->alias = expect(TokenType::STRING_LIT,
+                         "Expected alias tab string").value;
+    expectWord("to", "Expected 'to'");
+    stmt->target = expect(TokenType::STRING_LIT,
+                          "Expected target tab string").value;
+    return stmt;
+}
+
+std::unique_ptr<MergeTabsStmt> Parser::parseMergeTabs() {
+    auto stmt = std::make_unique<MergeTabsStmt>();
+    stmt->line = current().line;
+    stmt->col = current().col;
+
+    if (match(TokenType::MERGE_TABS)) {
+        // native keyword
+    } else {
+        expectWord("merge", "Expected 'merge'");
+        expectWord("tabs", "Expected 'tabs'");
+    }
+
+    stmt->context = expectName("Expected context name").value;
+    stmt->fromTab = expect(TokenType::STRING_LIT,
+                           "Expected source tab string").value;
+    expectWord("into", "Expected 'into'");
+    stmt->toTab = expect(TokenType::STRING_LIT,
+                         "Expected target tab string").value;
     return stmt;
 }
 

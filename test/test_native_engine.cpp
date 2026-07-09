@@ -2,12 +2,19 @@
 
 #include "lexer.h"
 #include "native_engine.h"
+#include "native_wal.h"
 #include "optimizer.h"
 #include "parser.h"
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <thread>
+#include <vector>
 
 struct NativeTestDatabase {
     std::filesystem::path path;
@@ -42,6 +49,39 @@ static std::vector<NativeQueryResult> executeSource(
     return results;
 }
 
+static std::vector<NativeQueryResult> executeRawSource(
+    NativeEngine& engine,
+    const std::string& source) {
+    Parser parser(Lexer(source).tokenize());
+    auto statements = parser.parseAll();
+    std::vector<NativeQueryResult> results;
+    for (auto& statement : statements) {
+        results.push_back(engine.execute(statement.get()));
+    }
+    return results;
+}
+
+static std::vector<std::uint8_t> readBinaryFile(
+    const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return std::vector<std::uint8_t>(
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>());
+}
+
+static void writeBinaryFile(const std::filesystem::path& path,
+                            const std::vector<std::uint8_t>& bytes) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!bytes.empty()) {
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+    }
+    if (!output) {
+        throw std::runtime_error("Failed writing test binary file");
+    }
+}
+
 static std::string fieldValue(const NativeQueryResult& result,
                               const std::string& field) {
     for (const auto& row : result.rows) {
@@ -50,6 +90,14 @@ static std::string fieldValue(const NativeQueryResult& result,
         }
     }
     return "";
+}
+
+static const Tuple* findFirstColumnRow(const NativeQueryResult& result,
+                                       const std::string& value) {
+    for (const auto& row : result.rows) {
+        if (!row.empty() && row[0] == Value(value)) return &row;
+    }
+    return nullptr;
 }
 
 TEST(native_engine_crud_filter_order_and_limit) {
@@ -260,6 +308,90 @@ TEST(native_engine_explicit_transaction_commit_and_rollback) {
     ASSERT_TRUE(result.rows[0][0] == Value((std::int64_t)2));
 }
 
+TEST(native_engine_serializes_multithreaded_autocommit_writes) {
+    NativeTestDatabase database;
+    executeSource(
+        database.engine,
+        "manifest items (id INTEGER main-character, value INTEGER);");
+
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    constexpr int workerCount = 4;
+    constexpr int rowsPerWorker = 25;
+    for (int worker = 0; worker < workerCount; ++worker) {
+        workers.emplace_back([&, worker]() {
+            for (int index = 0; index < rowsPerWorker; ++index) {
+                const int id = worker * rowsPerWorker + index + 1;
+                try {
+                    executeRawSource(
+                        database.engine,
+                        "yeet-into items drip (" +
+                            std::to_string(id) + ", " +
+                            std::to_string(id * 10) + ");");
+                } catch (...) {
+                    ++failures;
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+
+    ASSERT_EQ(failures.load(), 0);
+    const auto result = executeSource(
+        database.engine,
+        "slay headcount(*) no-cap items;").front();
+    ASSERT_TRUE(result.rows[0][0] ==
+                Value(static_cast<std::int64_t>(
+                    workerCount * rowsPerWorker)));
+    ASSERT_FALSE(std::filesystem::exists(database.path / "skibidi.wal"));
+}
+
+TEST(native_engine_undoes_uncommitted_wal_on_reopen) {
+    const auto path = std::filesystem::temp_directory_path() /
+        ("skibidi-wal-recovery-test-" +
+         std::to_string(
+             std::chrono::high_resolution_clock::now()
+                 .time_since_epoch().count()));
+
+    try {
+        {
+            NativeEngine engine(path, 4);
+            executeSource(
+                engine,
+                "manifest users (id INTEGER main-character, name TEXT);"
+                "yeet-into users drip (1, 'Ada');");
+            engine.flush();
+        }
+
+        const auto heapPath = path / "tables" / "users.heap";
+        const auto before = readBinaryFile(heapPath);
+        ASSERT_FALSE(before.empty());
+
+        NativeWal wal(path);
+        const auto txid = wal.begin();
+        wal.logBefore(txid, heapPath, before);
+        writeBinaryFile(heapPath, {});
+        ASSERT_EQ(std::filesystem::file_size(heapPath),
+                  static_cast<std::uintmax_t>(0));
+
+        {
+            NativeEngine recovered(path, 4);
+            const auto result = executeSource(
+                recovered,
+                "slay headcount(*) no-cap users;").front();
+            ASSERT_TRUE(result.rows[0][0] == Value((std::int64_t)1));
+            ASSERT_FALSE(std::filesystem::exists(path / "skibidi.wal"));
+        }
+    } catch (...) {
+        std::error_code error;
+        std::filesystem::remove_all(path, error);
+        throw;
+    }
+
+    std::error_code error;
+    std::filesystem::remove_all(path, error);
+}
+
 TEST(native_engine_enforces_foreign_keys_on_insert_and_delete) {
     NativeTestDatabase database;
     executeSource(
@@ -318,6 +450,105 @@ TEST(native_engine_directly_scans_filtered_aggregates) {
     ASSERT_EQ(stats.rowCopiesAvoided, (size_t)5);
     ASSERT_EQ(stats.decodedColumns, (size_t)10);
     ASSERT_EQ(stats.skippedColumns, (size_t)5);
+}
+
+TEST(native_engine_raw_point_select_decodes_only_projected_columns) {
+    NativeTestDatabase database;
+    executeSource(
+        database.engine,
+        "manifest users ("
+        "id INTEGER main-character, name TEXT, payload TEXT, score REAL);"
+        "yeet-into users drip "
+        "(1, 'ada', 'large-unused-a', 10.0), "
+        "(2, 'grace', 'large-unused-b', 20.0);");
+
+    database.engine.resetStats();
+    auto result = executeSource(
+        database.engine,
+        "slay id, name no-cap users only-if id = 2;").front();
+
+    ASSERT_EQ(result.rows.size(), (size_t)1);
+    ASSERT_TRUE(result.rows[0][0] == Value((std::int64_t)2));
+    ASSERT_TRUE(result.rows[0][1] == Value(std::string("grace")));
+    const auto stats = database.engine.stats();
+    ASSERT_EQ(stats.rawPointQueries, (size_t)1);
+    ASSERT_EQ(stats.rawPointHits, (size_t)1);
+    ASSERT_EQ(stats.indexLookups, (size_t)1);
+    ASSERT_EQ(stats.rowsRead, (size_t)1);
+    ASSERT_EQ(stats.rowCopiesAvoided, (size_t)1);
+    ASSERT_EQ(stats.decodedColumns, (size_t)2);
+    ASSERT_EQ(stats.skippedColumns, (size_t)2);
+}
+
+TEST(native_engine_value_count_cache_answers_filtered_count) {
+    NativeTestDatabase database;
+    executeSource(
+        database.engine,
+        "manifest users ("
+        "id INTEGER main-character, active INTEGER no-cap-not ghosted);"
+        "yeet-into users drip "
+        "(1, 1), (2, 0), (3, 1), (4, 1);");
+
+    database.engine.resetStats();
+    auto result = executeSource(
+        database.engine,
+        "slay headcount(*) no-cap users only-if active = 1;").front();
+
+    ASSERT_EQ(result.rows.size(), (size_t)1);
+    ASSERT_TRUE(result.rows[0][0] == Value((std::int64_t)3));
+    auto stats = database.engine.stats();
+    ASSERT_EQ(stats.directAggregateQueries, (size_t)1);
+    ASSERT_EQ(stats.valueCountQueries, (size_t)1);
+    ASSERT_EQ(stats.valueCountRowsAnswered, (size_t)3);
+    ASSERT_EQ(stats.rawRowsScanned, (size_t)0);
+    ASSERT_EQ(stats.minMaxStatisticsBuilt, (size_t)1);
+
+    executeSource(database.engine, "yeet-into users drip (5, 1);");
+    database.engine.resetStats();
+    result = executeSource(
+        database.engine,
+        "slay headcount(*) no-cap users only-if active = 1;").front();
+
+    ASSERT_TRUE(result.rows[0][0] == Value((std::int64_t)4));
+    stats = database.engine.stats();
+    ASSERT_EQ(stats.valueCountQueries, (size_t)1);
+    ASSERT_EQ(stats.valueCountRowsAnswered, (size_t)4);
+    ASSERT_EQ(stats.rawRowsScanned, (size_t)0);
+    ASSERT_EQ(stats.minMaxStatisticsBuilt, (size_t)1);
+}
+
+TEST(native_engine_dense_group_aggregate_uses_small_integer_domain) {
+    NativeTestDatabase database;
+    executeSource(
+        database.engine,
+        "manifest events ("
+        "id INTEGER main-character, "
+        "category INTEGER no-cap-not ghosted, "
+        "active INTEGER no-cap-not ghosted, "
+        "score REAL no-cap-not ghosted);"
+        "yeet-into events drip "
+        "(1, 0, 1, 10.0), (2, 0, 0, 20.0), "
+        "(3, 1, 1, 30.0), (4, 1, 1, 40.0), "
+        "(5, 2, 0, 50.0);");
+
+    database.engine.resetStats();
+    auto result = executeSource(
+        database.engine,
+        "slay category, stack(score) no-cap events "
+        "only-if active = 1 vibe-check category;").front();
+
+    ASSERT_EQ(result.rows.size(), (size_t)2);
+    double totalScore = 0.0;
+    for (const auto& row : result.rows) {
+        totalScore += row[1].asReal();
+    }
+    ASSERT_TRUE(totalScore == 80.0);
+    const auto stats = database.engine.stats();
+    ASSERT_EQ(stats.directAggregateQueries, (size_t)1);
+    ASSERT_EQ(stats.denseGroupAggregateQueries, (size_t)1);
+    ASSERT_EQ(stats.denseGroupAggregateRows, (size_t)3);
+    ASSERT_EQ(stats.rawRowsScanned, (size_t)5);
+    ASSERT_EQ(stats.rowCopiesAvoided, (size_t)5);
 }
 
 TEST(native_engine_vectorizes_filtered_projection) {
@@ -682,6 +913,138 @@ TEST(native_engine_contextql_maintains_prompt_view_with_receipts) {
     ASSERT_CONTAINS(fieldValue(spill, "invalidated"), "invalidated_by=message_88");
 }
 
+TEST(native_engine_context_schema_registry_and_dcf_receipts) {
+    NativeTestDatabase database;
+    const auto schemas = executeSource(
+        database.engine,
+        "show-context-schemas;").front();
+
+    const Tuple* messageSchema =
+        findFirstColumnRow(schemas, "ConversationMessage");
+    ASSERT_TRUE(messageSchema != nullptr);
+    ASSERT_EQ((*messageSchema)[1].toString(), std::string("v1"));
+    ASSERT_CONTAINS((*messageSchema)[5].toString(), "structured");
+    ASSERT_CONTAINS((*messageSchema)[6].toString(), "content");
+    ASSERT_CONTAINS((*messageSchema)[8].toString(), "timestamp");
+
+    const Tuple* taskSchema = findFirstColumnRow(schemas, "TaskState");
+    ASSERT_TRUE(taskSchema != nullptr);
+    ASSERT_CONTAINS((*taskSchema)[9].toString(), "ConversationMessage");
+
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'Find docs later.');"
+        "spill-context convo_123 only-if 'docs' "
+        "token-budget 200 receipts on;");
+
+    const auto& dcf = results.back();
+    ASSERT_CONTAINS(fieldValue(dcf, "schema_registry"),
+                    "ConversationMessage.v1");
+    ASSERT_CONTAINS(fieldValue(dcf, "dcf_storage_route"),
+                    "vector=ConversationMessage.content");
+    ASSERT_CONTAINS(fieldValue(dcf, "access_policy"),
+                    "AGENT_INTERNAL");
+    ASSERT_CONTAINS(fieldValue(dcf, "access_policy"),
+                    "redaction=on");
+    ASSERT_CONTAINS(fieldValue(dcf, "indexed_fields"),
+                    "ContextAtom.key");
+}
+
+TEST(native_engine_context_objects_are_schema_and_acl_aware) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'Never share passwords.');"
+        "show-context-objects convo_123;"
+        "spill-context convo_123 only-if 'constraint' "
+        "token-budget 200 receipts on;");
+
+    ASSERT_EQ(results.size(), (size_t)4);
+    const auto& append = results[1];
+    ASSERT_EQ(fieldValue(append, "message_schema"),
+              std::string("ConversationMessage.v1"));
+    ASSERT_CONTAINS(fieldValue(append, "access_labels"),
+                    "CONFIDENTIAL_CUSTOMER_DATA");
+    ASSERT_CONTAINS(fieldValue(append, "storage_route"),
+                    "vector=ConversationMessage.content");
+    ASSERT_CONTAINS(fieldValue(append, "dcf_object"),
+                    "message_1 -> ConversationMessage.v1");
+
+    const auto& objects = results[2];
+    const Tuple* messageRow = findFirstColumnRow(objects, "message_1");
+    ASSERT_TRUE(messageRow != nullptr);
+    ASSERT_EQ((*messageRow)[1].toString(),
+              std::string("ConversationMessage"));
+    ASSERT_EQ((*messageRow)[4].toString(), std::string("active"));
+    ASSERT_CONTAINS((*messageRow)[5].toString(),
+                    "CONFIDENTIAL_CUSTOMER_DATA");
+    ASSERT_EQ((*messageRow)[7].toString(), std::string(""));
+    ASSERT_CONTAINS((*messageRow)[8].toString(),
+                    "[redacted:CONFIDENTIAL_CUSTOMER_DATA]");
+
+    const Tuple* atomRow = findFirstColumnRow(objects, "atom_1");
+    ASSERT_TRUE(atomRow != nullptr);
+    ASSERT_EQ((*atomRow)[1].toString(), std::string("ContextAtom"));
+    ASSERT_EQ((*atomRow)[4].toString(), std::string("active"));
+    ASSERT_CONTAINS((*atomRow)[5].toString(),
+                    "CONFIDENTIAL_CUSTOMER_DATA");
+    ASSERT_CONTAINS((*atomRow)[6].toString(),
+                    "structured=catalog.contexts.atoms");
+    ASSERT_CONTAINS((*atomRow)[8].toString(),
+                    "[redacted:CONFIDENTIAL_CUSTOMER_DATA]");
+
+    const auto& spill = results[3];
+    ASSERT_EQ(fieldValue(spill, "redacted_atoms"), std::string("1"));
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"),
+                    "user_constraint=");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"),
+                    "[redacted:CONFIDENTIAL_CUSTOMER_DATA]");
+    ASSERT_TRUE(fieldValue(spill, "current_context")
+                    .find("passwords") == std::string::npos);
+}
+
+TEST(native_engine_context_spill_uses_revision_aware_cache) {
+    NativeTestDatabase database;
+    executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'My dog likes salmon.') vibe-tab auto;");
+
+    const std::string spillQuery =
+        "spill-context convo_123 vibe-tab 'convo about dog' "
+        "only-if 'pet preferences' token-budget 200 receipts on;";
+    (void)executeSource(database.engine, spillQuery).front();
+
+    database.engine.resetStats();
+    const auto cached = executeSource(database.engine, spillQuery).front();
+    ASSERT_CONTAINS(fieldValue(cached, "current_context"),
+                    "dog_preference=salmon");
+    auto stats = database.engine.stats();
+    ASSERT_EQ(stats.contextSpillQueries, (size_t)1);
+    ASSERT_EQ(stats.contextCacheHits, (size_t)1);
+    ASSERT_EQ(stats.contextCacheMisses, (size_t)0);
+    ASSERT_EQ(stats.contextAtomsScored, (size_t)0);
+
+    executeSource(
+        database.engine,
+        "yeet-memory convo_123 drip "
+        "(2, 'user', 'I like cat cafes.') vibe-tab 'convo about dog';");
+    database.engine.resetStats();
+    const auto refreshed = executeSource(database.engine, spillQuery).front();
+    ASSERT_CONTAINS(fieldValue(refreshed, "current_context"),
+                    "user_preference=cat cafes");
+    stats = database.engine.stats();
+    ASSERT_EQ(stats.contextSpillQueries, (size_t)1);
+    ASSERT_EQ(stats.contextCacheHits, (size_t)0);
+    ASSERT_EQ(stats.contextCacheMisses, (size_t)1);
+    ASSERT_TRUE(stats.contextAtomsScored > 0);
+}
+
 TEST(native_engine_contextql_tabs_filter_and_retag_memory) {
     NativeTestDatabase database;
     auto results = executeSource(
@@ -729,6 +1092,208 @@ TEST(native_engine_contextql_tabs_filter_and_retag_memory) {
                     "dog_preference=salmon");
     ASSERT_CONTAINS(fieldValue(dogAfterMove, "current_context"),
                     "user_location=NYC");
+}
+
+TEST(native_engine_tabs_auto_alias_merge_and_show) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "alias-tab convo_123 'dog' to 'convo about dog';"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'My dog likes salmon.') vibe-tab auto;"
+        "yeet-memory convo_123 drip "
+        "(2, 'user', 'I like cat cafes.') vibe-tab 'pet stuff';"
+        "show-tabs convo_123;"
+        "merge-tabs convo_123 'pet stuff' into 'dog';"
+        "show-tabs convo_123;"
+        "spill-context convo_123 vibe-tab 'dog' "
+        "only-if 'pet preferences' token-budget 200 receipts on;");
+
+    ASSERT_EQ(results.size(), (size_t)8);
+
+    const auto& autoAppend = results[2];
+    ASSERT_EQ(fieldValue(autoAppend, "auto_tab"), std::string("true"));
+    ASSERT_EQ(fieldValue(autoAppend, "suggested_tab"),
+              std::string("convo about dog"));
+    ASSERT_EQ(fieldValue(autoAppend, "tab"),
+              std::string("convo about dog"));
+
+    const auto& beforeMerge = results[4];
+    const Tuple* dogBefore = findFirstColumnRow(beforeMerge,
+                                               "convo about dog");
+    ASSERT_TRUE(dogBefore != nullptr);
+    ASSERT_EQ((*dogBefore)[1].toString(), std::string("1"));
+    ASSERT_CONTAINS((*dogBefore)[6].toString(), "dog");
+    const Tuple* petBefore = findFirstColumnRow(beforeMerge, "pet stuff");
+    ASSERT_TRUE(petBefore != nullptr);
+    ASSERT_EQ((*petBefore)[1].toString(), std::string("1"));
+
+    const auto& merge = results[5];
+    ASSERT_EQ(fieldValue(merge, "from_tab"), std::string("pet stuff"));
+    ASSERT_EQ(fieldValue(merge, "to_tab"),
+              std::string("convo about dog"));
+    ASSERT_EQ(fieldValue(merge, "moved_messages"), std::string("1"));
+    ASSERT_EQ(fieldValue(merge, "moved_atoms"), std::string("1"));
+
+    const auto& afterMerge = results[6];
+    const Tuple* dogAfter = findFirstColumnRow(afterMerge,
+                                              "convo about dog");
+    ASSERT_TRUE(dogAfter != nullptr);
+    ASSERT_EQ((*dogAfter)[1].toString(), std::string("2"));
+    ASSERT_EQ((*dogAfter)[2].toString(), std::string("2"));
+    ASSERT_CONTAINS((*dogAfter)[6].toString(), "dog");
+    ASSERT_CONTAINS((*dogAfter)[6].toString(), "pet stuff");
+    ASSERT_TRUE(findFirstColumnRow(afterMerge, "pet stuff") == nullptr);
+
+    const auto& spill = results[7];
+    ASSERT_EQ(fieldValue(spill, "tab"), std::string("convo about dog"));
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"),
+                    "dog_preference=salmon");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"),
+                    "user_preference=cat cafes");
+}
+
+TEST(native_engine_tab_alias_chain_survives_reopen) {
+    NativeTestDatabase database;
+    executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "alias-tab convo_123 'dog' to 'convo about dog';"
+        "alias-tab convo_123 'puppy' to 'dog';"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'My dog likes salmon.') vibe-tab auto;");
+    database.engine.flush();
+
+    NativeEngine reopened(database.path, 8);
+    const auto show = executeSource(
+        reopened,
+        "show-tabs convo_123;").front();
+    const Tuple* dogTab = findFirstColumnRow(show, "convo about dog");
+    ASSERT_TRUE(dogTab != nullptr);
+    ASSERT_CONTAINS((*dogTab)[6].toString(), "dog");
+    ASSERT_CONTAINS((*dogTab)[6].toString(), "puppy");
+
+    const auto spill = executeSource(
+        reopened,
+        "spill-context convo_123 vibe-tab 'puppy' "
+        "only-if 'dog food' token-budget 200 receipts on;").front();
+    ASSERT_EQ(fieldValue(spill, "tab"), std::string("convo about dog"));
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"),
+                    "dog_preference=salmon");
+}
+
+TEST(native_engine_auto_tab_suggestions_cover_common_agent_buckets) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'My dog likes salmon.') vibe-tab auto;"
+        "yeet-memory convo_123 drip "
+        "(2, 'user', 'Debug this later: sqlite join perf.') "
+        "vibe-tab auto;"
+        "yeet-memory convo_123 drip "
+        "(3, 'user', 'Project roadmap needs more tests.') "
+        "vibe-tab auto;"
+        "yeet-memory convo_123 drip "
+        "(4, 'user', 'Do we need WAL?') vibe-tab auto;"
+        "yeet-memory convo_123 drip "
+        "(5, 'user', 'Never share passwords.') vibe-tab auto;"
+        "yeet-memory convo_123 drip "
+        "(6, 'user', 'I prefer quiet restaurants.') vibe-tab auto;"
+        "yeet-memory convo_123 drip "
+        "(7, 'user', 'I need add docs.') vibe-tab auto;");
+
+    ASSERT_EQ(results.size(), (size_t)8);
+    ASSERT_EQ(fieldValue(results[1], "tab"),
+              std::string("convo about dog"));
+    ASSERT_EQ(fieldValue(results[2], "tab"),
+              std::string("debugging sqlite perf"));
+    ASSERT_EQ(fieldValue(results[3], "tab"),
+              std::string("project roadmap"));
+    ASSERT_EQ(fieldValue(results[4], "tab"),
+              std::string("open questions"));
+    ASSERT_EQ(fieldValue(results[5], "tab"),
+              std::string("constraints"));
+    ASSERT_EQ(fieldValue(results[6], "tab"),
+              std::string("preferences"));
+    ASSERT_EQ(fieldValue(results[7], "tab"),
+              std::string("current tasks"));
+}
+
+TEST(native_engine_prompt_extractor_handles_new_atom_types) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'Decision: keep prompt views inside SkibidiQL.');"
+        "yeet-memory convo_123 drip "
+        "(2, 'user', 'Do we need more tests?');"
+        "yeet-memory convo_123 drip "
+        "(3, 'user', 'Debug this later: sqlite perf join misses.');"
+        "yeet-memory convo_123 drip "
+        "(4, 'user', 'Never share passwords.');"
+        "spill-context convo_123 "
+        "only-if 'decision question debug constraint' "
+        "token-budget 1000 receipts on;");
+
+    ASSERT_EQ(results.size(), (size_t)6);
+    ASSERT_EQ(fieldValue(results[1], "extracted_atoms"), std::string("1"));
+    ASSERT_CONTAINS(fieldValue(results[1], "atom"),
+                    "decision=keep prompt views inside SkibidiQL");
+    ASSERT_CONTAINS(fieldValue(results[2], "atom"),
+                    "open_question=Do we need more tests");
+    ASSERT_CONTAINS(fieldValue(results[3], "atom"),
+                    "debug_followup=sqlite perf join misses");
+    ASSERT_CONTAINS(fieldValue(results[4], "atom"),
+                    "user_constraint=never share passwords");
+
+    const auto& spill = results[5];
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "decision=");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "open_question=");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "debug_followup=");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "user_constraint=");
+}
+
+TEST(native_engine_merge_tabs_recomputes_contradiction_status) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'user', 'I live in Seattle.') vibe-tab 'where';"
+        "yeet-memory convo_123 drip "
+        "(2, 'user', 'Actually I moved to NYC.') vibe-tab 'travel';"
+        "spill-context convo_123 vibe-tab 'where' "
+        "only-if 'where am I?' token-budget 200 receipts on;"
+        "merge-tabs convo_123 'travel' into 'where';"
+        "spill-context convo_123 vibe-tab 'where' "
+        "only-if 'where am I?' token-budget 200 receipts on;");
+
+    ASSERT_EQ(results.size(), (size_t)6);
+
+    const auto& before = results[3];
+    ASSERT_CONTAINS(fieldValue(before, "current_context"),
+                    "user_location=Seattle");
+    ASSERT_TRUE(fieldValue(before, "current_context")
+                    .find("user_location=NYC") == std::string::npos);
+    ASSERT_EQ(fieldValue(before, "invalidated"), std::string(""));
+
+    const auto& merge = results[4];
+    ASSERT_EQ(fieldValue(merge, "moved_messages"), std::string("1"));
+    ASSERT_EQ(fieldValue(merge, "moved_atoms"), std::string("1"));
+
+    const auto& after = results[5];
+    ASSERT_CONTAINS(fieldValue(after, "current_context"),
+                    "user_location=NYC");
+    ASSERT_TRUE(fieldValue(after, "current_context")
+                    .find("user_location=Seattle") == std::string::npos);
+    ASSERT_CONTAINS(fieldValue(after, "invalidated"),
+                    "user_location=Seattle");
+    ASSERT_CONTAINS(fieldValue(after, "invalidated"),
+                    "invalidated_by=message_2");
 }
 
 int main() {

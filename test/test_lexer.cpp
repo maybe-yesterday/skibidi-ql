@@ -175,6 +175,13 @@ TEST(keyword_contextql_terms) {
     ASSERT_TRUE(firstType("manifest-context") == TokenType::MANIFEST_CONTEXT);
     ASSERT_TRUE(firstType("yeet-memory") == TokenType::YEET_MEMORY);
     ASSERT_TRUE(firstType("spill-context") == TokenType::SPILL_CONTEXT);
+    ASSERT_TRUE(firstType("show-tabs") == TokenType::SHOW_TABS);
+    ASSERT_TRUE(firstType("show-context-schemas") ==
+                TokenType::SHOW_CONTEXT_SCHEMAS);
+    ASSERT_TRUE(firstType("show-context-objects") ==
+                TokenType::SHOW_CONTEXT_OBJECTS);
+    ASSERT_TRUE(firstType("alias-tab") == TokenType::ALIAS_TAB);
+    ASSERT_TRUE(firstType("merge-tabs") == TokenType::MERGE_TABS);
     ASSERT_TRUE(firstType("token-budget") == TokenType::TOKEN_BUDGET);
     ASSERT_TRUE(firstType("vibe-tab") == TokenType::VIBE_TAB);
 }

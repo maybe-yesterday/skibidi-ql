@@ -371,6 +371,57 @@ TEST(save_and_load_training_snapshot) {
     }
 }
 
+TEST(save_and_load_context_object_metadata) {
+    CatalogFileGuard guard;
+    {
+        Catalog cat;
+        ConversationContextMeta context;
+        context.name = "convo_123";
+
+        ContextMessageMeta message;
+        message.id = 1;
+        message.speaker = "user";
+        message.text = "Never share passwords.";
+        message.tab = "constraints";
+        message.accessLabels = {
+            "AGENT_INTERNAL", "CONFIDENTIAL_CUSTOMER_DATA"};
+        message.mentionedEntities = {"storage-safety"};
+        context.messages.push_back(message);
+
+        ContextAtomMeta atom;
+        atom.key = "user_constraint";
+        atom.value = "never share passwords";
+        atom.type = "constraint";
+        atom.status = "active";
+        atom.source = "message_1";
+        atom.tab = "constraints";
+        atom.accessLabels = message.accessLabels;
+        context.atoms.push_back(atom);
+
+        cat.addContext(context);
+        cat.save();
+    }
+    {
+        Catalog cat;
+        cat.load();
+        const auto* context = cat.getContext("convo_123");
+        ASSERT_TRUE(context != nullptr);
+        ASSERT_EQ(context->messages.size(), (size_t)1);
+        ASSERT_EQ(context->messages[0].schemaName,
+                  std::string("ConversationMessage"));
+        ASSERT_CONTAINS(context->messages[0].storageRoute,
+                        "ConversationMessage.content");
+        ASSERT_EQ(context->messages[0].accessLabels.size(), (size_t)2);
+        ASSERT_EQ(context->messages[0].mentionedEntities[0],
+                  std::string("storage-safety"));
+        ASSERT_EQ(context->atoms.size(), (size_t)1);
+        ASSERT_EQ(context->atoms[0].schemaName,
+                  std::string("ContextAtom"));
+        ASSERT_CONTAINS(context->atoms[0].accessLabels[1],
+                        "CONFIDENTIAL");
+    }
+}
+
 TEST(save_and_load_contextql_context) {
     CatalogFileGuard guard;
     {
@@ -387,6 +438,8 @@ TEST(save_and_load_contextql_context) {
         context.atoms.push_back(
             {"user_location", "NYC", "fact", "active",
              "message_88", "", "travel"});
+        context.tabAliases.push_back({"nyc", "travel"});
+        context.tabAliases.push_back({"big apple", "travel"});
         cat.addContext(context);
         cat.save();
     }
@@ -402,7 +455,27 @@ TEST(save_and_load_contextql_context) {
         ASSERT_EQ(context->atoms[0].status, std::string("invalidated"));
         ASSERT_EQ(context->atoms[1].value, std::string("NYC"));
         ASSERT_EQ(context->atoms[1].tab, std::string("travel"));
+        ASSERT_EQ(context->tabAliases.size(), (size_t)2);
+        ASSERT_EQ(context->tabAliases[0].alias, std::string("nyc"));
+        ASSERT_EQ(context->tabAliases[0].target, std::string("travel"));
     }
+}
+
+TEST(context_tab_aliases_affect_catalog_fingerprint) {
+    CatalogFileGuard guard;
+    Catalog cat;
+    ConversationContextMeta context;
+    context.name = "convo_123";
+    context.messages.push_back(
+        {1, "user", "My dog likes salmon.", "convo about dog"});
+    cat.addContext(context);
+    const auto beforeAlias = cat.schemaFingerprint();
+
+    context.tabAliases.push_back({"dog", "convo about dog"});
+    cat.addContext(context);
+    const auto afterAlias = cat.schemaFingerprint();
+
+    ASSERT_NE(beforeAlias, afterAlias);
 }
 
 int main() {

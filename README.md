@@ -10,16 +10,20 @@ No SQLite library is required for the default build or runtime.
 ## Performance Highlight
 
 Matched Release-build sample results against prepared, file-backed SQLite on the
-same 10,000 rows and warm caches:
+same 1,000 rows and warm caches:
 
-| Workload | Iterations | Native | SQLite | Result | Peak RSS (native / SQLite) |
-|---|---:|---:|---:|---|---:|
-| Primary-key lookup | 10,000 | 89.6 ms | 310.0 ms | Native 3.5x faster | 7.4 / 5.0 MiB |
-| Filtered count scan | 100 | 205.6 ms | 24.0 ms | SQLite 8.6x faster | 7.4 / 5.0 MiB |
-| Impossible count via min/max | 100 | 0.1 ms | 3.4 ms | Native ~34x faster | 7.4 / 5.0 MiB |
-| Filtered grouped sum | 100 | 352.1 ms | 120.1 ms | SQLite 2.9x faster | 7.4 / 5.2 MiB |
-| Skewed three-table join | 10 | 97.5 ms | 51.0 ms | SQLite 1.9x faster | 7.4 / 5.2 MiB |
-| Miss-heavy three-table join | 10 | <0.1 ms | 4.4 ms | Native metadata skip | 7.0 / 4.8 MiB |
+| Workload | Native | SQLite | Native / SQLite | Native peak RSS | SQLite peak RSS | Native est mem | Native buffer mem | Native raw point | Native value count | Native dense agg | Native ctx cache hits |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| point | 22.0 ms | 26.9 ms | 0.82x | 13.2 MiB | 13.2 MiB | 0.15 MiB | 0.06 MiB | 10000 | 0 | 0 | 0 |
+| scan | 0.3 ms | 2.3 ms | 0.12x | 13.2 MiB | 13.2 MiB | 0.15 MiB | 0.06 MiB | 0 | 100 | 0 | 0 |
+| count_miss | 0.1 ms | 0.2 ms | 0.47x | 13.2 MiB | 13.2 MiB | 0.23 MiB | 0.06 MiB | 0 | 0 | 0 | 0 |
+| aggregate | 7.2 ms | 11.3 ms | 0.63x | 13.2 MiB | 13.2 MiB | 0.16 MiB | 0.06 MiB | 0 | 0 | 100 | 0 |
+| join | 2.9 ms | 2.1 ms | 1.35x | 13.2 MiB | 13.2 MiB | 0.21 MiB | 0.05 MiB | 0 | 0 | 0 | 0 |
+| join_miss | 0.0 ms | 0.4 ms | 0.05x | 13.2 MiB | 13.2 MiB | 0.21 MiB | 0.05 MiB | 0 | 0 | 0 | 0 |
+| context_schema | 2.5 ms | 3.5 ms | 0.71x | 13.2 MiB | 13.2 MiB | 0.01 MiB | 0.00 MiB | 0 | 0 | 0 | 1000 |
+| context_spill | 0.4 ms | 3.4 ms | 0.12x | 13.2 MiB | 13.2 MiB | 0.01 MiB | 0.00 MiB | 0 | 0 | 0 | 100 |
+| context_spill_acl | 0.3 ms | 4.1 ms | 0.07x | 13.2 MiB | 13.2 MiB | 0.01 MiB | 0.00 MiB | 0 | 0 | 0 | 100 |
+| context_objects | 4.9 ms | 7.3 ms | 0.68x | 13.2 MiB | 13.2 MiB | 1.86 MiB | 0.00 MiB | 0 | 0 | 0 | 10 |
 
 See [Benchmarks](#benchmarks) and
 [benchmarks/optimization_notes.md](benchmarks/optimization_notes.md) for
@@ -60,6 +64,11 @@ reproduction details.
 | `manifest-context` | `CREATE CONTEXT` | Create a prompt-context log |
 | `yeet-memory` | `APPEND MEMORY` | Append a message and extract semantic atoms |
 | `spill-context` | `SPILL CONTEXT` | Render the maintained current context view |
+| `show-tabs` | `SHOW TABS` | List prompt-context topic tabs |
+| `show-context-schemas` | `SHOW CONTEXT SCHEMAS` | Inspect the built-in context schema registry |
+| `show-context-objects` | `SHOW CONTEXT OBJECTS` | Inspect schema-aware messages and atoms |
+| `alias-tab` | `ALIAS TAB` | Normalize one tab label to another |
+| `merge-tabs` | `MERGE TABS` | Move messages/atoms from one tab to another |
 | `token-budget` | `TOKEN_BUDGET` | Context-view rendering budget |
 | `vibe-tab` | `TAG MEMORY` | Topic tab / namespace for prompt context |
 | `lowkey` | `AS` | Alias |
@@ -290,7 +299,9 @@ manifest-context convo_123;
 ```
 
 Append messages. The current prototype uses deterministic rule extraction for
-obvious facts/preferences/constraints/tasks, which keeps the demo inspectable:
+facts, preferences, constraints, tasks, open questions, decisions, debug
+follow-ups, and a few demo-friendly dog facts, which keeps the demo
+inspectable:
 
 ```skql
 yeet-memory convo_123 drip
@@ -325,28 +336,62 @@ budget-aware rendering. The prototype persists contexts in the native catalog
 alongside tables and snapshots.
 
 Topic tabs are first-class too. An agent can put memories in an explicit
-`vibe-tab`, query only that tab, or move a message later when the convo
-forks into a new mini-arc:
+`vibe-tab`, ask SkibidiQL to pick one with `vibe-tab auto`, query tab inventory
+with `show-tabs`, normalize labels with `alias-tab`, and merge messy labels
+with `merge-tabs`:
 
 ```skql
+alias-tab convo_123 'dog' to 'convo about dog';
+
 yeet-memory convo_123 drip
     (7, 'user', 'My dog likes salmon.')
-vibe-tab 'convo about dog';
+vibe-tab auto;
+
+yeet-memory convo_123 drip
+    (8, 'user', 'I like cat cafes.')
+vibe-tab 'pet stuff';
+
+show-tabs convo_123;
+
+merge-tabs convo_123 'pet stuff' into 'dog';
 
 spill-context convo_123
-vibe-tab 'convo about dog'
+vibe-tab 'dog'
 only-if 'what does my dog like?'
 token-budget 200
 receipts on;
-
-vibe-tab convo_123 message 88 'travel';
 ```
 
 Under the hood, messages and extracted atoms both store the tab. `spill-context`
-filters atoms by tab before ranking/rendering, and retagging recomputes
-per-tab invalidation so `main` does not stay haunted by facts moved elsewhere.
-Tiny but real agent-memory affordance: the LLM can choose a label like
-`convo about dog`, save it, then ask for only that slice later.
+filters atoms by resolved tab before ranking/rendering. `vibe-tab` retagging
+and `merge-tabs` recompute per-tab invalidation so `main` does not stay
+haunted by facts moved elsewhere. `show-tabs` returns tab names, message
+counts, atom counts, active/invalidated counts, last message IDs, and aliases.
+Tiny but real agent-memory affordance: the LLM can choose or ask for a label
+like `convo about dog`, save it, inspect the tab map, then ask for only that
+slice later.
+
+SkibidiQL now also exposes a tiny Context Schema Registry, because agent memory
+needs receipts about shape, policy, and storage routing:
+
+```skql
+show-context-schemas;
+show-context-objects convo_123;
+```
+
+This returns built-in context object types like `ConversationMessage`,
+`ContextAtom`, `TaskState`, `ToolInvocationLog`, and `UserProfile`, including
+version, owner agent, sensitivity, retention policy, storage backend,
+vectorized fields, access labels, indexed fields, and related schemas.
+Messages and atoms now persist their own schema name/version, access labels,
+storage route, and lightweight mentioned-entity metadata. `show-context-objects`
+lists those objects as rows, while `spill-context` includes Dynamic Context
+Fabric receipts such as the schema registry pair used for retrieval, the
+structured/vector/blob storage route, access-policy labels, indexed fields,
+and the number of redacted atoms. Sensitive rows like password/API-key notes
+get tagged `CONFIDENTIAL_CUSTOMER_DATA` and render as
+`[redacted:CONFIDENTIAL_CUSTOMER_DATA]`. Very official. Context has a bouncer
+now.
 
 Plain aliases also work:
 
@@ -552,9 +597,9 @@ Source Text
     v
 [Metadata Catalog] (metadata.h / metadata.cpp)
     - Tracks schema in .skibidi_catalog.json
-    - Tracks TensorQL snapshots: query text, seed, schema fingerprint,
+    - Tracks SkibidiQL training snapshots: query text, seed, schema fingerprint,
       row IDs, split assignment, feature specs, label spec, and warnings
-    - Tracks ContextQL logs: messages, semantic atoms, active/invalidated
+    - Tracks SkibidiQL prompt logs: messages, semantic atoms, active/invalidated
       status, invalidation provenance, and rendered prompt-view metadata
     - Updated after successful CREATE TABLE / DROP TABLE execution
     - Validates column references (best-effort)
@@ -589,8 +634,11 @@ Source Text
     - Training snapshot materialization with deterministic splits
     - Deterministic distributed batch planning for PyTorch-style loaders
     - Batch provenance explain output for row-level debugging/resume tokens
-    - ContextQL append/extract/invalidate/render loop for prompt views
+    - Prompt append/extract/invalidate/render loop for SkibidiQL prompt views
+    - Raw primary-key point opcode loop that decodes only projected columns
     - Direct raw aggregate scans for simple count/sum/min/max/avg workloads
+    - Exact value-count stats for repeated filtered `COUNT(*)` equality scans
+    - Dense typed small-domain `GROUP BY` loops for integer buckets
     - Rowid-seek join aggregate loop for fact-to-primary-key joins
     - Cached read-only virtual-memory heap views for seek-heavy reads
     - Min/max join-domain pruning for provably empty inner joins
@@ -628,8 +676,10 @@ Source Text
 
 This is NOT yet a production database:
 
-- Transactions are single-process and snapshot-backed; there is no WAL,
-  crash recovery, or concurrent lock manager yet.
+- Durability/concurrency is now a first-cut native layer: undo-style WAL,
+  startup crash recovery, a process-local lock manager, concurrent readers, and
+  one serialized writer. It is not MVCC and does not yet use OS-level
+  cross-process file locks.
 - Primary-key B+ trees are rebuilt lazily and are not separately persisted.
 - Inner equi-joins use cost-based left-deep enumeration. Outer joins and
   non-equality joins retain source order.
@@ -639,6 +689,10 @@ This is NOT yet a production database:
   rowid-seek aggregate path for inner primary-key joins.
 - Bloom filters help miss-heavy hash joins; all-matching joins still pay the
   normal hash-probe and row-materialization costs.
+- Bloom filters are not a cheat code for successful primary-key point hits:
+  positive lookups still need the exact B+ tree seek and row read. The native
+  point fast path is therefore an exact raw rowid/projection loop, while
+  probabilistic filters remain best for misses and joins.
 - `LONE-WOLF` is exact in the native engine. SQL generation emits
   `LONE_WOLF(col)`, so the optional SQLite backend would need a matching UDF to
   execute that aggregate directly.
@@ -653,14 +707,52 @@ This is NOT yet a production database:
   filter. Arbitrary join/materialized-transform snapshots are the next layer.
   The Python `TensorQLDataset` reader returns batched tensors for numeric
   fields and keeps text/blob fields as lists.
-- ContextQL extraction is currently deterministic rule-based NLP for a tiny
-  set of demo patterns (`user_location`, preferences, constraints, tasks).
-  The database semantics are real; broad semantic extraction and learned
-  relevance scoring are future work.
+- Prompt-view extraction is currently deterministic rule-based NLP. It covers
+  demo patterns for `user_location`, preferences, constraints, tasks, open
+  questions, decisions, debug follow-ups, and dog facts. The database semantics
+  are real; broad semantic extraction and learned relevance scoring are future
+  work.
 
 Those boundaries are intentionally isolated behind the storage and execution
-interfaces, making WAL, locking, persisted indexes/statistics, broader
-vectorization, and JIT compilation natural next layers.
+interfaces, making persisted indexes/statistics, broader vectorization,
+cross-process locks, MVCC, and JIT compilation natural next layers.
+
+### Implemented Next-Step Features
+
+These are now SkibidiQL features, not separate side projects:
+
+- `show-tabs convo_123;` lists topic tabs with message counts, atom counts,
+  active/invalidated counts, last message IDs, and aliases.
+- `show-context-schemas;` lists the built-in CSR rows for agent context types:
+  schema version, owner, sensitivity, retention, storage route, vectorized
+  fields, access labels, indexes, and related schemas.
+- `show-context-objects convo_123;` exposes actual DCF rows for messages and
+  atoms: schema/version, resolved tab, status, access labels, storage route,
+  source message, and redacted value.
+- `vibe-tab auto` asks SkibidiQL to propose a tab from the message text before
+  saving it. Current built-in suggestions include labels like
+  `convo about dog`, `project roadmap`, `debugging sqlite perf`,
+  `open questions`, `constraints`, `preferences`, and `current tasks`.
+- `alias-tab convo_123 'dog' to 'convo about dog';` makes casual labels resolve
+  to the canonical tab.
+- `merge-tabs convo_123 'pet stuff' into 'dog';` moves messages and atoms,
+  adds an alias from the old tab, and recomputes per-tab invalidation.
+- Prompt extraction now covers the deterministic baseline plus open questions,
+  decisions, debug follow-ups, simple constraints, and a few dog-demo facts.
+- The native benchmark harness includes a `prompt` workload for tab-filtered
+  prompt-view rendering over an aliased/merged prompt log.
+- The native engine now has WAL + crash recovery + process-local locking, so
+  multithreaded readers can vibe while writes are serialized behind the
+  database gate.
+- `spill-context` now emits DCF receipts showing schema registry usage,
+  structured/vector/blob routing, access-policy labels, indexed fields,
+  mentioned entities, and redacted-atom counts.
+
+Still-future layers are intentionally heavier: arbitrary join snapshots,
+memory-mapped training chunks, pinned PyTorch batches, persisted page-level zone
+maps, cross-process lock files, MVCC snapshots, broader learned relevance
+scoring, and JIT/SIMD hot paths. Those need bigger design passes and benchmark
+receipts.
 
 ## Benchmarks
 
@@ -671,13 +763,29 @@ cmake --build build --config Release --target skibidi_native_benchmark
 ./build/skibidi_native_benchmark --workload point
 ./build/skibidi_native_benchmark --workload scan --iterations 100
 ./build/skibidi_native_benchmark --workload aggregate --iterations 100
+./build/skibidi_native_benchmark --workload prompt --rows 1000 --iterations 100
+./build/skibidi_native_benchmark --workload context_spill_acl --rows 1000 --iterations 100
+./build/skibidi_native_benchmark --workload context_objects --rows 1000 --iterations 10
 ```
 
-Available native workloads are `point`, `scan`, and `aggregate`. Output is JSON
-and includes access-path counters such as table scans, index lookups, direct
-aggregate scans, decoded/skipped columns, buffer-pool reads/evictions,
-min/max skips, join-domain skips, streaming aggregate rows, rowid-seek join
-lookups, virtual-memory mapped reads, and Bloom-filter rejects.
+Available native workloads are `point`, `scan`, `aggregate`, `prompt`,
+`context_schema`, `context_spill`, `context_spill_acl`, and
+`context_objects`. The `prompt`/`context_spill` workloads seed a SkibidiQL
+prompt log with `vibe-tab auto`, `alias-tab`, `merge-tabs`, then repeatedly
+run a tab-filtered `spill-context`. `context_spill_acl` adds confidential
+password/API-key-shaped notes and verifies the redaction path stays hot.
+`context_objects` benchmarks the DCF object inspector over schema-aware
+message/atom rows. Context reads use a revision-aware result cache keyed by
+context, tab, query, token budget, receipts mode, and catalog revision, so
+repeated prompt views after a warm-up should report `context_cache_hits` in
+the JSON output.
+Output is JSON and includes access-path counters such as table scans, index
+lookups, raw point hits, direct aggregate scans, exact value-count answers,
+dense group aggregate loops, decoded/skipped columns, estimated native memory,
+buffer-pool reads/evictions, min/max skips, join-domain skips, streaming
+aggregate rows, rowid-seek join lookups, virtual-memory mapped reads,
+Bloom-filter rejects, context cache hits/misses, atoms scored, atoms rendered,
+and atoms redacted.
 
 The optional SQLite build also provides comparative modes:
 
@@ -694,21 +802,43 @@ SkibidiQL, and cached SkibidiQL with prepared-statement reuse.
 For a matched native-engine comparison, build and run:
 
 ```bash
-cmake --build build-sqlite --config Release \
-  --target skibidi_engine_comparison
+cmake -S . -B build-sqlite-wsl \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSKIBIDI_WITH_SQLITE=ON
+cmake --build build-sqlite-wsl \
+  --target skibidi_engine_comparison -j
 python benchmarks/compare_engines.py \
-  --binary build-sqlite/benchmarks/skibidi_engine_comparison \
+  --binary build-sqlite-wsl/benchmarks/skibidi_engine_comparison \
   --rows 10000 --repeats 3
 ```
 
+On WSL/Ubuntu, install the native build dependencies first if CMake cannot
+find SQLite:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake pkg-config libsqlite3-dev
+```
+
+Avoid reusing a Windows-generated `build-sqlite` directory from inside WSL.
+Use a separate Linux build directory such as `build-sqlite-wsl`; otherwise
+`gmake` may complain that there is no `Makefile`.
+
 The comparison uses separate processes, persistent database files, prepared
 SQLite statements, one warm-up execution, and identical point, scan,
-aggregation, and skewed three-table join workloads. Native comparison runs use
-the same 1024-page default buffer pool as the CLI. To reproduce the old cache
+aggregation, skewed three-table join, miss-heavy join, ContextQL schema,
+ContextQL spill, ACL-redaction spill, and context-object inspection workloads.
+For ContextQL, SQLite gets equivalent normalized `context_messages`,
+`context_atoms`, and `context_schemas` tables, so the comparison is normal SQL
+over rows versus native SkibidiQL fabric APIs. Native comparison runs use the
+same 1024-page default buffer pool as the CLI. To reproduce the old cache
 thrash diagnosis, pass `--buffer-pages 128` and watch
 `buffer_page_reads`/`buffer_evictions` jump. Extra workloads `count_miss` and
-`join_miss` isolate min/max pruning and Bloom-filter join pruning. JSON for an
-individual run:
+`join_miss` isolate min/max pruning and Bloom-filter join pruning. The summary
+table reports both `Native est mem` (buffer pages plus estimated B+ tree,
+statistics, and context-result-cache memory) and `Native buffer mem` (resident
+buffer-pool pages only), plus raw-point/value-count/dense-aggregate counters
+so fast-path coverage is visible. JSON for an individual run:
 
 ```bash
 ./build-sqlite/benchmarks/skibidi_engine_comparison \

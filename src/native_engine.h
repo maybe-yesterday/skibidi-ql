@@ -3,14 +3,19 @@
 #include "ast.h"
 #include "metadata.h"
 #include "native_index.h"
+#include "native_lock.h"
 #include "native_storage.h"
+#include "native_wal.h"
 
 #include <array>
 #include <filesystem>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -35,6 +40,8 @@ struct NativeEngineStats {
     std::size_t bloomFilterChecks = 0;
     std::size_t bloomFilterRejects = 0;
     std::size_t indexLookups = 0;
+    std::size_t rawPointQueries = 0;
+    std::size_t rawPointHits = 0;
     std::size_t vectorizedQueries = 0;
     std::size_t vectorBatches = 0;
     std::size_t vectorRows = 0;
@@ -42,6 +49,10 @@ struct NativeEngineStats {
     std::size_t skippedColumns = 0;
     std::size_t vectorNulls = 0;
     std::size_t directAggregateQueries = 0;
+    std::size_t valueCountQueries = 0;
+    std::size_t valueCountRowsAnswered = 0;
+    std::size_t denseGroupAggregateQueries = 0;
+    std::size_t denseGroupAggregateRows = 0;
     std::size_t rawRowsScanned = 0;
     std::size_t rowCopiesAvoided = 0;
     std::size_t minMaxFiltersChecked = 0;
@@ -63,6 +74,15 @@ struct NativeEngineStats {
     std::size_t joinDomainRowsSkipped = 0;
     std::size_t joinPlansEnumerated = 0;
     std::size_t joinOrderChanges = 0;
+    std::size_t contextSchemaQueries = 0;
+    std::size_t contextSpillQueries = 0;
+    std::size_t contextObjectQueries = 0;
+    std::size_t contextCacheHits = 0;
+    std::size_t contextCacheMisses = 0;
+    std::size_t contextAtomsScored = 0;
+    std::size_t contextAtomsRendered = 0;
+    std::size_t contextAtomsRedacted = 0;
+    std::size_t estimatedMemoryBytes = 0;
     double estimatedJoinCost = 0.0;
 };
 
@@ -82,7 +102,7 @@ public:
     void beginTransaction();
     void commitTransaction();
     void rollbackTransaction();
-    bool transactionActive() const { return transactionActive_; }
+    bool transactionActive() const;
     void flush();
     NativeEngineStats stats() const;
     void resetStats();
@@ -156,6 +176,8 @@ private:
             std::array<std::size_t, 16> buckets{};
             double bucketMin = 0.0;
             double bucketMax = 0.0;
+            bool valueCountsExact = false;
+            std::unordered_map<Value, std::size_t, ValueHash> valueCounts;
         };
 
         std::size_t rowCount = 0;
@@ -167,14 +189,31 @@ private:
     bool temporary_ = false;
     Catalog catalog_;
     BufferPool bufferPool_;
+    NativeWal wal_;
     std::unordered_map<std::string, std::unique_ptr<BPlusTree>>
         primaryIndexes_;
     std::unordered_map<std::string, TableStatistics> tableStatistics_;
     std::unordered_map<std::string, MappedHeapFile> mappedHeaps_;
+    std::unordered_map<std::string, NativeQueryResult>
+        contextResultCache_;
     mutable NativeEngineStats stats_;
+    mutable std::recursive_mutex operationMutex_;
     bool transactionActive_ = false;
+    std::uint64_t walTransactionId_ = 0;
+    std::unordered_set<std::string> walLoggedFiles_;
+    std::vector<NativeLockGuard> transactionLocks_;
     std::unordered_map<std::string, std::vector<std::uint8_t>>
         transactionSnapshot_;
+
+    std::vector<NativeLockGuard> acquireStatementLocks(
+        const ASTNode* statement) const;
+    bool statementMutatesPersistentState(const ASTNode* statement) const;
+    void beginWalTransaction();
+    void recordWalBefore(const std::filesystem::path& path);
+    void commitWalTransaction();
+    void discardWalTransaction();
+    void saveCatalog();
+    void flushUnlocked();
 
     NativeQueryResult executeCreate(const CreateStmt& statement);
     NativeQueryResult executeDrop(const DropStmt& statement);
@@ -195,6 +234,18 @@ private:
         const SpillContextStmt& statement);
     NativeQueryResult executeTagMemory(
         const TagMemoryStmt& statement);
+    NativeQueryResult executeShowTabs(
+        const ShowTabsStmt& statement);
+    NativeQueryResult executeShowContextSchemas(
+        const ShowContextSchemasStmt& statement);
+    NativeQueryResult executeShowContextObjects(
+        const ShowContextObjectsStmt& statement);
+    NativeQueryResult executeAliasTab(
+        const AliasTabStmt& statement);
+    NativeQueryResult executeMergeTabs(
+        const MergeTabsStmt& statement);
+    std::optional<NativeQueryResult> executeRawPointSelect(
+        const SelectStmt& statement);
     std::optional<NativeQueryResult> executeDirectAggregateSelect(
         const SelectStmt& statement);
     std::optional<NativeQueryResult> executeRowIdSeekJoinAggregateSelect(
@@ -203,6 +254,8 @@ private:
         const SelectStmt& statement);
     std::optional<std::vector<EvalRow>> executeCostBasedJoins(
         const SelectStmt& statement);
+    void executeSourceOrderJoins(const SelectStmt& statement,
+                                 std::vector<EvalRow>& rows);
 
     std::filesystem::path tablePath(const std::string& table) const;
     HeapFile heap(const std::string& table);

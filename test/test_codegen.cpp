@@ -471,6 +471,38 @@ TEST(generate_drop_table_name_correct) {
 }
 
 // -----------------------------------------------------------------------
+// Prompt-view statement comments
+// -----------------------------------------------------------------------
+TEST(generate_prompt_view_tab_statements) {
+    std::string append = toSQL(
+        "yeet-memory convo drip "
+        "(1, 'user', 'My dog likes salmon.') vibe-tab auto;");
+    ASSERT_CONTAINS(append, "-- yeet-memory convo");
+    ASSERT_CONTAINS(append, "message 1");
+    ASSERT_CONTAINS(append, "vibe-tab auto");
+
+    std::string spill = toSQL(
+        "spill-context convo vibe-tab 'dog' only-if 'pet' "
+        "token-budget 64 receipts off;");
+    ASSERT_CONTAINS(spill, "-- spill-context convo");
+    ASSERT_CONTAINS(spill, "token-budget 64");
+    ASSERT_CONTAINS(spill, "receipts off");
+    ASSERT_CONTAINS(spill, "vibe-tab 'dog'");
+
+    ASSERT_CONTAINS(toSQL("show-tabs convo;"), "-- show-tabs convo");
+    ASSERT_CONTAINS(toSQL("show-context-schemas;"),
+                    "-- show-context-schemas");
+    ASSERT_CONTAINS(toSQL("show-context-objects convo;"),
+                    "-- show-context-objects convo");
+    ASSERT_CONTAINS(
+        toSQL("alias-tab convo 'dog' to 'convo about dog';"),
+        "-- alias-tab convo 'dog' to 'convo about dog'");
+    ASSERT_CONTAINS(
+        toSQL("merge-tabs convo 'pet stuff' into 'dog';"),
+        "-- merge-tabs convo 'pet stuff' into 'dog'");
+}
+
+// -----------------------------------------------------------------------
 // String quoting in generated SQL
 // -----------------------------------------------------------------------
 TEST(generate_string_with_single_quote_doubled) {

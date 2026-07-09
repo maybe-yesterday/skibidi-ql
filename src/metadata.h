@@ -48,6 +48,12 @@ struct ContextMessageMeta {
     std::string speaker;
     std::string text;
     std::string tab;
+    std::string schemaName = "ConversationMessage";
+    std::string schemaVersion = "v1";
+    std::string storageRoute =
+        "structured=catalog.contexts.messages; vector=ConversationMessage.content; blob=none";
+    std::vector<std::string> accessLabels;
+    std::vector<std::string> mentionedEntities;
 };
 
 struct ContextAtomMeta {
@@ -58,12 +64,35 @@ struct ContextAtomMeta {
     std::string source;        // message_<id>
     std::string invalidatedBy; // message_<id>
     std::string tab;
+    std::string schemaName = "ContextAtom";
+    std::string schemaVersion = "v1";
+    std::vector<std::string> accessLabels;
+};
+
+struct ContextTabAliasMeta {
+    std::string alias;
+    std::string target;
+};
+
+struct ContextSchemaMeta {
+    std::string name;
+    std::string version;
+    std::string ownerAgentId;
+    std::string sensitivityLevel;
+    std::string retentionPolicy;
+    std::string storageBackend;
+    std::string vectorizationStrategy;
+    std::vector<std::string> vectorizedFields;
+    std::vector<std::string> accessLabels;
+    std::vector<std::string> indexedFields;
+    std::vector<std::string> relatedSchemas;
 };
 
 struct ConversationContextMeta {
     std::string name;
     std::vector<ContextMessageMeta> messages;
     std::vector<ContextAtomMeta> atoms;
+    std::vector<ContextTabAliasMeta> tabAliases;
 };
 
 class Catalog {
@@ -97,6 +126,7 @@ public:
     std::vector<std::string> tableNames() const;
     std::vector<std::string> snapshotNames() const;
     std::vector<std::string> contextNames() const;
+    std::vector<ContextSchemaMeta> contextSchemas() const;
     std::uint64_t revision() const { return revision_; }
     std::uint64_t schemaFingerprint() const { return schemaFingerprint_; }
 

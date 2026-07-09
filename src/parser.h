@@ -55,6 +55,11 @@ private:
     std::unique_ptr<AppendMemoryStmt> parseAppendMemory();
     std::unique_ptr<SpillContextStmt> parseSpillContext();
     std::unique_ptr<TagMemoryStmt> parseTagMemory();
+    std::unique_ptr<ShowTabsStmt> parseShowTabs();
+    std::unique_ptr<ShowContextSchemasStmt> parseShowContextSchemas();
+    std::unique_ptr<ShowContextObjectsStmt> parseShowContextObjects();
+    std::unique_ptr<AliasTabStmt> parseAliasTab();
+    std::unique_ptr<MergeTabsStmt> parseMergeTabs();
 
     // Clause parsers
     void parseTableRef(std::string& table, std::string& alias);

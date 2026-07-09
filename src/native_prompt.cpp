@@ -1,0 +1,1009 @@
+#include "native_engine.h"
+
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+namespace {
+
+std::string joinStrings(const std::vector<std::string>& values,
+                        const std::string& separator) {
+    std::string out;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index > 0) out += separator;
+        out += values[index];
+    }
+    return out;
+}
+
+void addKeyValue(NativeQueryResult& result,
+                 const std::string& field,
+                 const std::string& value) {
+    result.rows.push_back(Tuple{Value(field), Value(value)});
+}
+
+std::string lowerText(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    return value;
+}
+
+std::string trimText(const std::string& value) {
+    std::size_t first = 0;
+    while (first < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[first]))) {
+        ++first;
+    }
+    std::size_t last = value.size();
+    while (last > first &&
+           std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+        --last;
+    }
+    return value.substr(first, last - first);
+}
+
+std::string cleanAtomValue(std::string value) {
+    value = trimText(value);
+    const auto lower = lowerText(value);
+    for (const char* stop : {" but ", " and ", " because "}) {
+        const auto pos = lower.find(stop);
+        if (pos != std::string::npos) {
+            value = value.substr(0, pos);
+            break;
+        }
+    }
+    while (!value.empty() &&
+           (value.back() == '.' || value.back() == '!' ||
+            value.back() == '?' || value.back() == ',' ||
+            value.back() == ';')) {
+        value.pop_back();
+    }
+    return trimText(value);
+}
+
+void addUnique(std::vector<std::string>& values,
+               const std::string& value) {
+    if (value.empty()) return;
+    if (std::find(values.begin(), values.end(), value) == values.end()) {
+        values.push_back(value);
+    }
+}
+
+bool containsAny(const std::string& lower,
+                 const std::vector<std::string>& needles) {
+    for (const auto& needle : needles) {
+        if (lower.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+std::vector<std::string> inferAccessLabels(const std::string& text) {
+    const auto lower = lowerText(text);
+    std::vector<std::string> labels;
+    labels.push_back("AGENT_INTERNAL");
+    if (containsAny(lower, {
+            "password", "secret", "api key", "token", "ssn",
+            "social security", "credit card", "confidential",
+            "private key"})) {
+        labels.push_back("CONFIDENTIAL_CUSTOMER_DATA");
+    }
+    if (containsAny(lower, {"tool call", "tool trace", "stack trace"})) {
+        labels.push_back("TOOL_TRACE");
+    }
+    return labels;
+}
+
+std::vector<std::string> inferMentionedEntities(const std::string& text) {
+    const auto lower = lowerText(text);
+    std::vector<std::string> entities;
+    if (containsAny(lower, {"dog", "puppy", "pet"})) {
+        addUnique(entities, "dog");
+    }
+    if (containsAny(lower, {"sqlite", "sql", "b-tree", "btree"})) {
+        addUnique(entities, "sqlite");
+    }
+    if (containsAny(lower, {"benchmark", "perf", "slow", "latency"})) {
+        addUnique(entities, "performance");
+    }
+    if (containsAny(lower, {"wal", "lock", "recovery", "transaction"})) {
+        addUnique(entities, "storage-safety");
+    }
+    if (containsAny(lower, {"readme", "docs", "documentation"})) {
+        addUnique(entities, "docs");
+    }
+    if (containsAny(lower, {"pytorch", "torch", "dataset", "training"})) {
+        addUnique(entities, "ml-dataset");
+    }
+    return entities;
+}
+
+bool hasAccessLabel(const std::vector<std::string>& labels,
+                    const std::string& label) {
+    return std::find(labels.begin(), labels.end(), label) != labels.end();
+}
+
+bool shouldRedact(const std::vector<std::string>& labels) {
+    return hasAccessLabel(labels, "CONFIDENTIAL_CUSTOMER_DATA");
+}
+
+std::string redactIfNeeded(const std::string& value,
+                           const std::vector<std::string>& labels,
+                           bool* redacted = nullptr) {
+    if (!shouldRedact(labels)) {
+        if (redacted) *redacted = false;
+        return value;
+    }
+    if (redacted) *redacted = true;
+    return "[redacted:CONFIDENTIAL_CUSTOMER_DATA]";
+}
+
+std::optional<std::string> extractAfterMarker(const std::string& text,
+                                              const std::string& marker) {
+    const auto lower = lowerText(text);
+    const auto pos = lower.find(marker);
+    if (pos == std::string::npos) return std::nullopt;
+    auto value = text.substr(pos + marker.size());
+    const auto punctuation = value.find_first_of(".!?;\n\r");
+    if (punctuation != std::string::npos) {
+        value = value.substr(0, punctuation);
+    }
+    value = cleanAtomValue(value);
+    if (value.empty()) return std::nullopt;
+    return value;
+}
+
+std::string normalizedTab(const std::string& tab) {
+    const auto cleaned = cleanAtomValue(tab);
+    return cleaned.empty() ? "main" : cleaned;
+}
+
+std::string suggestContextTab(const std::string& text) {
+    const auto lower = lowerText(text);
+    if (lower.find("dog") != std::string::npos ||
+        lower.find("puppy") != std::string::npos ||
+        lower.find("pet") != std::string::npos) {
+        return "convo about dog";
+    }
+    if (lower.find("sqlite") != std::string::npos ||
+        lower.find("sql") != std::string::npos ||
+        lower.find("benchmark") != std::string::npos ||
+        lower.find("perf") != std::string::npos ||
+        lower.find("slow") != std::string::npos ||
+        lower.find("join") != std::string::npos ||
+        lower.find("b-tree") != std::string::npos ||
+        lower.find("btree") != std::string::npos) {
+        return "debugging sqlite perf";
+    }
+    if (lower.find("roadmap") != std::string::npos ||
+        lower.find("next step") != std::string::npos ||
+        lower.find("project") != std::string::npos ||
+        lower.find("readme") != std::string::npos) {
+        return "project roadmap";
+    }
+    if (lower.find("debug this later") != std::string::npos ||
+        lower.find("investigate") != std::string::npos ||
+        lower.find("look into") != std::string::npos) {
+        return "debug this later";
+    }
+    if (lower.find("?") != std::string::npos) {
+        return "open questions";
+    }
+    if (lower.find("remember that") != std::string::npos ||
+        lower.find("always ") != std::string::npos ||
+        lower.find("never ") != std::string::npos ||
+        lower.find("don't ") != std::string::npos ||
+        lower.find("do not ") != std::string::npos) {
+        return "constraints";
+    }
+    if (lower.find("i like ") != std::string::npos ||
+        lower.find("i prefer ") != std::string::npos) {
+        return "preferences";
+    }
+    if (lower.find("i need ") != std::string::npos ||
+        lower.find("i want ") != std::string::npos ||
+        lower.find("todo") != std::string::npos) {
+        return "current tasks";
+    }
+    return "main";
+}
+
+std::vector<ContextAtomMeta> extractContextAtoms(
+    const AppendMemoryStmt& statement) {
+    std::vector<ContextAtomMeta> atoms;
+    const std::string source =
+        "message_" + std::to_string(statement.messageId);
+    auto add = [&](std::string key,
+                   std::string value,
+                   std::string type) {
+        if (value.empty()) return;
+        ContextAtomMeta atom;
+        atom.key = std::move(key);
+        atom.value = std::move(value);
+        atom.type = std::move(type);
+        atom.status = "active";
+        atom.source = source;
+        atom.tab = normalizedTab(statement.tab);
+        atoms.push_back(std::move(atom));
+    };
+
+    for (const char* marker : {
+             "i live in ", "i moved to ", "moved to ",
+             "i am in ", "i'm in ", "my location is ",
+             "i live near "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("user_location", *value, "fact");
+            break;
+        }
+    }
+    for (const char* marker : {"i prefer ", "i like "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("user_preference", *value, "preference");
+            break;
+        }
+    }
+    for (const char* marker : {
+             "my dog likes ", "my dog loves ", "my dog prefers "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("dog_preference", *value, "preference");
+            break;
+        }
+    }
+    for (const char* marker : {
+             "my dog is named ", "my dog's name is "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("dog_name", *value, "fact");
+            break;
+        }
+    }
+    if (auto value = extractAfterMarker(statement.text, "remember that ")) {
+        add("user_constraint", *value, "constraint");
+    }
+    for (const char* marker : {
+             "always ", "never ", "do not ", "don't "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("user_constraint", std::string(marker) + *value,
+                "constraint");
+            break;
+        }
+    }
+    for (const char* marker : {"i need ", "i want "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("current_task", *value, "task");
+            break;
+        }
+    }
+    for (const char* marker : {
+             "todo: ", "todo ", "debug this later: ",
+             "investigate ", "look into "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("debug_followup", *value, "debug");
+            break;
+        }
+    }
+    for (const char* marker : {
+             "we decided ", "decision: ", "final call: "}) {
+        if (auto value = extractAfterMarker(statement.text, marker)) {
+            add("decision", *value, "decision");
+            break;
+        }
+    }
+    if (statement.text.find('?') != std::string::npos) {
+        const auto question = cleanAtomValue(statement.text);
+        if (!question.empty()) add("open_question", question, "question");
+    }
+    return atoms;
+}
+
+std::string contextCacheKey(std::uint64_t revision,
+                            const std::vector<std::string>& parts) {
+    std::string key = std::to_string(revision);
+    for (const auto& part : parts) {
+        key += '\x1f';
+        key += part;
+    }
+    return key;
+}
+
+int contextAtomUtilityLower(const ContextAtomMeta& atom,
+                            const std::string& lowerQuery) {
+    const auto value = lowerText(atom.value);
+    int score = 10;
+    if (lowerQuery.find(value) != std::string::npos && !value.empty()) {
+        score += 40;
+    }
+    if (atom.key == "user_location" &&
+        (lowerQuery.find("near me") != std::string::npos ||
+         lowerQuery.find("nearby") != std::string::npos ||
+         lowerQuery.find("restaurant") != std::string::npos ||
+         lowerQuery.find("weather") != std::string::npos ||
+         lowerQuery.find("location") != std::string::npos ||
+         lowerQuery.find("near ") != std::string::npos)) {
+        score += 100;
+    }
+    if (atom.type == "constraint") score += 80;
+    if (atom.type == "preference" &&
+        (lowerQuery.find("recommend") != std::string::npos ||
+         lowerQuery.find("choose") != std::string::npos ||
+         lowerQuery.find("prefer") != std::string::npos)) {
+        score += 60;
+    }
+    if (atom.type == "task") score += 50;
+    if (atom.type == "decision") score += 70;
+    if (atom.type == "question" &&
+        (lowerQuery.find("question") != std::string::npos ||
+         lowerQuery.find("open") != std::string::npos ||
+         lowerQuery.find("?") != std::string::npos)) {
+        score += 70;
+    }
+    if (atom.type == "debug" &&
+        (lowerQuery.find("debug") != std::string::npos ||
+         lowerQuery.find("todo") != std::string::npos ||
+         lowerQuery.find("investigate") != std::string::npos)) {
+        score += 70;
+    }
+    return score;
+}
+
+std::size_t estimateContextTokens(const std::string& text) {
+    return std::max<std::size_t>(1, (text.size() + 3) / 4);
+}
+
+std::string renderContextAtom(const ContextAtomMeta& atom,
+                              bool receipts,
+                              bool* redacted = nullptr) {
+    std::string rendered = atom.type + " " + atom.key + "=" +
+        redactIfNeeded(atom.value, atom.accessLabels, redacted);
+    if (receipts) {
+        rendered += " @" + atom.source;
+        if (!atom.schemaName.empty()) {
+            rendered += " schema=" + atom.schemaName + "." +
+                        atom.schemaVersion;
+        }
+        if (!atom.accessLabels.empty()) {
+            rendered += " labels=" + joinStrings(atom.accessLabels, ",");
+        }
+    }
+    return rendered;
+}
+
+std::string resolveContextTab(const ConversationContextMeta& context,
+                              const std::string& tab) {
+    std::string current = normalizedTab(tab);
+    std::unordered_set<std::string> seen;
+    for (std::size_t hop = 0; hop < 32; ++hop) {
+        if (!seen.insert(current).second) return current;
+        bool changed = false;
+        for (const auto& alias : context.tabAliases) {
+            if (normalizedTab(alias.alias) == current) {
+                current = normalizedTab(alias.target);
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) return current;
+    }
+    return current;
+}
+
+void setContextTabAlias(ConversationContextMeta& context,
+                        const std::string& aliasValue,
+                        const std::string& targetValue) {
+    const std::string alias = normalizedTab(aliasValue);
+    const std::string target = resolveContextTab(context, targetValue);
+    for (auto& existing : context.tabAliases) {
+        if (normalizedTab(existing.alias) == alias) {
+            existing.alias = alias;
+            existing.target = target;
+            return;
+        }
+    }
+    context.tabAliases.push_back(ContextTabAliasMeta{alias, target});
+}
+
+std::vector<std::string> contextAliasesForTab(
+    const ConversationContextMeta& context,
+    const std::string& tab) {
+    std::vector<std::string> aliases;
+    const std::string target = normalizedTab(tab);
+    for (const auto& alias : context.tabAliases) {
+        if (resolveContextTab(context, alias.alias) == target) {
+            aliases.push_back(normalizedTab(alias.alias));
+        }
+    }
+    std::sort(aliases.begin(), aliases.end());
+    aliases.erase(std::unique(aliases.begin(), aliases.end()),
+                  aliases.end());
+    return aliases;
+}
+
+void recomputeContextAtomStatus(ConversationContextMeta& context) {
+    for (auto& atom : context.atoms) {
+        atom.tab = normalizedTab(atom.tab);
+        atom.status = "active";
+        atom.invalidatedBy.clear();
+    }
+
+    for (std::size_t index = 0; index < context.atoms.size(); ++index) {
+        const auto& atom = context.atoms[index];
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            auto& existing = context.atoms[prior];
+            if (existing.status == "active" &&
+                existing.key == atom.key &&
+                existing.tab == atom.tab &&
+                existing.value != atom.value) {
+                existing.status = "invalidated";
+                existing.invalidatedBy = atom.source;
+            }
+        }
+    }
+}
+
+} // namespace
+
+NativeQueryResult NativeEngine::executeCreateContext(
+    const CreateContextStmt& statement) {
+    if (catalog_.hasContext(statement.name)) {
+        throw std::runtime_error(
+            "Context already exists: " + statement.name);
+    }
+    ConversationContextMeta context;
+    context.name = statement.name;
+    catalog_.addContext(context);
+    saveCatalog();
+    contextResultCache_.clear();
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", statement.name);
+    addKeyValue(result, "messages", "0");
+    addKeyValue(result, "atoms", "0");
+    result.message = "manifested context " + statement.name;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeAppendMemory(
+    const AppendMemoryStmt& statement) {
+    const auto* existing = catalog_.getContext(statement.context);
+    if (!existing) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+    ConversationContextMeta context = *existing;
+    for (const auto& message : context.messages) {
+        if (message.id == statement.messageId) {
+            throw std::runtime_error(
+                "Duplicate context message id: " +
+                std::to_string(statement.messageId));
+        }
+    }
+
+    ContextMessageMeta message;
+    message.id = statement.messageId;
+    message.speaker = statement.speaker;
+    message.text = statement.text;
+    const std::string suggestedTab = suggestContextTab(statement.text);
+    const std::string requestedTab =
+        statement.autoTab ? suggestedTab : statement.tab;
+    message.tab = resolveContextTab(context, requestedTab);
+    message.schemaName = "ConversationMessage";
+    message.schemaVersion = "v1";
+    message.storageRoute =
+        "structured=catalog.contexts.messages; vector=ConversationMessage.content; blob=none";
+    message.accessLabels = inferAccessLabels(statement.text);
+    message.mentionedEntities = inferMentionedEntities(statement.text);
+    context.messages.push_back(message);
+
+    AppendMemoryStmt extractionStatement = statement;
+    extractionStatement.tab = message.tab;
+    auto atoms = extractContextAtoms(extractionStatement);
+    const std::string invalidator =
+        "message_" + std::to_string(statement.messageId);
+    std::size_t invalidated = 0;
+    for (const auto& atom : atoms) {
+        for (auto& existingAtom : context.atoms) {
+            if (existingAtom.status == "active" &&
+                existingAtom.key == atom.key &&
+                existingAtom.tab == atom.tab &&
+                existingAtom.value != atom.value) {
+                existingAtom.status = "invalidated";
+                existingAtom.invalidatedBy = invalidator;
+                ++invalidated;
+            }
+        }
+        ContextAtomMeta storedAtom = atom;
+        storedAtom.schemaName = "ContextAtom";
+        storedAtom.schemaVersion = "v1";
+        storedAtom.accessLabels = message.accessLabels;
+        context.atoms.push_back(std::move(storedAtom));
+    }
+
+    catalog_.addContext(context);
+    saveCatalog();
+    contextResultCache_.clear();
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", statement.context);
+    addKeyValue(result, "message", invalidator);
+    addKeyValue(result, "speaker", statement.speaker);
+    addKeyValue(result, "tab", message.tab);
+    addKeyValue(result, "suggested_tab", suggestedTab);
+    addKeyValue(result, "auto_tab", statement.autoTab ? "true" : "false");
+    addKeyValue(result, "message_schema",
+                message.schemaName + "." + message.schemaVersion);
+    addKeyValue(result, "access_labels",
+                joinStrings(message.accessLabels, ","));
+    addKeyValue(result, "mentioned_entities",
+                joinStrings(message.mentionedEntities, ","));
+    addKeyValue(result, "storage_route", message.storageRoute);
+    addKeyValue(result, "dcf_object",
+                "message_" + std::to_string(statement.messageId) +
+                " -> " + message.schemaName + "." +
+                message.schemaVersion);
+    addKeyValue(result, "extracted_atoms", std::to_string(atoms.size()));
+    addKeyValue(result, "invalidated_atoms", std::to_string(invalidated));
+    for (const auto& atom : atoms) {
+        addKeyValue(result, "atom",
+                    atom.key + "=" + atom.value + " @" + atom.source);
+    }
+    result.message = "yeeted memory into " + statement.context;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeTagMemory(
+    const TagMemoryStmt& statement) {
+    const auto* existing = catalog_.getContext(statement.context);
+    if (!existing) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+    ConversationContextMeta context = *existing;
+    const std::string source =
+        "message_" + std::to_string(statement.messageId);
+    const std::string tab = resolveContextTab(context, statement.tab);
+
+    bool found = false;
+    for (auto& message : context.messages) {
+        if (message.id == statement.messageId) {
+            message.tab = tab;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        throw std::runtime_error(
+            "Unknown context message id: " +
+            std::to_string(statement.messageId));
+    }
+
+    std::size_t retaggedAtoms = 0;
+    for (auto& atom : context.atoms) {
+        if (atom.source == source) {
+            atom.tab = tab;
+            ++retaggedAtoms;
+        }
+    }
+    recomputeContextAtomStatus(context);
+
+    catalog_.addContext(context);
+    saveCatalog();
+    contextResultCache_.clear();
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", statement.context);
+    addKeyValue(result, "message", source);
+    addKeyValue(result, "tab", tab);
+    addKeyValue(result, "retagged_atoms", std::to_string(retaggedAtoms));
+    result.message = "vibe-tabbed memory in " + statement.context;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeShowTabs(
+    const ShowTabsStmt& statement) {
+    const auto* context = catalog_.getContext(statement.context);
+    if (!context) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+
+    struct TabStats {
+        std::size_t messages = 0;
+        std::size_t atoms = 0;
+        std::size_t activeAtoms = 0;
+        std::size_t invalidatedAtoms = 0;
+        std::uint64_t lastMessage = 0;
+        std::vector<std::string> accessLabels;
+    };
+
+    std::map<std::string, TabStats> stats;
+    for (const auto& message : context->messages) {
+        const std::string tab = resolveContextTab(*context, message.tab);
+        auto& entry = stats[tab];
+        ++entry.messages;
+        entry.lastMessage = std::max(entry.lastMessage, message.id);
+        for (const auto& label : message.accessLabels) {
+            addUnique(entry.accessLabels, label);
+        }
+    }
+    for (const auto& atom : context->atoms) {
+        const std::string tab = resolveContextTab(*context, atom.tab);
+        auto& entry = stats[tab];
+        ++entry.atoms;
+        if (atom.status == "active") ++entry.activeAtoms;
+        else if (atom.status == "invalidated") ++entry.invalidatedAtoms;
+        for (const auto& label : atom.accessLabels) {
+            addUnique(entry.accessLabels, label);
+        }
+    }
+    for (const auto& alias : context->tabAliases) {
+        stats[resolveContextTab(*context, alias.target)];
+    }
+    if (stats.empty()) stats["main"] = TabStats{};
+
+    NativeQueryResult result;
+    result.columns = {"tab", "messages", "atoms", "active_atoms",
+                      "invalidated_atoms", "last_message", "aliases",
+                      "access_labels"};
+    for (const auto& entry : stats) {
+        const auto aliases =
+            contextAliasesForTab(*context, entry.first);
+        result.rows.push_back(Tuple{
+            Value(entry.first),
+            Value(std::to_string(entry.second.messages)),
+            Value(std::to_string(entry.second.atoms)),
+            Value(std::to_string(entry.second.activeAtoms)),
+            Value(std::to_string(entry.second.invalidatedAtoms)),
+            Value(entry.second.lastMessage == 0
+                      ? std::string{}
+                      : std::to_string(entry.second.lastMessage)),
+            Value(joinStrings(aliases, ",")),
+            Value(joinStrings(entry.second.accessLabels, ","))});
+    }
+    result.message = "showed tabs for " + context->name;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeShowContextSchemas(
+    const ShowContextSchemasStmt&) {
+    ++stats_.contextSchemaQueries;
+    const std::string key =
+        contextCacheKey(catalog_.revision(), {"schemas"});
+    auto cached = contextResultCache_.find(key);
+    if (cached != contextResultCache_.end()) {
+        ++stats_.contextCacheHits;
+        return cached->second;
+    }
+    ++stats_.contextCacheMisses;
+
+    NativeQueryResult result;
+    result.columns = {"schema", "version", "owner_agent",
+                      "sensitivity", "retention", "storage",
+                      "vectorized_fields", "access_labels",
+                      "indexed_fields", "related_schemas"};
+    for (const auto& schema : catalog_.contextSchemas()) {
+        result.rows.push_back(Tuple{
+            Value(schema.name),
+            Value(schema.version),
+            Value(schema.ownerAgentId),
+            Value(schema.sensitivityLevel),
+            Value(schema.retentionPolicy),
+            Value(schema.storageBackend),
+            Value(joinStrings(schema.vectorizedFields, ",")),
+            Value(joinStrings(schema.accessLabels, ",")),
+            Value(joinStrings(schema.indexedFields, ",")),
+            Value(joinStrings(schema.relatedSchemas, ","))});
+    }
+    result.message =
+        "showed CSR schema registry fr fr";
+    contextResultCache_[key] = result;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeShowContextObjects(
+    const ShowContextObjectsStmt& statement) {
+    ++stats_.contextObjectQueries;
+    const std::string key =
+        contextCacheKey(catalog_.revision(),
+                        {"objects", statement.context});
+    auto cached = contextResultCache_.find(key);
+    if (cached != contextResultCache_.end()) {
+        ++stats_.contextCacheHits;
+        return cached->second;
+    }
+    ++stats_.contextCacheMisses;
+
+    const auto* context = catalog_.getContext(statement.context);
+    if (!context) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+
+    auto fallbackLabels = [](std::vector<std::string> labels) {
+        if (labels.empty()) labels.push_back("AGENT_INTERNAL");
+        return labels;
+    };
+
+    NativeQueryResult result;
+    result.columns = {"object_id", "schema", "version", "tab", "status",
+                      "access_labels", "storage_route", "source",
+                      "value"};
+
+    std::size_t redacted = 0;
+    for (const auto& message : context->messages) {
+        auto labels = fallbackLabels(message.accessLabels);
+        bool wasRedacted = false;
+        const std::string tab = resolveContextTab(*context, message.tab);
+        result.rows.push_back(Tuple{
+            Value("message_" + std::to_string(message.id)),
+            Value(message.schemaName.empty()
+                      ? std::string("ConversationMessage")
+                      : message.schemaName),
+            Value(message.schemaVersion.empty()
+                      ? std::string("v1")
+                      : message.schemaVersion),
+            Value(tab),
+            Value(std::string("active")),
+            Value(joinStrings(labels, ",")),
+            Value(message.storageRoute.empty()
+                      ? std::string("structured=catalog.contexts.messages; vector=ConversationMessage.content; blob=none")
+                      : message.storageRoute),
+            Value(std::string("")),
+            Value(redactIfNeeded(message.text, labels, &wasRedacted))});
+        if (wasRedacted) ++redacted;
+    }
+
+    for (std::size_t index = 0; index < context->atoms.size(); ++index) {
+        const auto& atom = context->atoms[index];
+        auto labels = fallbackLabels(atom.accessLabels);
+        bool wasRedacted = false;
+        const std::string value =
+            atom.type + " " + atom.key + "=" +
+            redactIfNeeded(atom.value, labels, &wasRedacted);
+        result.rows.push_back(Tuple{
+            Value("atom_" + std::to_string(index + 1)),
+            Value(atom.schemaName.empty()
+                      ? std::string("ContextAtom")
+                      : atom.schemaName),
+            Value(atom.schemaVersion.empty()
+                      ? std::string("v1")
+                      : atom.schemaVersion),
+            Value(resolveContextTab(*context, atom.tab)),
+            Value(atom.status.empty() ? std::string("active")
+                                      : atom.status),
+            Value(joinStrings(labels, ",")),
+            Value(std::string("structured=catalog.contexts.atoms")),
+            Value(atom.source),
+            Value(value)});
+        if (wasRedacted) ++redacted;
+    }
+
+    result.message =
+        "showed context objects for " + context->name +
+        " (redacted " + std::to_string(redacted) + ")";
+    contextResultCache_[key] = result;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeAliasTab(
+    const AliasTabStmt& statement) {
+    const auto* existing = catalog_.getContext(statement.context);
+    if (!existing) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+    ConversationContextMeta context = *existing;
+    const std::string alias = normalizedTab(statement.alias);
+    const std::string target = resolveContextTab(context, statement.target);
+    setContextTabAlias(context, alias, target);
+
+    catalog_.addContext(context);
+    saveCatalog();
+    contextResultCache_.clear();
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", statement.context);
+    addKeyValue(result, "alias", alias);
+    addKeyValue(result, "target", target);
+    result.message = "aliased tab in " + statement.context;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeMergeTabs(
+    const MergeTabsStmt& statement) {
+    const auto* existing = catalog_.getContext(statement.context);
+    if (!existing) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+    ConversationContextMeta context = *existing;
+    const std::string source = resolveContextTab(context, statement.fromTab);
+    const std::string target = resolveContextTab(context, statement.toTab);
+
+    std::size_t movedMessages = 0;
+    std::size_t movedAtoms = 0;
+    if (source != target) {
+        for (auto& message : context.messages) {
+            if (resolveContextTab(context, message.tab) == source) {
+                message.tab = target;
+                ++movedMessages;
+            }
+        }
+        for (auto& atom : context.atoms) {
+            if (resolveContextTab(context, atom.tab) == source) {
+                atom.tab = target;
+                ++movedAtoms;
+            }
+        }
+        for (auto& alias : context.tabAliases) {
+            if (resolveContextTab(context, alias.target) == source) {
+                alias.target = target;
+            }
+        }
+        setContextTabAlias(context, source, target);
+        recomputeContextAtomStatus(context);
+    }
+
+    catalog_.addContext(context);
+    saveCatalog();
+    contextResultCache_.clear();
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", statement.context);
+    addKeyValue(result, "from_tab", source);
+    addKeyValue(result, "to_tab", target);
+    addKeyValue(result, "moved_messages", std::to_string(movedMessages));
+    addKeyValue(result, "moved_atoms", std::to_string(movedAtoms));
+    result.message = "merged tabs in " + statement.context;
+    return result;
+}
+
+NativeQueryResult NativeEngine::executeSpillContext(
+    const SpillContextStmt& statement) {
+    ++stats_.contextSpillQueries;
+    const std::string key =
+        contextCacheKey(catalog_.revision(),
+                        {"spill", statement.context, statement.tab,
+                         statement.query,
+                         std::to_string(statement.tokenBudget),
+                         statement.receipts ? "receipts:on"
+                                            : "receipts:off"});
+    auto cached = contextResultCache_.find(key);
+    if (cached != contextResultCache_.end()) {
+        ++stats_.contextCacheHits;
+        return cached->second;
+    }
+    ++stats_.contextCacheMisses;
+
+    const auto* context = catalog_.getContext(statement.context);
+    if (!context) {
+        throw std::runtime_error("Unknown context: " + statement.context);
+    }
+
+    struct RankedAtom {
+        const ContextAtomMeta* atom = nullptr;
+        int utility = 0;
+        std::size_t ordinal = 0;
+    };
+
+    std::vector<RankedAtom> active;
+    std::vector<const ContextAtomMeta*> invalidated;
+    active.reserve(context->atoms.size());
+    invalidated.reserve(context->atoms.size() / 4);
+    const std::string tabFilter = statement.tab.empty()
+        ? std::string{}
+        : resolveContextTab(*context, statement.tab);
+    const std::string lowerQuery = lowerText(statement.query);
+    std::vector<std::string> accessLabels;
+    std::vector<std::string> mentionedEntities;
+    for (const auto& message : context->messages) {
+        const std::string tab = resolveContextTab(*context, message.tab);
+        if (!tabFilter.empty() && tab != tabFilter) continue;
+        for (const auto& label : message.accessLabels) {
+            addUnique(accessLabels, label);
+        }
+        for (const auto& entity : message.mentionedEntities) {
+            addUnique(mentionedEntities, entity);
+        }
+    }
+    for (std::size_t index = 0; index < context->atoms.size(); ++index) {
+        const auto& atom = context->atoms[index];
+        const std::string atomTab = resolveContextTab(*context, atom.tab);
+        if (!tabFilter.empty() && atomTab != tabFilter) continue;
+        for (const auto& label : atom.accessLabels) {
+            addUnique(accessLabels, label);
+        }
+        if (atom.status == "active") {
+            ++stats_.contextAtomsScored;
+            active.push_back(
+                RankedAtom{
+                    &atom,
+                    contextAtomUtilityLower(atom, lowerQuery),
+                    index});
+        } else if (atom.status == "invalidated") {
+            invalidated.push_back(&atom);
+        }
+    }
+    std::stable_sort(active.begin(), active.end(),
+        [](const RankedAtom& left, const RankedAtom& right) {
+        if (left.utility != right.utility) {
+            return left.utility > right.utility;
+        }
+        return left.ordinal > right.ordinal;
+    });
+
+    std::vector<std::string> renderedAtoms;
+    renderedAtoms.reserve(active.size());
+    std::size_t tokenCost = 0;
+    std::size_t redactedAtoms = 0;
+    for (const auto& ranked : active) {
+        bool wasRedacted = false;
+        std::string rendered =
+            renderContextAtom(*ranked.atom, statement.receipts,
+                              &wasRedacted);
+        const auto cost = estimateContextTokens(rendered);
+        if (!renderedAtoms.empty() &&
+            tokenCost + cost > statement.tokenBudget) {
+            continue;
+        }
+        if (renderedAtoms.empty() && cost > statement.tokenBudget) {
+            continue;
+        }
+        renderedAtoms.push_back(std::move(rendered));
+        tokenCost += cost;
+        if (wasRedacted) ++redactedAtoms;
+    }
+    stats_.contextAtomsRendered += renderedAtoms.size();
+    stats_.contextAtomsRedacted += redactedAtoms;
+
+    NativeQueryResult result;
+    result.columns = {"field", "value"};
+    addKeyValue(result, "context", context->name);
+    addKeyValue(result, "query", statement.query);
+    addKeyValue(result, "tab",
+                tabFilter.empty() ? "all" : tabFilter);
+    addKeyValue(result, "token_budget",
+                std::to_string(statement.tokenBudget));
+    addKeyValue(result, "token_cost", std::to_string(tokenCost));
+    addKeyValue(result, "messages",
+                std::to_string(context->messages.size()));
+    addKeyValue(result, "active_atoms", std::to_string(active.size()));
+    addKeyValue(result, "rendered_atoms",
+                std::to_string(renderedAtoms.size()));
+    addKeyValue(result, "redacted_atoms", std::to_string(redactedAtoms));
+    addKeyValue(result, "schema_registry",
+                "CSR: ConversationMessage.v1 + ContextAtom.v1");
+    addKeyValue(result, "dcf_storage_route",
+                "structured=catalog.contexts.messages+atoms; vector=ConversationMessage.content; blob=tool/object refs");
+    addKeyValue(result, "access_policy",
+                "schema=agent-internal; labels=" +
+                (accessLabels.empty()
+                     ? std::string("AGENT_INTERNAL")
+                     : joinStrings(accessLabels, ",")) +
+                "; redaction=on");
+    addKeyValue(result, "mentioned_entities",
+                joinStrings(mentionedEntities, ","));
+    addKeyValue(result, "indexed_fields",
+                "ContextAtom.key,type,status,tab,source,access_labels; ConversationMessage.tab,mentioned_entities,access_labels");
+    addKeyValue(result, "current_context",
+                joinStrings(renderedAtoms, " | "));
+
+    for (const auto& rendered : renderedAtoms) {
+        addKeyValue(result, "view_atom", rendered);
+    }
+    if (statement.receipts) {
+        for (const auto* atom : invalidated) {
+            addKeyValue(result, "invalidated",
+                atom->key + "=" +
+                redactIfNeeded(atom->value, atom->accessLabels) +
+                " @" + atom->source +
+                " invalidated_by=" + atom->invalidatedBy);
+        }
+    }
+    result.message = "spilled context view for " + context->name;
+    contextResultCache_[key] = result;
+    return result;
+}

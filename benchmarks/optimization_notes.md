@@ -121,6 +121,35 @@ Using SQLite 3.49.1 through the local Python/SQLite build:
    - The miss-heavy benchmark is exactly this shape:
      `facts.d2_id` is outside `dimension_two.id`.
 
+14. Raw point opcode loop
+   - Primary-key point selects now run an exact narrow loop:
+     B+ tree lookup, raw rowid read, projected-column decode, tuple emit.
+   - This skips full-row `EvalRow` materialization and avoids decoding
+     unreferenced payload columns.
+   - Bloom filters remain useful for negative membership tests, but successful
+     point hits still need the exact index/row read.
+
+15. Dense small-domain group aggregation
+   - Single-table grouped aggregates with one not-null integer/boolean group
+     key and a small min/max domain now use a dense typed group array.
+   - This avoids hashing boxed `Tuple` keys for common bucketed OLAP shapes
+     such as `category, SUM(score) WHERE active = 1 GROUP BY category`.
+
+16. Exact value-count filtered counts
+   - Column range metadata now keeps exact value counts while the distinct
+     count stays small.
+   - Scalar `COUNT(*) WHERE col = literal` and `COUNT(col) WHERE col = literal`
+     can answer from metadata after warm-up instead of scanning rows.
+   - This targets the benchmark `COUNT(*) WHERE active = 1` shape and is the
+     native analogue of a tiny exact bitmap/materialized-stat shortcut.
+
+17. Memory metric cleanup
+   - `engine_memory_bytes` now estimates buffer pages plus B+ tree keys,
+     statistics metadata, mapped-view handles, and cached context results.
+   - `buffer_memory_bytes` remains the raw resident-buffer-page count, which is
+     why older tables showed deceptively tiny native memory on context
+     workloads.
+
 ## Measured deltas
 
 Release build, 10,000 rows, timed loop after one warm-up:
@@ -143,12 +172,20 @@ Additional targeted runs:
 | Rowid-seek miss-heavy join | miss-heavy 3-table join x10 | 36.7 ms | 10 rowid-seek queries, 200,000 rowid lookups, 100,000 misses |
 | Mapped rowid-seek grouped join | matching 3-table join x10 | 129.7 ms | 10 mapped scans, 100,000 mapped rowid reads, 0 hash probes |
 | Join-domain skip | miss-heavy 3-table join x10 | 0.036 ms | 10 join-domain skips, 100,000 rows skipped, 0 rowid lookups |
+| Raw point loop | point hit x1000, 1,000 rows | 10.2 ms on local MSVC smoke | 1,000 raw point hits, 2,000 decoded columns, 3,000 skipped columns |
+| Exact value count | filtered count x100, 1,000 rows | 0.7 ms on local MSVC smoke | 100 value-count queries, 0 raw rows scanned after warm-up |
+| Dense grouped aggregate | grouped aggregate x100, 1,000 rows | 35.5 ms on local MSVC smoke | 100 dense group aggregate queries, 50,000 matching rows |
 
 The main diagnosis: for repeated scan workloads the previous bottleneck was
 buffer-pool thrash, not B-trees. Remaining gaps versus SQLite are now mostly
 executor tightness, tuple format, B+ tree lookup overhead, and SQLite's very
-compact aggregate/join opcode loops. The rowid-seek path no longer materializes
-combined join rows for primary-key dimension joins, but it is still C++ object
-code over `Value`/`RawField` abstractions rather than a compact bytecode VM over
-cache-tuned record cursors. When table-level domains prove an inner join empty,
-metadata now wins outright and avoids the executor loop entirely.
+compact aggregate/join opcode loops. The raw point and dense aggregate paths
+remove more `Value`/`EvalRow` overhead for narrow cases, and exact value counts
+let repeated equality counts skip the scan entirely after warm-up. Generic
+scans are still row-store loops over serialized tuples rather than
+SIMD/columnar kernels.
+The rowid-seek path no longer materializes combined join rows for primary-key
+dimension joins, but it is still C++ object code over `Value`/`RawField`
+abstractions rather than a compact bytecode VM over cache-tuned record cursors.
+When table-level domains prove an inner join empty, metadata now wins outright
+and avoids the executor loop entirely.

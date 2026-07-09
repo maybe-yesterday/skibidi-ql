@@ -87,7 +87,9 @@ CompilationResult QueryCompiler::compileUncached(
             dynamic_cast<CreateSnapshotStmt*>(ast.get()) ||
             dynamic_cast<CreateContextStmt*>(ast.get()) ||
             dynamic_cast<AppendMemoryStmt*>(ast.get()) ||
-            dynamic_cast<TagMemoryStmt*>(ast.get());
+            dynamic_cast<TagMemoryStmt*>(ast.get()) ||
+            dynamic_cast<AliasTabStmt*>(ast.get()) ||
+            dynamic_cast<MergeTabsStmt*>(ast.get());
         if (statementChangesSchema) {
             schemaChanging = true;
         }

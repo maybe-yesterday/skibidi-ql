@@ -15,9 +15,17 @@ set(SKIBIDI_CORE_SOURCES
     src/compiler.cpp
     src/lexer.cpp
     src/metadata.cpp
+    src/native_aggregates.cpp
     src/native_engine.cpp
+    src/native_fast_paths.cpp
     src/native_index.cpp
+    src/native_joins.cpp
+    src/native_lock.cpp
+    src/native_prompt.cpp
+    src/native_raw.cpp
     src/native_storage.cpp
+    src/native_vectorized.cpp
+    src/native_wal.cpp
     src/optimizer.cpp
     src/parser.cpp
 )

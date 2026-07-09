@@ -27,6 +27,11 @@ struct CreateContextStmt;
 struct AppendMemoryStmt;
 struct SpillContextStmt;
 struct TagMemoryStmt;
+struct ShowTabsStmt;
+struct ShowContextSchemasStmt;
+struct ShowContextObjectsStmt;
+struct AliasTabStmt;
+struct MergeTabsStmt;
 
 // -----------------------------------------------------------------------
 // Visitor base
@@ -53,6 +58,11 @@ struct ASTVisitor {
     virtual void visit(AppendMemoryStmt&) = 0;
     virtual void visit(SpillContextStmt&) = 0;
     virtual void visit(TagMemoryStmt&) = 0;
+    virtual void visit(ShowTabsStmt&) = 0;
+    virtual void visit(ShowContextSchemasStmt&) = 0;
+    virtual void visit(ShowContextObjectsStmt&) = 0;
+    virtual void visit(AliasTabStmt&) = 0;
+    virtual void visit(MergeTabsStmt&) = 0;
 };
 
 // -----------------------------------------------------------------------
@@ -649,12 +659,14 @@ struct AppendMemoryStmt : ASTNode {
     std::string speaker;
     std::string text;
     std::string tab;
+    bool autoTab = false;
 
     void accept(ASTVisitor& v) override { v.visit(*this); }
     void print(std::ostream& os, int indent) const override {
         printIndent(os, indent);
         os << "AppendMemoryStmt(" << context << ", message "
            << messageId << ", " << speaker;
+        if (autoTab) os << ", tab auto";
         if (!tab.empty()) os << ", tab " << tab;
         os << ")\n";
     }
@@ -699,6 +711,80 @@ struct TagMemoryStmt : ASTNode {
     }
     std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<TagMemoryStmt>(*this);
+        return n;
+    }
+};
+
+struct ShowTabsStmt : ASTNode {
+    std::string context;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "ShowTabsStmt(" << context << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ShowTabsStmt>(*this);
+        return n;
+    }
+};
+
+struct ShowContextSchemasStmt : ASTNode {
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "ShowContextSchemasStmt()\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ShowContextSchemasStmt>(*this);
+        return n;
+    }
+};
+
+struct ShowContextObjectsStmt : ASTNode {
+    std::string context;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "ShowContextObjectsStmt(" << context << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ShowContextObjectsStmt>(*this);
+        return n;
+    }
+};
+
+struct AliasTabStmt : ASTNode {
+    std::string context;
+    std::string alias;
+    std::string target;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "AliasTabStmt(" << context << ", " << alias
+           << " -> " << target << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<AliasTabStmt>(*this);
+        return n;
+    }
+};
+
+struct MergeTabsStmt : ASTNode {
+    std::string context;
+    std::string fromTab;
+    std::string toTab;
+
+    void accept(ASTVisitor& v) override { v.visit(*this); }
+    void print(std::ostream& os, int indent) const override {
+        printIndent(os, indent);
+        os << "MergeTabsStmt(" << context << ", " << fromTab
+           << " -> " << toTab << ")\n";
+    }
+    std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<MergeTabsStmt>(*this);
         return n;
     }
 };

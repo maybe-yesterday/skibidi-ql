@@ -64,6 +64,72 @@ static void seed(NativeEngine& engine, int rowCount) {
     engine.flush();
 }
 
+static bool isContextWorkload(const std::string& workload) {
+    return workload == "prompt" ||
+           workload == "context_schema" ||
+           workload == "context_spill" ||
+           workload == "context_spill_acl" ||
+           workload == "context_objects";
+}
+
+static void seedPromptLog(NativeEngine& engine,
+                          int messageCount,
+                          bool includeSensitive = false) {
+    CreateContextStmt create;
+    create.name = "bench_convo";
+    engine.execute(&create);
+
+    AliasTabStmt alias;
+    alias.context = "bench_convo";
+    alias.alias = "dog";
+    alias.target = "convo about dog";
+    engine.execute(&alias);
+
+    for (int id = 1; id <= messageCount; ++id) {
+        AppendMemoryStmt append;
+        append.context = "bench_convo";
+        append.messageId = static_cast<unsigned long long>(id);
+        append.speaker = "user";
+        if (includeSensitive && id % 7 == 0) {
+            append.text = "Never share passwords or api key tokens.";
+            append.tab = "constraints";
+            engine.execute(&append);
+            continue;
+        }
+        switch (id % 5) {
+            case 0:
+                append.text = "My dog likes salmon.";
+                append.autoTab = true;
+                break;
+            case 1:
+                append.text = "I like cat cafes.";
+                append.tab = "pet stuff";
+                break;
+            case 2:
+                append.text =
+                    "Decision: keep prompt views inside SkibidiQL.";
+                append.tab = "project roadmap";
+                break;
+            case 3:
+                append.text =
+                    "Debug this later: sqlite perf join misses.";
+                append.autoTab = true;
+                break;
+            default:
+                append.text = "I live in Seattle.";
+                break;
+        }
+        engine.execute(&append);
+    }
+
+    MergeTabsStmt merge;
+    merge.context = "bench_convo";
+    merge.fromTab = "pet stuff";
+    merge.toTab = "dog";
+    engine.execute(&merge);
+    engine.flush();
+}
+
 static Options parseOptions(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
@@ -100,7 +166,15 @@ int main(int argc, char** argv) {
                      .time_since_epoch().count()));
         auto engine = std::make_unique<NativeEngine>(
             root, static_cast<std::size_t>(options.bufferPages));
-        seed(*engine, options.rows);
+        if (isContextWorkload(options.workload)) {
+            if (options.workload != "context_schema") {
+                seedPromptLog(*engine, options.rows,
+                              options.workload == "context_spill_acl" ||
+                              options.workload == "context_objects");
+            }
+        } else {
+            seed(*engine, options.rows);
+        }
 
         std::string source;
         if (options.workload == "point") {
@@ -113,6 +187,23 @@ int main(int argc, char** argv) {
             source =
                 "slay category, stack(score) no-cap users "
                 "only-if active = 1 vibe-check category;";
+        } else if (options.workload == "prompt") {
+            source =
+                "spill-context bench_convo vibe-tab 'dog' "
+                "only-if 'pet preferences' token-budget 512 receipts on;";
+        } else if (options.workload == "context_schema") {
+            source = "show-context-schemas;";
+        } else if (options.workload == "context_spill") {
+            source =
+                "spill-context bench_convo vibe-tab 'dog' "
+                "only-if 'pet preferences' token-budget 512 receipts on;";
+        } else if (options.workload == "context_spill_acl") {
+            source =
+                "spill-context bench_convo "
+                "only-if 'constraints password policy' "
+                "token-budget 512 receipts on;";
+        } else if (options.workload == "context_objects") {
+            source = "show-context-objects bench_convo;";
         } else {
             throw std::runtime_error(
                 "Unknown workload: " + options.workload);
@@ -154,6 +245,8 @@ int main(int argc, char** argv) {
                   << "\"ops_per_sec\":"
                   << options.iterations * 1000.0 / elapsedMs << ","
                   << "\"resident_pages\":" << stats.residentPages << ","
+                  << "\"estimated_memory_bytes\":"
+                  << stats.estimatedMemoryBytes << ","
                   << "\"buffer_capacity_pages\":"
                   << stats.bufferCapacityPages << ","
                   << "\"buffer_page_reads\":"
@@ -172,8 +265,20 @@ int main(int argc, char** argv) {
                   << stats.skippedColumns << ","
                   << "\"vector_nulls\":"
                   << stats.vectorNulls << ","
+                  << "\"raw_point_queries\":"
+                  << stats.rawPointQueries << ","
+                  << "\"raw_point_hits\":"
+                  << stats.rawPointHits << ","
                   << "\"direct_aggregate_queries\":"
                   << stats.directAggregateQueries << ","
+                  << "\"value_count_queries\":"
+                  << stats.valueCountQueries << ","
+                  << "\"value_count_rows_answered\":"
+                  << stats.valueCountRowsAnswered << ","
+                  << "\"dense_group_aggregate_queries\":"
+                  << stats.denseGroupAggregateQueries << ","
+                  << "\"dense_group_aggregate_rows\":"
+                  << stats.denseGroupAggregateRows << ","
                   << "\"raw_rows_scanned\":"
                   << stats.rawRowsScanned << ","
                   << "\"row_copies_avoided\":"
@@ -222,6 +327,22 @@ int main(int argc, char** argv) {
                   << stats.bloomFilterChecks << ","
                   << "\"bloom_filter_rejects\":"
                   << stats.bloomFilterRejects << ","
+                  << "\"context_schema_queries\":"
+                  << stats.contextSchemaQueries << ","
+                  << "\"context_spill_queries\":"
+                  << stats.contextSpillQueries << ","
+                  << "\"context_object_queries\":"
+                  << stats.contextObjectQueries << ","
+                  << "\"context_cache_hits\":"
+                  << stats.contextCacheHits << ","
+                  << "\"context_cache_misses\":"
+                  << stats.contextCacheMisses << ","
+                  << "\"context_atoms_scored\":"
+                  << stats.contextAtomsScored << ","
+                  << "\"context_atoms_rendered\":"
+                  << stats.contextAtomsRendered << ","
+                  << "\"context_atoms_redacted\":"
+                  << stats.contextAtomsRedacted << ","
                   << "\"checksum\":" << checksum
                   << "}\n";
 

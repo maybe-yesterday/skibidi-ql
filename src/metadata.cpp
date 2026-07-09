@@ -34,6 +34,16 @@ std::string escapeJson(const std::string& value) {
     return out;
 }
 
+void writeJsonStringArray(std::ostream& out,
+                          const std::vector<std::string>& values) {
+    out << "[";
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index > 0) out << ", ";
+        out << "\"" << escapeJson(values[index]) << "\"";
+    }
+    out << "]";
+}
+
 struct CatalogData {
     std::unordered_map<std::string, TableMeta> tables;
     std::unordered_map<std::string, DatasetSnapshotMeta> snapshots;
@@ -392,6 +402,9 @@ private:
             expect(':');
             if (key == "messages") context.messages = parseMessages();
             else if (key == "atoms") context.atoms = parseAtoms();
+            else if (key == "tab_aliases") {
+                context.tabAliases = parseTabAliases();
+            }
             else skipValue();
         } while (consume(','));
 
@@ -415,11 +428,30 @@ private:
                     else if (key == "speaker") message.speaker = parseString();
                     else if (key == "text") message.text = parseString();
                     else if (key == "tab") message.tab = parseString();
+                    else if (key == "schema_name") {
+                        message.schemaName = parseString();
+                    } else if (key == "schema_version") {
+                        message.schemaVersion = parseString();
+                    } else if (key == "storage_route") {
+                        message.storageRoute = parseString();
+                    } else if (key == "access_labels") {
+                        message.accessLabels = parseStringArray();
+                    } else if (key == "mentioned_entities") {
+                        message.mentionedEntities = parseStringArray();
+                    }
                     else skipValue();
                 } while (consume(','));
                 expect('}');
             }
             if (message.tab.empty()) message.tab = "main";
+            if (message.schemaName.empty()) {
+                message.schemaName = "ConversationMessage";
+            }
+            if (message.schemaVersion.empty()) message.schemaVersion = "v1";
+            if (message.storageRoute.empty()) {
+                message.storageRoute =
+                    "structured=catalog.contexts.messages; vector=ConversationMessage.content; blob=none";
+            }
             result.push_back(std::move(message));
         } while (consume(','));
 
@@ -448,12 +480,47 @@ private:
                         atom.invalidatedBy = parseString();
                     } else if (key == "tab") {
                         atom.tab = parseString();
+                    } else if (key == "schema_name") {
+                        atom.schemaName = parseString();
+                    } else if (key == "schema_version") {
+                        atom.schemaVersion = parseString();
+                    } else if (key == "access_labels") {
+                        atom.accessLabels = parseStringArray();
                     } else skipValue();
                 } while (consume(','));
                 expect('}');
             }
             if (atom.tab.empty()) atom.tab = "main";
+            if (atom.schemaName.empty()) atom.schemaName = "ContextAtom";
+            if (atom.schemaVersion.empty()) atom.schemaVersion = "v1";
             result.push_back(std::move(atom));
+        } while (consume(','));
+
+        expect(']');
+        return result;
+    }
+
+    std::vector<ContextTabAliasMeta> parseTabAliases() {
+        std::vector<ContextTabAliasMeta> result;
+        expect('[');
+        if (consume(']')) return result;
+
+        do {
+            ContextTabAliasMeta alias;
+            expect('{');
+            if (!consume('}')) {
+                do {
+                    const std::string key = parseString();
+                    expect(':');
+                    if (key == "alias") alias.alias = parseString();
+                    else if (key == "target") alias.target = parseString();
+                    else skipValue();
+                } while (consume(','));
+                expect('}');
+            }
+            if (!alias.alias.empty() && !alias.target.empty()) {
+                result.push_back(std::move(alias));
+            }
         } while (consume(','));
 
         expect(']');
@@ -508,6 +575,81 @@ private:
 };
 
 } // namespace
+
+std::vector<ContextSchemaMeta> Catalog::contextSchemas() const {
+    return {
+        ContextSchemaMeta{
+            "ConversationMessage",
+            "v1",
+            "system",
+            "agent-internal",
+            "conversation-lifetime",
+            "structured+vector",
+            "embed content for semantic filtering; keep metadata structured",
+            {"content"},
+            {"AGENT_INTERNAL"},
+            {"conversation_id", "sender_id", "sender_type", "timestamp",
+             "tab", "mentioned_entities", "access_labels",
+             "schema_name", "storage_route"},
+            {"ContextAtom", "TaskState", "ToolInvocationLog"},
+        },
+        ContextSchemaMeta{
+            "ContextAtom",
+            "v1",
+            "system",
+            "agent-internal",
+            "conversation-lifetime",
+            "structured",
+            "not vectorized; derived from source message content",
+            {},
+            {"AGENT_INTERNAL"},
+            {"key", "type", "status", "tab", "source",
+             "invalidated_by", "access_labels", "schema_name"},
+            {"ConversationMessage"},
+        },
+        ContextSchemaMeta{
+            "TaskState",
+            "v1",
+            "system",
+            "agent-internal",
+            "task-lifetime",
+            "structured",
+            "description may be embedded when semantic task lookup lands",
+            {"description"},
+            {"AGENT_INTERNAL"},
+            {"task_id", "status", "assigned_agent_id",
+             "last_update_timestamp"},
+            {"ConversationMessage", "ToolInvocationLog"},
+        },
+        ContextSchemaMeta{
+            "ToolInvocationLog",
+            "v1",
+            "system",
+            "agent-internal",
+            "audit-lifetime",
+            "structured+blob",
+            "large tool payloads stay as blob refs; summaries can be embedded",
+            {"summary"},
+            {"AGENT_INTERNAL", "TOOL_TRACE"},
+            {"tool_id", "conversation_id", "message_id", "status",
+             "timestamp"},
+            {"ConversationMessage", "TaskState"},
+        },
+        ContextSchemaMeta{
+            "UserProfile",
+            "v1",
+            "system",
+            "confidential",
+            "user-lifetime",
+            "structured",
+            "selected preference text can be embedded after policy check",
+            {"preferences"},
+            {"CONFIDENTIAL_CUSTOMER_DATA"},
+            {"user_id", "tenant_id", "access_labels"},
+            {"ConversationMessage"},
+        },
+    };
+}
 
 void Catalog::load() {
     std::ifstream file(filePath_);
@@ -657,7 +799,17 @@ void Catalog::save() {
                  << ", \"speaker\": \"" << escapeJson(message.speaker)
                  << "\", \"text\": \"" << escapeJson(message.text)
                  << "\", \"tab\": \"" << escapeJson(message.tab)
-                 << "\"}";
+                 << "\", \"schema_name\": \""
+                 << escapeJson(message.schemaName)
+                 << "\", \"schema_version\": \""
+                 << escapeJson(message.schemaVersion)
+                 << "\", \"storage_route\": \""
+                 << escapeJson(message.storageRoute)
+                 << "\", \"access_labels\": ";
+            writeJsonStringArray(file, message.accessLabels);
+            file << ", \"mentioned_entities\": ";
+            writeJsonStringArray(file, message.mentionedEntities);
+            file << "}";
         }
         if (!context.messages.empty()) file << "\n      ";
         file << "],\n"
@@ -675,9 +827,29 @@ void Catalog::save() {
                  << "\", \"source\": \"" << escapeJson(atom.source)
                  << "\", \"invalidated_by\": \""
                  << escapeJson(atom.invalidatedBy)
-                 << "\", \"tab\": \"" << escapeJson(atom.tab) << "\"}";
+                 << "\", \"tab\": \"" << escapeJson(atom.tab)
+                 << "\", \"schema_name\": \""
+                 << escapeJson(atom.schemaName)
+                 << "\", \"schema_version\": \""
+                 << escapeJson(atom.schemaVersion)
+                 << "\", \"access_labels\": ";
+            writeJsonStringArray(file, atom.accessLabels);
+            file << "}";
         }
         if (!context.atoms.empty()) file << "\n      ";
+        file << "],\n"
+             << "      \"tab_aliases\": [";
+
+        for (std::size_t aliasIndex = 0;
+             aliasIndex < context.tabAliases.size();
+             ++aliasIndex) {
+            const auto& alias = context.tabAliases[aliasIndex];
+            file << (aliasIndex == 0 ? "\n" : ",\n")
+                 << "        {\"alias\": \"" << escapeJson(alias.alias)
+                 << "\", \"target\": \"" << escapeJson(alias.target)
+                 << "\"}";
+        }
+        if (!context.tabAliases.empty()) file << "\n      ";
         file << "]\n"
              << "    }";
     }
@@ -869,6 +1041,10 @@ void Catalog::recomputeFingerprint() {
             append(atom.source);
             append(atom.invalidatedBy);
             append(atom.tab);
+        }
+        for (const auto& alias : context.tabAliases) {
+            append(alias.alias);
+            append(alias.target);
         }
     }
     schemaFingerprint_ = hash;

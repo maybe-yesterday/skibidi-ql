@@ -50,6 +50,11 @@ std::string CodeGen::generate(const ASTNode* node) {
     if (auto* s = dynamic_cast<const AppendMemoryStmt*>(node)) return genAppendMemory(s);
     if (auto* s = dynamic_cast<const SpillContextStmt*>(node)) return genSpillContext(s);
     if (auto* s = dynamic_cast<const TagMemoryStmt*>(node)) return genTagMemory(s);
+    if (auto* s = dynamic_cast<const ShowTabsStmt*>(node)) return genShowTabs(s);
+    if (auto* s = dynamic_cast<const ShowContextSchemasStmt*>(node)) return genShowContextSchemas(s);
+    if (auto* s = dynamic_cast<const ShowContextObjectsStmt*>(node)) return genShowContextObjects(s);
+    if (auto* s = dynamic_cast<const AliasTabStmt*>(node)) return genAliasTab(s);
+    if (auto* s = dynamic_cast<const MergeTabsStmt*>(node)) return genMergeTabs(s);
 
     throw std::runtime_error("CodeGen: Unknown top-level node type");
 }
@@ -404,6 +409,7 @@ std::string CodeGen::genAppendMemory(const AppendMemoryStmt* s) {
     out << "-- yeet-memory " << s->context
         << " message " << s->messageId
         << " speaker " << quoteString(s->speaker);
+    if (s->autoTab) out << " vibe-tab auto";
     if (!s->tab.empty()) out << " vibe-tab " << quoteString(s->tab);
     return out.str();
 }
@@ -422,6 +428,36 @@ std::string CodeGen::genTagMemory(const TagMemoryStmt* s) {
     out << "-- vibe-tab " << s->context
         << " message " << s->messageId
         << " " << quoteString(s->tab);
+    return out.str();
+}
+
+std::string CodeGen::genShowTabs(const ShowTabsStmt* s) {
+    return "-- show-tabs " + s->context;
+}
+
+std::string CodeGen::genShowContextSchemas(
+    const ShowContextSchemasStmt*) {
+    return "-- show-context-schemas";
+}
+
+std::string CodeGen::genShowContextObjects(
+    const ShowContextObjectsStmt* s) {
+    return "-- show-context-objects " + s->context;
+}
+
+std::string CodeGen::genAliasTab(const AliasTabStmt* s) {
+    std::ostringstream out;
+    out << "-- alias-tab " << s->context
+        << " " << quoteString(s->alias)
+        << " to " << quoteString(s->target);
+    return out.str();
+}
+
+std::string CodeGen::genMergeTabs(const MergeTabsStmt* s) {
+    std::ostringstream out;
+    out << "-- merge-tabs " << s->context
+        << " " << quoteString(s->fromTab)
+        << " into " << quoteString(s->toTab);
     return out.str();
 }
 
