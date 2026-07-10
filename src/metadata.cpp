@@ -438,6 +438,10 @@ private:
                         message.accessLabels = parseStringArray();
                     } else if (key == "mentioned_entities") {
                         message.mentionedEntities = parseStringArray();
+                    } else if (key == "tags") {
+                        message.tags = parseStringArray();
+                    } else if (key == "tag_reasons") {
+                        message.tagReasons = parseStringArray();
                     }
                     else skipValue();
                 } while (consume(','));
@@ -486,6 +490,18 @@ private:
                         atom.schemaVersion = parseString();
                     } else if (key == "access_labels") {
                         atom.accessLabels = parseStringArray();
+                    } else if (key == "tags") {
+                        atom.tags = parseStringArray();
+                    } else if (key == "extractor_rule") {
+                        atom.extractorRule = parseString();
+                    } else if (key == "extractor_confidence") {
+                        atom.extractorConfidence = parseString();
+                    } else if (key == "source_start") {
+                        atom.sourceStart = parseUnsigned();
+                    } else if (key == "source_end") {
+                        atom.sourceEnd = parseUnsigned();
+                    } else if (key == "original_snippet") {
+                        atom.originalSnippet = parseString();
                     } else skipValue();
                 } while (consume(','));
                 expect('}');
@@ -493,6 +509,9 @@ private:
             if (atom.tab.empty()) atom.tab = "main";
             if (atom.schemaName.empty()) atom.schemaName = "ContextAtom";
             if (atom.schemaVersion.empty()) atom.schemaVersion = "v1";
+            if (atom.extractorConfidence.empty()) {
+                atom.extractorConfidence = "1.00";
+            }
             result.push_back(std::move(atom));
         } while (consume(','));
 
@@ -809,6 +828,10 @@ void Catalog::save() {
             writeJsonStringArray(file, message.accessLabels);
             file << ", \"mentioned_entities\": ";
             writeJsonStringArray(file, message.mentionedEntities);
+            file << ", \"tags\": ";
+            writeJsonStringArray(file, message.tags);
+            file << ", \"tag_reasons\": ";
+            writeJsonStringArray(file, message.tagReasons);
             file << "}";
         }
         if (!context.messages.empty()) file << "\n      ";
@@ -834,6 +857,17 @@ void Catalog::save() {
                  << escapeJson(atom.schemaVersion)
                  << "\", \"access_labels\": ";
             writeJsonStringArray(file, atom.accessLabels);
+            file << ", \"tags\": ";
+            writeJsonStringArray(file, atom.tags);
+            file << ", \"extractor_rule\": \""
+                 << escapeJson(atom.extractorRule)
+                 << "\", \"extractor_confidence\": \""
+                 << escapeJson(atom.extractorConfidence)
+                 << "\", \"source_start\": " << atom.sourceStart
+                 << ", \"source_end\": " << atom.sourceEnd
+                 << ", \"original_snippet\": \""
+                 << escapeJson(atom.originalSnippet)
+                 << "\"";
             file << "}";
         }
         if (!context.atoms.empty()) file << "\n      ";
@@ -1027,6 +1061,8 @@ void Catalog::recomputeFingerprint() {
             append(message.speaker);
             append(message.text);
             append(message.tab);
+            for (const auto& tag : message.tags) append(tag);
+            for (const auto& reason : message.tagReasons) append(reason);
         }
         for (const auto& atom : context.atoms) {
             append(atom.key);
@@ -1036,6 +1072,12 @@ void Catalog::recomputeFingerprint() {
             append(atom.source);
             append(atom.invalidatedBy);
             append(atom.tab);
+            for (const auto& tag : atom.tags) append(tag);
+            append(atom.extractorRule);
+            append(atom.extractorConfidence);
+            append(std::to_string(atom.sourceStart));
+            append(std::to_string(atom.sourceEnd));
+            append(atom.originalSnippet);
         }
         for (const auto& alias : context.tabAliases) {
             append(alias.alias);

@@ -40,6 +40,7 @@ skibidi
 *.heap
 .skibidi_db/
 .skibidi_agent_ctx/
+.mem0/
 .skibidi_catalog.json
 *_db/
 

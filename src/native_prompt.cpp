@@ -53,7 +53,7 @@ std::string trimText(const std::string& value) {
 std::string cleanAtomValue(std::string value) {
     value = trimText(value);
     const auto lower = lowerText(value);
-    for (const char* stop : {" but ", " and ", " because "}) {
+    for (const char* stop : {" but ", " because "}) {
         const auto pos = lower.find(stop);
         if (pos != std::string::npos) {
             value = value.substr(0, pos);
@@ -77,12 +77,54 @@ void addUnique(std::vector<std::string>& values,
     }
 }
 
+void removeValue(std::vector<std::string>& values,
+                 const std::string& value) {
+    values.erase(std::remove(values.begin(), values.end(), value),
+                 values.end());
+}
+
 bool containsAny(const std::string& lower,
                  const std::vector<std::string>& needles) {
     for (const auto& needle : needles) {
         if (lower.find(needle) != std::string::npos) return true;
     }
     return false;
+}
+
+bool isWordChar(char ch) {
+    return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+}
+
+bool containsWord(const std::string& lower, const std::string& word) {
+    std::size_t pos = lower.find(word);
+    while (pos != std::string::npos) {
+        const bool leftOk = pos == 0 || !isWordChar(lower[pos - 1]);
+        const std::size_t end = pos + word.size();
+        const bool rightOk = end >= lower.size() || !isWordChar(lower[end]);
+        if (leftOk && rightOk) return true;
+        pos = lower.find(word, pos + 1);
+    }
+    return false;
+}
+
+std::vector<std::string> tokenizeLower(const std::string& text) {
+    std::vector<std::string> tokens;
+    std::string token;
+    auto flush = [&]() {
+        if (!token.empty()) {
+            tokens.push_back(token);
+            token.clear();
+        }
+    };
+    for (unsigned char ch : lowerText(text)) {
+        if (std::isalnum(ch)) {
+            token.push_back(static_cast<char>(ch));
+        } else {
+            flush();
+        }
+    }
+    flush();
+    return tokens;
 }
 
 bool isQueryStopword(const std::string& token) {
@@ -119,8 +161,10 @@ std::vector<std::string> inferAccessLabels(const std::string& text) {
     std::vector<std::string> labels;
     labels.push_back("AGENT_INTERNAL");
     if (containsAny(lower, {
-            "password", "secret", "api key", "token", "ssn",
-            "social security", "credit card", "confidential",
+            "password", "secret", "api key", "api token",
+            "access token", "auth token", "bearer token",
+            "refresh token", "session token", "credential token",
+            "ssn", "social security", "credit card", "confidential",
             "private key"})) {
         labels.push_back("CONFIDENTIAL_CUSTOMER_DATA");
     }
@@ -133,7 +177,9 @@ std::vector<std::string> inferAccessLabels(const std::string& text) {
 std::vector<std::string> inferMentionedEntities(const std::string& text) {
     const auto lower = lowerText(text);
     std::vector<std::string> entities;
-    if (containsAny(lower, {"dog", "puppy", "pet"})) {
+    if (containsWord(lower, "dog") ||
+        containsWord(lower, "puppy") ||
+        containsWord(lower, "pet")) {
         addUnique(entities, "dog");
     }
     if (containsAny(lower, {"sqlite", "sql", "b-tree", "btree"})) {
@@ -152,6 +198,131 @@ std::vector<std::string> inferMentionedEntities(const std::string& text) {
         addUnique(entities, "ml-dataset");
     }
     return entities;
+}
+
+std::string normalizedTab(const std::string& tab);
+
+struct TagSuggestion {
+    std::string tag;
+    int score = 0;
+    std::string reason;
+};
+
+void addTagSuggestion(std::vector<TagSuggestion>& suggestions,
+                      std::string tag,
+                      int score,
+                      std::string reason) {
+    tag = normalizedTab(std::move(tag));
+    for (auto& existing : suggestions) {
+        if (existing.tag == tag) {
+            if (score > existing.score) existing.score = score;
+            if (!reason.empty() &&
+                existing.reason.find(reason) == std::string::npos) {
+                if (!existing.reason.empty()) existing.reason += "+";
+                existing.reason += reason;
+            }
+            return;
+        }
+    }
+    suggestions.push_back(TagSuggestion{std::move(tag), score,
+                                        std::move(reason)});
+}
+
+std::vector<TagSuggestion> inferContextTagSuggestions(
+    const std::string& text) {
+    const auto lower = lowerText(text);
+    std::vector<TagSuggestion> suggestions;
+
+    if (containsWord(lower, "dog") ||
+        containsWord(lower, "puppy") ||
+        containsWord(lower, "pet")) {
+        addTagSuggestion(suggestions, "convo about dog", 90,
+                         "matched pet/dog term");
+    }
+    if (containsAny(lower, {"sqlite", "b-tree", "btree"}) ||
+        containsWord(lower, "sql") || containsWord(lower, "join")) {
+        addTagSuggestion(suggestions, "debugging sqlite perf", 85,
+                         "matched sql/sqlite/join term");
+    }
+    if (containsAny(lower, {"benchmark", "recall", "avg tokens",
+                            "average tokens"})) {
+        addTagSuggestion(suggestions, "benchmarks", 82,
+                         "matched benchmark metric term");
+    }
+    if (containsAny(lower, {"mem0", "rag", "recency-window"})) {
+        addTagSuggestion(suggestions, "memory baselines", 80,
+                         "matched memory baseline term");
+    }
+    if (containsAny(lower, {"agent", "context pack", "current_context",
+                            "dogfood", "helper"})) {
+        addTagSuggestion(suggestions, "agent integration", 78,
+                         "matched agent/context term");
+    }
+    if (containsAny(lower, {"roadmap", "next step", "project"})) {
+        addTagSuggestion(suggestions, "project roadmap", 76,
+                         "matched project planning term");
+    }
+    if (containsAny(lower, {"readme", "docs", "documentation"})) {
+        addTagSuggestion(suggestions, "docs", 74,
+                         "matched docs/readme term");
+    }
+    if (containsAny(lower, {"debug this later", "investigate",
+                            "look into"})) {
+        addTagSuggestion(suggestions, "debug this later", 95,
+                         "matched follow-up marker");
+    }
+    if (lower.find("?") != std::string::npos) {
+        addTagSuggestion(suggestions, "open questions", 92,
+                         "contains question mark");
+    }
+    if (containsAny(lower, {"remember that", "always ", "never ",
+                            "don't ", "do not "})) {
+        addTagSuggestion(suggestions, "constraints", 88,
+                         "matched constraint marker");
+    }
+    if (containsAny(lower, {"i like ", "i prefer "})) {
+        addTagSuggestion(suggestions, "preferences", 86,
+                         "matched preference marker");
+    }
+    if (containsAny(lower, {"i need ", "i want ", "todo"})) {
+        addTagSuggestion(suggestions, "current tasks", 89,
+                         "matched task marker");
+    }
+
+    if (suggestions.empty()) {
+        addTagSuggestion(suggestions, "main", 1, "fallback");
+    }
+    std::stable_sort(suggestions.begin(), suggestions.end(),
+                     [](const TagSuggestion& left,
+                        const TagSuggestion& right) {
+                         return left.score > right.score;
+                     });
+    return suggestions;
+}
+
+std::vector<std::string> tagsFromSuggestions(
+    const std::vector<TagSuggestion>& suggestions) {
+    std::vector<std::string> tags;
+    for (const auto& suggestion : suggestions) {
+        addUnique(tags, suggestion.tag);
+    }
+    return tags;
+}
+
+std::vector<std::string> reasonsFromSuggestions(
+    const std::vector<TagSuggestion>& suggestions) {
+    std::vector<std::string> reasons;
+    for (const auto& suggestion : suggestions) {
+        addUnique(reasons, suggestion.tag + ":" +
+                  std::to_string(suggestion.score) + ":" +
+                  suggestion.reason);
+    }
+    return reasons;
+}
+
+std::string suggestionSummary(const TagSuggestion& suggestion) {
+    return suggestion.tag + " score=" + std::to_string(suggestion.score) +
+           " reason=" + suggestion.reason;
 }
 
 bool hasAccessLabel(const std::vector<std::string>& labels,
@@ -174,19 +345,98 @@ std::string redactIfNeeded(const std::string& value,
     return "[redacted:CONFIDENTIAL_CUSTOMER_DATA]";
 }
 
-std::optional<std::string> extractAfterMarker(const std::string& text,
-                                              const std::string& marker) {
+struct ExtractedValue {
+    std::string value;
+    std::uint64_t sourceStart = 0;
+    std::uint64_t sourceEnd = 0;
+    std::string originalSnippet;
+};
+
+std::optional<ExtractedValue> extractAfterMarker(const std::string& text,
+                                                 const std::string& marker) {
     const auto lower = lowerText(text);
     const auto pos = lower.find(marker);
     if (pos == std::string::npos) return std::nullopt;
-    auto value = text.substr(pos + marker.size());
-    const auto punctuation = value.find_first_of(".!?;\n\r");
-    if (punctuation != std::string::npos) {
-        value = value.substr(0, punctuation);
+    const std::size_t start = pos + marker.size();
+    auto value = text.substr(start);
+    std::size_t boundary = std::string::npos;
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        const char ch = value[index];
+        if (ch == '\n' || ch == '\r' || ch == '!' ||
+            ch == '?' || ch == ';') {
+            boundary = index;
+            break;
+        }
+        if (ch == '.') {
+            const bool decimalPoint =
+                index > 0 && index + 1 < value.size() &&
+                std::isdigit(static_cast<unsigned char>(value[index - 1])) &&
+                std::isdigit(static_cast<unsigned char>(value[index + 1]));
+            const bool sentencePeriod =
+                index + 1 == value.size() ||
+                std::isspace(static_cast<unsigned char>(value[index + 1]));
+            if (!decimalPoint && sentencePeriod) {
+                boundary = index;
+                break;
+            }
+        }
     }
+    if (boundary != std::string::npos) {
+        value = value.substr(0, boundary);
+    }
+    const auto originalSnippet = trimText(value);
     value = cleanAtomValue(value);
     if (value.empty()) return std::nullopt;
-    return value;
+    ExtractedValue extracted;
+    extracted.value = std::move(value);
+    extracted.sourceStart = static_cast<std::uint64_t>(start);
+    extracted.sourceEnd = static_cast<std::uint64_t>(
+        start + (boundary == std::string::npos
+                     ? originalSnippet.size()
+                     : boundary));
+    extracted.originalSnippet = originalSnippet;
+    return extracted;
+}
+
+bool isAtomSlugStopword(const std::string& token) {
+    static const std::unordered_set<std::string> stopwords = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "for",
+        "from", "in", "inside", "is", "it", "of", "on", "or",
+        "should", "that", "the", "this", "to", "use", "using",
+        "we", "with", "also", "says", "measured"};
+    return stopwords.find(token) != stopwords.end();
+}
+
+std::string atomTopicSlug(const std::string& value) {
+    std::string slug;
+    std::size_t kept = 0;
+    for (const auto& token : tokenizeLower(value)) {
+        if (token.size() < 3 || isAtomSlugStopword(token)) continue;
+        if (!slug.empty()) slug += "_";
+        slug += token;
+        if (++kept == 4) break;
+    }
+    return slug.empty() ? "general" : slug;
+}
+
+std::string specificAtomKey(const std::string& base,
+                            const std::string& value) {
+    const auto lower = lowerText(value);
+    if (base == "user_constraint" &&
+        containsAny(lower, {"password", "secret", "api key",
+                            "api token", "access token",
+                            "bearer token", "private key",
+                            "credit card", "ssn"})) {
+        return "user_constraint.security";
+    }
+    if (base == "decision" ||
+        base == "open_question" ||
+        base == "debug_followup" ||
+        base == "current_task" ||
+        base == "user_constraint") {
+        return base + "." + atomTopicSlug(value);
+    }
+    return base;
 }
 
 std::string normalizedTab(const std::string& tab) {
@@ -195,53 +445,7 @@ std::string normalizedTab(const std::string& tab) {
 }
 
 std::string suggestContextTab(const std::string& text) {
-    const auto lower = lowerText(text);
-    if (lower.find("dog") != std::string::npos ||
-        lower.find("puppy") != std::string::npos ||
-        lower.find("pet") != std::string::npos) {
-        return "convo about dog";
-    }
-    if (lower.find("sqlite") != std::string::npos ||
-        lower.find("sql") != std::string::npos ||
-        lower.find("benchmark") != std::string::npos ||
-        lower.find("perf") != std::string::npos ||
-        lower.find("slow") != std::string::npos ||
-        lower.find("join") != std::string::npos ||
-        lower.find("b-tree") != std::string::npos ||
-        lower.find("btree") != std::string::npos) {
-        return "debugging sqlite perf";
-    }
-    if (lower.find("roadmap") != std::string::npos ||
-        lower.find("next step") != std::string::npos ||
-        lower.find("project") != std::string::npos ||
-        lower.find("readme") != std::string::npos) {
-        return "project roadmap";
-    }
-    if (lower.find("debug this later") != std::string::npos ||
-        lower.find("investigate") != std::string::npos ||
-        lower.find("look into") != std::string::npos) {
-        return "debug this later";
-    }
-    if (lower.find("?") != std::string::npos) {
-        return "open questions";
-    }
-    if (lower.find("remember that") != std::string::npos ||
-        lower.find("always ") != std::string::npos ||
-        lower.find("never ") != std::string::npos ||
-        lower.find("don't ") != std::string::npos ||
-        lower.find("do not ") != std::string::npos) {
-        return "constraints";
-    }
-    if (lower.find("i like ") != std::string::npos ||
-        lower.find("i prefer ") != std::string::npos) {
-        return "preferences";
-    }
-    if (lower.find("i need ") != std::string::npos ||
-        lower.find("i want ") != std::string::npos ||
-        lower.find("todo") != std::string::npos) {
-        return "current tasks";
-    }
-    return "main";
+    return inferContextTagSuggestions(text).front().tag;
 }
 
 std::vector<ContextAtomMeta> extractContextAtoms(
@@ -250,16 +454,23 @@ std::vector<ContextAtomMeta> extractContextAtoms(
     const std::string source =
         "message_" + std::to_string(statement.messageId);
     auto add = [&](std::string key,
-                   std::string value,
-                   std::string type) {
-        if (value.empty()) return;
+                   const ExtractedValue& extracted,
+                   std::string type,
+                   std::string extractorRule,
+                   std::string confidence = "0.92") {
+        if (extracted.value.empty()) return;
         ContextAtomMeta atom;
-        atom.key = std::move(key);
-        atom.value = std::move(value);
+        atom.key = specificAtomKey(key, extracted.value);
+        atom.value = extracted.value;
         atom.type = std::move(type);
         atom.status = "active";
         atom.source = source;
         atom.tab = normalizedTab(statement.tab);
+        atom.extractorRule = std::move(extractorRule);
+        atom.extractorConfidence = std::move(confidence);
+        atom.sourceStart = extracted.sourceStart;
+        atom.sourceEnd = extracted.sourceEnd;
+        atom.originalSnippet = extracted.originalSnippet;
         atoms.push_back(std::move(atom));
     };
 
@@ -267,66 +478,90 @@ std::vector<ContextAtomMeta> extractContextAtoms(
              "i live in ", "i moved to ", "moved to ",
              "i am in ", "i'm in ", "my location is ",
              "i live near "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("user_location", *value, "fact");
+        if (auto extracted = extractAfterMarker(statement.text, marker)) {
+            add("user_location", *extracted, "fact",
+                std::string("marker:") + marker);
             break;
         }
     }
     for (const char* marker : {"i prefer ", "i like "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("user_preference", *value, "preference");
+        if (auto extracted = extractAfterMarker(statement.text, marker)) {
+            add("user_preference", *extracted, "preference",
+                std::string("marker:") + marker);
             break;
         }
     }
     for (const char* marker : {
              "my dog likes ", "my dog loves ", "my dog prefers "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("dog_preference", *value, "preference");
+        if (auto extracted = extractAfterMarker(statement.text, marker)) {
+            add("dog_preference", *extracted, "preference",
+                std::string("marker:") + marker);
             break;
         }
     }
     for (const char* marker : {
              "my dog is named ", "my dog's name is "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("dog_name", *value, "fact");
+        if (auto extracted = extractAfterMarker(statement.text, marker)) {
+            add("dog_name", *extracted, "fact",
+                std::string("marker:") + marker);
             break;
         }
     }
-    if (auto value = extractAfterMarker(statement.text, "remember that ")) {
-        add("user_constraint", *value, "constraint");
+    if (auto extracted = extractAfterMarker(statement.text,
+                                           "remember that ")) {
+        add("user_constraint", *extracted, "constraint",
+            "marker:remember that");
     }
     for (const char* marker : {
              "always ", "never ", "do not ", "don't "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("user_constraint", std::string(marker) + *value,
-                "constraint");
+        if (auto extracted = extractAfterMarker(statement.text, marker)) {
+            ExtractedValue constraint = *extracted;
+            constraint.value = cleanAtomValue(std::string(marker) +
+                                              extracted->value);
+            constraint.originalSnippet =
+                cleanAtomValue(std::string(marker) +
+                               extracted->originalSnippet);
+            add("user_constraint", constraint, "constraint",
+                std::string("marker:") + marker);
             break;
         }
     }
     for (const char* marker : {"i need ", "i want "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("current_task", *value, "task");
+        if (auto extracted = extractAfterMarker(statement.text, marker)) {
+            add("current_task", *extracted, "task",
+                std::string("marker:") + marker);
             break;
         }
     }
     for (const char* marker : {
              "todo: ", "todo ", "debug this later: ",
              "investigate ", "look into "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("debug_followup", *value, "debug");
+        if (auto extracted = extractAfterMarker(statement.text, marker)) {
+            add("debug_followup", *extracted, "debug",
+                std::string("marker:") + marker);
             break;
         }
     }
     for (const char* marker : {
              "we decided ", "decision: ", "final call: "}) {
-        if (auto value = extractAfterMarker(statement.text, marker)) {
-            add("decision", *value, "decision");
+        if (auto extracted = extractAfterMarker(statement.text, marker)) {
+            add("decision", *extracted, "decision",
+                std::string("marker:") + marker);
             break;
         }
     }
     if (statement.text.find('?') != std::string::npos) {
         const auto question = cleanAtomValue(statement.text);
-        if (!question.empty()) add("open_question", question, "question");
+        if (!question.empty()) {
+            ExtractedValue extracted;
+            extracted.value = question;
+            extracted.sourceStart = 0;
+            extracted.sourceEnd =
+                static_cast<std::uint64_t>(statement.text.size());
+            extracted.originalSnippet = statement.text;
+            add("open_question", extracted, "question",
+                "punctuation:question_mark", "0.75");
+        }
     }
     return atoms;
 }
@@ -407,6 +642,19 @@ std::string renderContextAtom(const ContextAtomMeta& atom,
         if (!atom.accessLabels.empty()) {
             rendered += " labels=" + joinStrings(atom.accessLabels, ",");
         }
+        if (!atom.tags.empty()) {
+            rendered += " tags=" + joinStrings(atom.tags, ",");
+        }
+        if (!atom.extractorRule.empty()) {
+            rendered += " rule=" + atom.extractorRule;
+        }
+        if (!atom.extractorConfidence.empty()) {
+            rendered += " confidence=" + atom.extractorConfidence;
+        }
+        if (atom.sourceEnd > atom.sourceStart) {
+            rendered += " span=" + std::to_string(atom.sourceStart) +
+                        ":" + std::to_string(atom.sourceEnd);
+        }
     }
     return rendered;
 }
@@ -433,6 +681,18 @@ std::string resolveContextTab(const ConversationContextMeta& context,
         if (!changed) return current;
     }
     return current;
+}
+
+bool contextMatchesTab(const ConversationContextMeta& context,
+                       const std::string& primaryTab,
+                       const std::vector<std::string>& tags,
+                       const std::string& tabFilter) {
+    if (tabFilter.empty()) return true;
+    if (resolveContextTab(context, primaryTab) == tabFilter) return true;
+    for (const auto& tag : tags) {
+        if (resolveContextTab(context, tag) == tabFilter) return true;
+    }
+    return false;
 }
 
 void setContextTabAlias(ConversationContextMeta& context,
@@ -469,6 +729,10 @@ std::vector<std::string> contextAliasesForTab(
 void recomputeContextAtomStatus(ConversationContextMeta& context) {
     for (auto& atom : context.atoms) {
         atom.tab = normalizedTab(atom.tab);
+        for (auto& tag : atom.tags) tag = normalizedTab(tag);
+        std::sort(atom.tags.begin(), atom.tags.end());
+        atom.tags.erase(std::unique(atom.tags.begin(), atom.tags.end()),
+                        atom.tags.end());
         atom.status = "active";
         atom.invalidatedBy.clear();
     }
@@ -530,7 +794,8 @@ NativeQueryResult NativeEngine::executeAppendMemory(
     message.id = statement.messageId;
     message.speaker = statement.speaker;
     message.text = statement.text;
-    const std::string suggestedTab = suggestContextTab(statement.text);
+    const auto tagSuggestions = inferContextTagSuggestions(statement.text);
+    const std::string suggestedTab = tagSuggestions.front().tag;
     const std::string requestedTab =
         statement.autoTab ? suggestedTab : statement.tab;
     message.tab = resolveContextTab(context, requestedTab);
@@ -540,6 +805,19 @@ NativeQueryResult NativeEngine::executeAppendMemory(
         "structured=catalog.contexts.messages; vector=ConversationMessage.content; blob=none";
     message.accessLabels = inferAccessLabels(statement.text);
     message.mentionedEntities = inferMentionedEntities(statement.text);
+    message.tags = tagsFromSuggestions(tagSuggestions);
+    addUnique(message.tags, message.tab);
+    for (auto& tag : message.tags) {
+        tag = resolveContextTab(context, tag);
+    }
+    std::sort(message.tags.begin(), message.tags.end());
+    message.tags.erase(std::unique(message.tags.begin(), message.tags.end()),
+                       message.tags.end());
+    message.tagReasons = reasonsFromSuggestions(tagSuggestions);
+    if (!statement.autoTab && !statement.tab.empty()) {
+        addUnique(message.tagReasons,
+                  message.tab + ":100:explicit vibe-tab");
+    }
     context.messages.push_back(message);
 
     AppendMemoryStmt extractionStatement = statement;
@@ -563,6 +841,7 @@ NativeQueryResult NativeEngine::executeAppendMemory(
         storedAtom.schemaName = "ContextAtom";
         storedAtom.schemaVersion = "v1";
         storedAtom.accessLabels = message.accessLabels;
+        storedAtom.tags = message.tags;
         context.atoms.push_back(std::move(storedAtom));
     }
 
@@ -577,7 +856,12 @@ NativeQueryResult NativeEngine::executeAppendMemory(
     addKeyValue(result, "speaker", statement.speaker);
     addKeyValue(result, "tab", message.tab);
     addKeyValue(result, "suggested_tab", suggestedTab);
+    addKeyValue(result, "suggested_tab_reason",
+                suggestionSummary(tagSuggestions.front()));
     addKeyValue(result, "auto_tab", statement.autoTab ? "true" : "false");
+    addKeyValue(result, "tags", joinStrings(message.tags, ","));
+    addKeyValue(result, "tag_reasons",
+                joinStrings(message.tagReasons, " | "));
     addKeyValue(result, "message_schema",
                 message.schemaName + "." + message.schemaVersion);
     addKeyValue(result, "access_labels",
@@ -594,6 +878,11 @@ NativeQueryResult NativeEngine::executeAppendMemory(
     for (const auto& atom : atoms) {
         addKeyValue(result, "atom",
                     atom.key + "=" + atom.value + " @" + atom.source);
+        addKeyValue(result, "atom_provenance",
+                    atom.key + " rule=" + atom.extractorRule +
+                    " confidence=" + atom.extractorConfidence +
+                    " span=" + std::to_string(atom.sourceStart) +
+                    ":" + std::to_string(atom.sourceEnd));
     }
     result.message = "yeeted memory into " + statement.context;
     return result;
@@ -611,9 +900,15 @@ NativeQueryResult NativeEngine::executeTagMemory(
     const std::string tab = resolveContextTab(context, statement.tab);
 
     bool found = false;
+    std::string previousTab;
     for (auto& message : context.messages) {
         if (message.id == statement.messageId) {
+            previousTab = resolveContextTab(context, message.tab);
             message.tab = tab;
+            removeValue(message.tags, previousTab);
+            addUnique(message.tags, tab);
+            addUnique(message.tagReasons,
+                      tab + ":100:manual retag");
             found = true;
             break;
         }
@@ -627,7 +922,11 @@ NativeQueryResult NativeEngine::executeTagMemory(
     std::size_t retaggedAtoms = 0;
     for (auto& atom : context.atoms) {
         if (atom.source == source) {
+            const std::string atomPreviousTab =
+                resolveContextTab(context, atom.tab);
             atom.tab = tab;
+            removeValue(atom.tags, atomPreviousTab);
+            addUnique(atom.tags, tab);
             ++retaggedAtoms;
         }
     }
@@ -661,6 +960,8 @@ NativeQueryResult NativeEngine::executeShowTabs(
         std::size_t invalidatedAtoms = 0;
         std::uint64_t lastMessage = 0;
         std::vector<std::string> accessLabels;
+        std::vector<std::string> tags;
+        std::vector<std::string> tagReasons;
     };
 
     std::map<std::string, TabStats> stats;
@@ -672,6 +973,12 @@ NativeQueryResult NativeEngine::executeShowTabs(
         for (const auto& label : message.accessLabels) {
             addUnique(entry.accessLabels, label);
         }
+        for (const auto& tag : message.tags) {
+            addUnique(entry.tags, resolveContextTab(*context, tag));
+        }
+        for (const auto& reason : message.tagReasons) {
+            addUnique(entry.tagReasons, reason);
+        }
     }
     for (const auto& atom : context->atoms) {
         const std::string tab = resolveContextTab(*context, atom.tab);
@@ -682,6 +989,9 @@ NativeQueryResult NativeEngine::executeShowTabs(
         for (const auto& label : atom.accessLabels) {
             addUnique(entry.accessLabels, label);
         }
+        for (const auto& tag : atom.tags) {
+            addUnique(entry.tags, resolveContextTab(*context, tag));
+        }
     }
     for (const auto& alias : context->tabAliases) {
         stats[resolveContextTab(*context, alias.target)];
@@ -691,7 +1001,7 @@ NativeQueryResult NativeEngine::executeShowTabs(
     NativeQueryResult result;
     result.columns = {"tab", "messages", "atoms", "active_atoms",
                       "invalidated_atoms", "last_message", "aliases",
-                      "access_labels"};
+                      "access_labels", "tags", "tag_reasons"};
     for (const auto& entry : stats) {
         const auto aliases =
             contextAliasesForTab(*context, entry.first);
@@ -705,7 +1015,9 @@ NativeQueryResult NativeEngine::executeShowTabs(
                       ? std::string{}
                       : std::to_string(entry.second.lastMessage)),
             Value(joinStrings(aliases, ",")),
-            Value(joinStrings(entry.second.accessLabels, ","))});
+            Value(joinStrings(entry.second.accessLabels, ",")),
+            Value(joinStrings(entry.second.tags, ",")),
+            Value(joinStrings(entry.second.tagReasons, " | "))});
     }
     result.message = "showed tabs for " + context->name;
     return result;
@@ -773,7 +1085,9 @@ NativeQueryResult NativeEngine::executeShowContextObjects(
     NativeQueryResult result;
     result.columns = {"object_id", "schema", "version", "tab", "status",
                       "access_labels", "storage_route", "source",
-                      "value"};
+                      "value", "tags", "extractor_rule",
+                      "extractor_confidence", "source_span",
+                      "original_snippet"};
 
     std::size_t redacted = 0;
     for (const auto& message : context->messages) {
@@ -795,7 +1109,12 @@ NativeQueryResult NativeEngine::executeShowContextObjects(
                       ? std::string("structured=catalog.contexts.messages; vector=ConversationMessage.content; blob=none")
                       : message.storageRoute),
             Value(std::string("")),
-            Value(redactIfNeeded(message.text, labels, &wasRedacted))});
+            Value(redactIfNeeded(message.text, labels, &wasRedacted)),
+            Value(joinStrings(message.tags, ",")),
+            Value(std::string("message")),
+            Value(std::string("1.00")),
+            Value(std::string("0:") + std::to_string(message.text.size())),
+            Value(redactIfNeeded(message.text, labels))});
         if (wasRedacted) ++redacted;
     }
 
@@ -820,7 +1139,16 @@ NativeQueryResult NativeEngine::executeShowContextObjects(
             Value(joinStrings(labels, ",")),
             Value(std::string("structured=catalog.contexts.atoms")),
             Value(atom.source),
-            Value(value)});
+            Value(value),
+            Value(joinStrings(atom.tags, ",")),
+            Value(atom.extractorRule),
+            Value(atom.extractorConfidence),
+            Value(std::to_string(atom.sourceStart) + ":" +
+                  std::to_string(atom.sourceEnd)),
+            Value(redactIfNeeded(atom.originalSnippet.empty()
+                                      ? atom.value
+                                      : atom.originalSnippet,
+                                  labels))});
         if (wasRedacted) ++redacted;
     }
 
@@ -873,12 +1201,30 @@ NativeQueryResult NativeEngine::executeMergeTabs(
                 message.tab = target;
                 ++movedMessages;
             }
+            for (auto& tag : message.tags) {
+                if (resolveContextTab(context, tag) == source) {
+                    tag = target;
+                }
+            }
+            std::sort(message.tags.begin(), message.tags.end());
+            message.tags.erase(std::unique(message.tags.begin(),
+                                           message.tags.end()),
+                               message.tags.end());
         }
         for (auto& atom : context.atoms) {
             if (resolveContextTab(context, atom.tab) == source) {
                 atom.tab = target;
                 ++movedAtoms;
             }
+            for (auto& tag : atom.tags) {
+                if (resolveContextTab(context, tag) == source) {
+                    tag = target;
+                }
+            }
+            std::sort(atom.tags.begin(), atom.tags.end());
+            atom.tags.erase(std::unique(atom.tags.begin(),
+                                        atom.tags.end()),
+                            atom.tags.end());
         }
         for (auto& alias : context.tabAliases) {
             if (resolveContextTab(context, alias.target) == source) {
@@ -952,8 +1298,8 @@ NativeQueryResult NativeEngine::executeExplainContext(
     activeByDiversityKey.reserve(context->atoms.size());
 
     for (const auto& message : context->messages) {
-        const std::string tab = resolveContextTab(*context, message.tab);
-        if (!tabFilter.empty() && tab != tabFilter) {
+        if (!contextMatchesTab(*context, message.tab, message.tags,
+                               tabFilter)) {
             ++prunedTabMessages;
             continue;
         }
@@ -968,8 +1314,7 @@ NativeQueryResult NativeEngine::executeExplainContext(
 
     for (std::size_t index = 0; index < context->atoms.size(); ++index) {
         const auto& atom = context->atoms[index];
-        const std::string atomTab = resolveContextTab(*context, atom.tab);
-        if (!tabFilter.empty() && atomTab != tabFilter) {
+        if (!contextMatchesTab(*context, atom.tab, atom.tags, tabFilter)) {
             ++prunedTabAtoms;
             continue;
         }
@@ -1083,7 +1428,7 @@ NativeQueryResult NativeEngine::executeExplainContext(
     addKeyValue(result, "ranker",
                 "query utility + atom type weights + recency tie-break");
     addKeyValue(result, "context_indexes",
-                "tab,status,key,type,source,access_labels,mentioned_entities");
+                "tab,tags,status,key,type,source,access_labels,mentioned_entities");
     addKeyValue(result, "provenance_model",
                 "git-blame-for-prompts: source message, schema, labels, "
                 "invalidated_by");
@@ -1162,8 +1507,10 @@ NativeQueryResult NativeEngine::executeSpillContext(
     std::vector<std::string> accessLabels;
     std::vector<std::string> mentionedEntities;
     for (const auto& message : context->messages) {
-        const std::string tab = resolveContextTab(*context, message.tab);
-        if (!tabFilter.empty() && tab != tabFilter) continue;
+        if (!contextMatchesTab(*context, message.tab, message.tags,
+                               tabFilter)) {
+            continue;
+        }
         for (const auto& label : message.accessLabels) {
             addUnique(accessLabels, label);
         }
@@ -1173,8 +1520,9 @@ NativeQueryResult NativeEngine::executeSpillContext(
     }
     for (std::size_t index = 0; index < context->atoms.size(); ++index) {
         const auto& atom = context->atoms[index];
-        const std::string atomTab = resolveContextTab(*context, atom.tab);
-        if (!tabFilter.empty() && atomTab != tabFilter) continue;
+        if (!contextMatchesTab(*context, atom.tab, atom.tags, tabFilter)) {
+            continue;
+        }
         for (const auto& label : atom.accessLabels) {
             addUnique(accessLabels, label);
         }
@@ -1261,7 +1609,7 @@ NativeQueryResult NativeEngine::executeSpillContext(
     addKeyValue(result, "mentioned_entities",
                 joinStrings(mentionedEntities, ","));
     addKeyValue(result, "indexed_fields",
-                "ContextAtom.key,type,status,tab,source,access_labels; ConversationMessage.tab,mentioned_entities,access_labels");
+                "ContextAtom.key,type,status,tab,tags,source,access_labels; ConversationMessage.tab,tags,mentioned_entities,access_labels");
     addKeyValue(result, "current_context",
                 joinStrings(renderedAtoms, " | "));
 

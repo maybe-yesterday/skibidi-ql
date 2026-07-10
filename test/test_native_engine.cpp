@@ -996,15 +996,69 @@ TEST(native_engine_context_objects_are_schema_and_acl_aware) {
                     "structured=catalog.contexts.atoms");
     ASSERT_CONTAINS((*atomRow)[8].toString(),
                     "[redacted:CONFIDENTIAL_CUSTOMER_DATA]");
+    ASSERT_CONTAINS((*atomRow)[9].toString(), "constraints");
+    ASSERT_CONTAINS((*atomRow)[10].toString(), "marker:never");
+    ASSERT_CONTAINS((*atomRow)[12].toString(), ":");
 
     const auto& spill = results[3];
     ASSERT_EQ(fieldValue(spill, "redacted_atoms"), std::string("1"));
     ASSERT_CONTAINS(fieldValue(spill, "current_context"),
-                    "user_constraint=");
+                    "user_constraint.");
     ASSERT_CONTAINS(fieldValue(spill, "current_context"),
                     "[redacted:CONFIDENTIAL_CUSTOMER_DATA]");
     ASSERT_TRUE(fieldValue(spill, "current_context")
                     .find("passwords") == std::string::npos);
+}
+
+TEST(native_engine_context_redacts_credentials_not_token_metrics) {
+    NativeTestDatabase database;
+    auto results = executeSource(
+        database.engine,
+        "manifest-context convo_123;"
+        "yeet-memory convo_123 drip "
+        "(1, 'assistant', 'decision: benchmark measured 41.5 average tokens and 66.7% ACL raw excluded.') "
+        "vibe-tab 'benchmarks';"
+        "yeet-memory convo_123 drip "
+        "(2, 'user', 'Never share api key tokens.') "
+        "vibe-tab 'constraints';"
+        "yeet-memory convo_123 drip "
+        "(3, 'assistant', 'decision: agents should use .agents/skibidi_context.py and pass current_context.') "
+        "vibe-tab 'agent helper';"
+        "spill-context convo_123 vibe-tab 'benchmarks' "
+        "only-if 'benchmark token metric' token-budget 200 receipts on;"
+        "spill-context convo_123 vibe-tab 'constraints' "
+        "only-if 'security constraint' token-budget 200 receipts on;"
+        "spill-context convo_123 vibe-tab 'agent helper' "
+        "only-if 'agent helper path' token-budget 200 receipts on;");
+
+    ASSERT_EQ(results.size(), (size_t)7);
+    const auto& metricAppend = results[1];
+    ASSERT_TRUE(fieldValue(metricAppend, "access_labels")
+                    .find("CONFIDENTIAL_CUSTOMER_DATA") ==
+                std::string::npos);
+    ASSERT_CONTAINS(fieldValue(metricAppend, "tags"), "benchmarks");
+    ASSERT_CONTAINS(fieldValue(metricAppend, "tag_reasons"),
+                    "matched benchmark metric term");
+
+    const auto& metricSpill = results[4];
+    ASSERT_EQ(fieldValue(metricSpill, "redacted_atoms"), std::string("0"));
+    ASSERT_CONTAINS(fieldValue(metricSpill, "current_context"),
+                    "decision.benchmark_average_tokens_acl=");
+    ASSERT_CONTAINS(fieldValue(metricSpill, "current_context"),
+                    "41.5 average tokens");
+    ASSERT_CONTAINS(fieldValue(metricSpill, "current_context"),
+                    "66.7% ACL raw excluded");
+
+    const auto& secretSpill = results[5];
+    ASSERT_EQ(fieldValue(secretSpill, "redacted_atoms"), std::string("1"));
+    ASSERT_CONTAINS(fieldValue(secretSpill, "current_context"),
+                    "[redacted:CONFIDENTIAL_CUSTOMER_DATA]");
+    ASSERT_TRUE(fieldValue(secretSpill, "current_context")
+                    .find("api key tokens") == std::string::npos);
+
+    const auto& helperSpill = results[6];
+    ASSERT_CONTAINS(fieldValue(helperSpill, "current_context"),
+                    ".agents/skibidi_context.py and pass current_context");
 }
 
 TEST(native_engine_context_spill_uses_revision_aware_cache) {
@@ -1203,13 +1257,17 @@ TEST(native_engine_auto_tab_suggestions_cover_common_agent_buckets) {
         "yeet-memory convo_123 drip "
         "(6, 'user', 'I prefer quiet restaurants.') vibe-tab auto;"
         "yeet-memory convo_123 drip "
-        "(7, 'user', 'I need add docs.') vibe-tab auto;");
+        "(7, 'user', 'I need add docs.') vibe-tab auto;"
+        "spill-context convo_123 vibe-tab 'debugging sqlite perf' "
+        "only-if 'sqlite join perf follow-up' token-budget 200 receipts on;");
 
-    ASSERT_EQ(results.size(), (size_t)8);
+    ASSERT_EQ(results.size(), (size_t)9);
     ASSERT_EQ(fieldValue(results[1], "tab"),
               std::string("convo about dog"));
     ASSERT_EQ(fieldValue(results[2], "tab"),
-              std::string("debugging sqlite perf"));
+              std::string("debug this later"));
+    ASSERT_CONTAINS(fieldValue(results[2], "tags"),
+                    "debugging sqlite perf");
     ASSERT_EQ(fieldValue(results[3], "tab"),
               std::string("project roadmap"));
     ASSERT_EQ(fieldValue(results[4], "tab"),
@@ -1220,6 +1278,8 @@ TEST(native_engine_auto_tab_suggestions_cover_common_agent_buckets) {
               std::string("preferences"));
     ASSERT_EQ(fieldValue(results[7], "tab"),
               std::string("current tasks"));
+    ASSERT_CONTAINS(fieldValue(results[8], "current_context"),
+                    "debug_followup.sqlite_join_perf=");
 }
 
 TEST(native_engine_prompt_extractor_handles_new_atom_types) {
@@ -1242,19 +1302,22 @@ TEST(native_engine_prompt_extractor_handles_new_atom_types) {
     ASSERT_EQ(results.size(), (size_t)6);
     ASSERT_EQ(fieldValue(results[1], "extracted_atoms"), std::string("1"));
     ASSERT_CONTAINS(fieldValue(results[1], "atom"),
-                    "decision=keep prompt views inside SkibidiQL");
+                    "decision.keep_prompt_views_skibidiql=keep prompt views inside SkibidiQL");
+    ASSERT_CONTAINS(fieldValue(results[1], "atom_provenance"),
+                    "rule=marker:decision:");
     ASSERT_CONTAINS(fieldValue(results[2], "atom"),
-                    "open_question=Do we need more tests");
+                    "open_question.need_more_tests=Do we need more tests");
     ASSERT_CONTAINS(fieldValue(results[3], "atom"),
-                    "debug_followup=sqlite perf join misses");
+                    "debug_followup.sqlite_perf_join_misses=sqlite perf join misses");
     ASSERT_CONTAINS(fieldValue(results[4], "atom"),
-                    "user_constraint=never share passwords");
+                    "user_constraint.security=never share passwords");
 
     const auto& spill = results[5];
-    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "decision=");
-    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "open_question=");
-    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "debug_followup=");
-    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "user_constraint=");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "decision.");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "open_question.");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "debug_followup.");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "user_constraint.");
+    ASSERT_CONTAINS(fieldValue(spill, "current_context"), "confidence=");
 }
 
 TEST(native_engine_explain_context_reports_prompt_view_plan) {

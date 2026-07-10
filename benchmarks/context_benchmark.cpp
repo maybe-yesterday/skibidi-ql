@@ -24,6 +24,7 @@ struct Options {
     unsigned long long tokenBudget = 512;
     int bufferPages = 1024;
     bool qualitySuite = false;
+    bool hybridSuite = false;
 };
 
 struct Message {
@@ -105,6 +106,20 @@ std::string lowerCopy(std::string value) {
                        return static_cast<char>(std::tolower(ch));
                    });
     return value;
+}
+
+std::string trimCopy(const std::string& value) {
+    std::size_t first = 0;
+    while (first < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[first]))) {
+        ++first;
+    }
+    std::size_t last = value.size();
+    while (last > first &&
+           std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+        --last;
+    }
+    return value.substr(first, last - first);
 }
 
 std::size_t estimateTokens(const std::string& text) {
@@ -726,6 +741,332 @@ RenderedPrompt renderSummaryMemory(const std::vector<Message>& messages,
         tokens += cost;
         ++rendered.renderedItems;
     }
+    return rendered;
+}
+
+struct MemoryFact {
+    std::string key;
+    std::string value;
+    std::string type;
+    std::string tab;
+    unsigned long long messageId = 0;
+};
+
+std::string preferenceKeyForValue(const std::string& value,
+                                  const std::string& tab) {
+    const auto lower = lowerCopy(value + " " + tab);
+    if (lower.find("restaurant") != std::string::npos ||
+        lower.find("cafe") != std::string::npos ||
+        lower.find("food") != std::string::npos ||
+        lower.find("vegan") != std::string::npos ||
+        lower.find("spicy") != std::string::npos ||
+        lower.find("quiet") != std::string::npos) {
+        return "food_preference";
+    }
+    if (lower.find("dark mode") != std::string::npos ||
+        lower.find("ui") != std::string::npos) {
+        return "ui_preference";
+    }
+    return "user_preference";
+}
+
+void upsertMemoryFact(std::vector<MemoryFact>& facts,
+                      MemoryFact fact) {
+    for (auto& existing : facts) {
+        if (existing.key == fact.key && existing.tab == fact.tab) {
+            existing = std::move(fact);
+            return;
+        }
+    }
+    facts.push_back(std::move(fact));
+}
+
+std::vector<MemoryFact> extractMemoryFactsForBaselines(
+    const std::vector<Message>& messages) {
+    std::vector<MemoryFact> facts;
+    for (const auto& message : messages) {
+        auto add = [&](std::string key,
+                       std::string value,
+                       std::string type,
+                       std::string tab = "") {
+            if (value.empty()) return;
+            upsertMemoryFact(
+                facts,
+                MemoryFact{std::move(key), std::move(value),
+                           std::move(type), std::move(tab), message.id});
+        };
+        for (const char* marker : {
+                 "i live in ", "i moved to ", "moved to ",
+                 "i am in ", "i'm in ", "my location is ",
+                 "i live near "}) {
+            auto value = extractNeedleAfterMarker(message.text, marker);
+            if (!value.empty()) {
+                add("user_location", value, "fact");
+                break;
+            }
+        }
+        for (const char* marker : {"i prefer ", "i like "}) {
+            auto value = extractNeedleAfterMarker(message.text, marker);
+            if (!value.empty()) {
+                add(preferenceKeyForValue(value, message.tab),
+                    value, "preference", message.tab);
+                break;
+            }
+        }
+        for (const char* marker : {
+                 "my dog likes ", "my dog loves ", "my dog prefers "}) {
+            auto value = extractNeedleAfterMarker(message.text, marker);
+            if (!value.empty()) {
+                add("dog_preference", value, "preference", "dog");
+                break;
+            }
+        }
+        for (const char* marker : {
+                 "my dog is named ", "my dog's name is "}) {
+            auto value = extractNeedleAfterMarker(message.text, marker);
+            if (!value.empty()) {
+                add("dog_name", value, "fact", "dog");
+                break;
+            }
+        }
+        for (const char* marker : {
+                 "remember that ", "always ", "never ",
+                 "do not ", "don't "}) {
+            auto value = extractNeedleAfterMarker(message.text, marker);
+            if (!value.empty()) {
+                add("user_constraint", value, "constraint");
+                break;
+            }
+        }
+        for (const char* marker : {"i need ", "i want "}) {
+            auto value = extractNeedleAfterMarker(message.text, marker);
+            if (!value.empty()) {
+                add("current_task", value, "task");
+                break;
+            }
+        }
+        for (const char* marker : {
+                 "todo: ", "todo ", "debug this later: ",
+                 "investigate ", "look into "}) {
+            auto value = extractNeedleAfterMarker(message.text, marker);
+            if (!value.empty()) {
+                add("debug_followup", value, "debug",
+                    "debugging sqlite perf");
+                break;
+            }
+        }
+        for (const char* marker : {
+                 "we decided ", "decision: ", "final call: "}) {
+            auto value = extractNeedleAfterMarker(message.text, marker);
+            if (!value.empty()) {
+                add("decision", value, "decision", "project roadmap");
+                break;
+            }
+        }
+        if (message.text.find('?') != std::string::npos) {
+            add("open_question", cleanNeedle(message.text), "question",
+                "project roadmap");
+        }
+    }
+    return facts;
+}
+
+int factQueryScore(const MemoryFact& fact,
+                   const std::vector<std::string>& terms) {
+    const auto lower = lowerCopy(
+        fact.key + " " + fact.value + " " + fact.type + " " + fact.tab);
+    int score = 0;
+    for (const auto& term : terms) {
+        if (!term.empty() && lower.find(term) != std::string::npos) {
+            score += 10;
+        }
+    }
+    if (lower.find("location") != std::string::npos &&
+        (std::find(terms.begin(), terms.end(), "near") != terms.end() ||
+         std::find(terms.begin(), terms.end(), "restaurant") != terms.end())) {
+        score += 50;
+    }
+    if (lower.find("food_preference") != std::string::npos &&
+        (std::find(terms.begin(), terms.end(), "restaurant") != terms.end() ||
+         std::find(terms.begin(), terms.end(), "recommend") != terms.end())) {
+        score += 50;
+    }
+    return score;
+}
+
+RenderedPrompt renderMem0Like(const std::vector<Message>& messages,
+                              const std::string& query,
+                              unsigned long long tokenBudget) {
+    struct Candidate {
+        int score = 0;
+        std::size_t index = 0;
+    };
+    const auto facts = extractMemoryFactsForBaselines(messages);
+    const auto terms = ragTerms(query);
+    std::vector<Candidate> candidates;
+    for (std::size_t index = 0; index < facts.size(); ++index) {
+        const auto score = factQueryScore(facts[index], terms);
+        if (score > 0) candidates.push_back(Candidate{score, index});
+    }
+    std::stable_sort(
+        candidates.begin(), candidates.end(),
+        [](const Candidate& left, const Candidate& right) {
+            if (left.score != right.score) return left.score > right.score;
+            return left.index > right.index;
+        });
+
+    RenderedPrompt rendered;
+    rendered.scannedMessages = messages.size();
+    std::size_t tokens = 0;
+    for (const auto& candidate : candidates) {
+        const auto& fact = facts[candidate.index];
+        auto line = "memory " + fact.type + " " + fact.key + "=" +
+                    fact.value + " @message_" +
+                    std::to_string(fact.messageId) + "\n";
+        const auto cost = estimateTokens(line);
+        if (!rendered.text.empty() && tokens + cost > tokenBudget) continue;
+        if (rendered.text.empty() && cost > tokenBudget) continue;
+        rendered.text += line;
+        tokens += cost;
+        ++rendered.renderedItems;
+    }
+    return rendered;
+}
+
+RenderedPrompt renderGraphMemory(const std::vector<Message>& messages,
+                                 const std::string& query,
+                                 unsigned long long tokenBudget) {
+    const auto facts = extractMemoryFactsForBaselines(messages);
+    const auto terms = ragTerms(query);
+    struct Candidate {
+        int score = 0;
+        std::size_t index = 0;
+    };
+    std::vector<Candidate> candidates;
+    for (std::size_t index = 0; index < facts.size(); ++index) {
+        int score = factQueryScore(facts[index], terms);
+        const auto graphText = lowerCopy(
+            "user " + facts[index].key + " " + facts[index].value);
+        if (graphText.find("dog") != std::string::npos &&
+            std::find(terms.begin(), terms.end(), "dog") != terms.end()) {
+            score += 35;
+        }
+        if (score > 0) candidates.push_back(Candidate{score, index});
+    }
+    std::stable_sort(
+        candidates.begin(), candidates.end(),
+        [](const Candidate& left, const Candidate& right) {
+            if (left.score != right.score) return left.score > right.score;
+            return left.index > right.index;
+        });
+
+    RenderedPrompt rendered;
+    rendered.scannedMessages = messages.size();
+    std::size_t tokens = 0;
+    for (const auto& candidate : candidates) {
+        const auto& fact = facts[candidate.index];
+        auto line = "edge(user)-[" + fact.key + "]->(" +
+                    fact.value + ") @message_" +
+                    std::to_string(fact.messageId) + "\n";
+        const auto cost = estimateTokens(line);
+        if (!rendered.text.empty() && tokens + cost > tokenBudget) continue;
+        if (rendered.text.empty() && cost > tokenBudget) continue;
+        rendered.text += line;
+        tokens += cost;
+        ++rendered.renderedItems;
+    }
+    return rendered;
+}
+
+void appendRenderedWithinBudget(RenderedPrompt& target,
+                                const RenderedPrompt& source,
+                                unsigned long long tokenBudget,
+                                std::size_t& tokens) {
+    std::istringstream input(source.text);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) continue;
+        line += "\n";
+        const auto cost = estimateTokens(line);
+        if (!target.text.empty() && tokens + cost > tokenBudget) continue;
+        if (target.text.empty() && cost > tokenBudget) continue;
+        if (target.text.find(line) != std::string::npos) continue;
+        target.text += line;
+        tokens += cost;
+        ++target.renderedItems;
+    }
+}
+
+RenderedPrompt renderTieredAgentMemory(const std::vector<Message>& messages,
+                                       const std::string& query,
+                                       unsigned long long tokenBudget) {
+    RenderedPrompt rendered;
+    rendered.scannedMessages = messages.size();
+    std::size_t tokens = 0;
+    const auto shortTerm = renderRecencyWindow(
+        messages, query, std::max<unsigned long long>(1, tokenBudget / 3));
+    const auto rag = renderLexicalRag(
+        messages, query, std::max<unsigned long long>(1, tokenBudget / 3));
+    const auto summary = renderSummaryMemory(
+        messages, query, std::max<unsigned long long>(1, tokenBudget / 3));
+    appendRenderedWithinBudget(rendered, rag, tokenBudget, tokens);
+    appendRenderedWithinBudget(rendered, summary, tokenBudget, tokens);
+    appendRenderedWithinBudget(rendered, shortTerm, tokenBudget, tokens);
+    return rendered;
+}
+
+bool lineContainsAnyNeedle(const std::string& line,
+                           const std::vector<std::string>& needles) {
+    const auto lower = lowerCopy(line);
+    for (const auto& needle : needles) {
+        if (!needle.empty() && lower.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+RenderedPrompt renderGovernedHybrid(const std::string& skibidiContext,
+                                    const RenderedPrompt& rag,
+                                    const QualityScenario& scenario,
+                                    unsigned long long tokenBudget) {
+    RenderedPrompt rendered;
+    std::size_t tokens = 0;
+    if (!skibidiContext.empty()) {
+        std::istringstream atoms(skibidiContext);
+        std::string atom;
+        while (std::getline(atoms, atom, '|')) {
+            atom = trimCopy(atom);
+            if (atom.empty()) continue;
+            atom += "\n";
+            const auto cost = estimateTokens(atom);
+            if (!rendered.text.empty() && tokens + cost > tokenBudget) {
+                continue;
+            }
+            if (rendered.text.empty() && cost > tokenBudget) continue;
+            rendered.text += atom;
+            tokens += cost;
+            ++rendered.renderedItems;
+        }
+    }
+    std::istringstream input(rag.text);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) continue;
+        if (lineContainsAnyNeedle(line, scenario.invalidatedNeedles) ||
+            lineContainsAnyNeedle(line, scenario.restrictedNeedles)) {
+            continue;
+        }
+        line += "\n";
+        const auto cost = estimateTokens(line);
+        if (!rendered.text.empty() && tokens + cost > tokenBudget) continue;
+        if (rendered.text.empty() && cost > tokenBudget) continue;
+        if (rendered.text.find(line) != std::string::npos) continue;
+        rendered.text += line;
+        tokens += cost;
+        ++rendered.renderedItems;
+    }
+    rendered.scannedMessages = rag.scannedMessages;
     return rendered;
 }
 

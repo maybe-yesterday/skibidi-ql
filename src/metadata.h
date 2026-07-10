@@ -57,6 +57,8 @@ struct ContextMessageMeta {
         "structured=catalog.contexts.messages; vector=ConversationMessage.content; blob=none";
     std::vector<std::string> accessLabels;
     std::vector<std::string> mentionedEntities;
+    std::vector<std::string> tags;
+    std::vector<std::string> tagReasons;
 };
 
 struct ContextAtomMeta {
@@ -70,6 +72,12 @@ struct ContextAtomMeta {
     std::string schemaName = "ContextAtom";
     std::string schemaVersion = "v1";
     std::vector<std::string> accessLabels;
+    std::vector<std::string> tags;
+    std::string extractorRule;
+    std::string extractorConfidence = "1.00";
+    std::uint64_t sourceStart = 0;
+    std::uint64_t sourceEnd = 0;
+    std::string originalSnippet;
 };
 
 struct ContextTabAliasMeta {

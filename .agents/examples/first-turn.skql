@@ -1,0 +1,26 @@
+manifest-context agent_memory;
+
+yeet-memory agent_memory drip
+    (1, 'user', 'I prefer concise benchmark summaries.')
+vibe-tab 'preferences';
+
+yeet-memory agent_memory drip
+    (2, 'assistant', 'decision: SkibidiQL central message is context is data.')
+vibe-tab 'project roadmap';
+
+yeet-memory agent_memory drip
+    (3, 'user', 'I live in Seattle.')
+vibe-tab 'user facts';
+
+yeet-memory agent_memory drip
+    (4, 'user', 'Actually I moved to NYC.')
+vibe-tab 'user facts';
+
+yeet-memory agent_memory drip
+    (5, 'user', 'Never expose api key tokens.')
+vibe-tab 'constraints';
+
+spill-context agent_memory
+only-if 'answer using the active project and user context'
+token-budget 300
+receipts on;

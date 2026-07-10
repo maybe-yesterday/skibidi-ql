@@ -1,0 +1,53 @@
+manifest-context skibidi_project;
+
+yeet-memory skibidi_project drip
+    (1001, 'assistant', 'decision: SkibidiQL is a relational database for agent context management.')
+vibe-tab 'project identity';
+
+yeet-memory skibidi_project drip
+    (1002, 'assistant', 'decision: Central message is context is data, not a generic SQL clone.')
+vibe-tab 'project message';
+
+yeet-memory skibidi_project drip
+    (1003, 'user', 'I prefer project-facing copy in gen z / gen alpha lingo.')
+vibe-tab 'preferences';
+
+yeet-memory skibidi_project drip
+    (1004, 'assistant', 'decision: Agents should use .agents/skibidi_context.py and pass only current_context to the LLM prompt.')
+vibe-tab 'agent helper';
+
+yeet-memory skibidi_project drip
+    (1005, 'assistant', 'decision: Agent docs should distinguish SkibidiQL context DB rows from the model-facing context pack.')
+vibe-tab 'agent docs';
+
+yeet-memory skibidi_project drip
+    (1006, 'assistant', 'decision: Benchmark headline is SkibidiQL achieved 100.0% policy-safe active recall using 64.6% fewer tokens than recency-window memory.')
+vibe-tab 'benchmark recall';
+
+yeet-memory skibidi_project drip
+    (1007, 'assistant', 'decision: Benchmark headline also says SkibidiQL excluded 100.0% of invalidated facts and 100.0% of ACL-restricted raw facts.')
+vibe-tab 'benchmark safety';
+
+yeet-memory skibidi_project drip
+    (1008, 'assistant', 'decision: Real mem0ai comparison measured 62.5% policy-safe active recall, 41.5 average tokens, 0.0% invalidated excluded, and 66.7% ACL raw excluded.')
+vibe-tab 'mem0 comparison';
+
+yeet-memory skibidi_project drip
+    (1009, 'assistant', 'debug this later: make the agent helper support fresh DB dogfood runs and prompt-wrapped output.')
+vibe-tab 'agent integration';
+
+yeet-memory skibidi_project drip
+    (1010, 'user', 'I want to polish the agent integration by using the actual project and then report dogfood experience.')
+vibe-tab 'agent integration';
+
+spill-context skibidi_project
+only-if 'polish the agent integration using actual SkibidiQL project facts, benchmark claims, and report dogfood experience'
+token-budget 1000
+receipts on;
+
+explain-context skibidi_project
+only-if 'polish the agent integration using actual SkibidiQL project facts, benchmark claims, and report dogfood experience'
+token-budget 1000
+receipts on;
+
+show-tabs skibidi_project;

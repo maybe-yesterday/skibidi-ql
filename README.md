@@ -86,7 +86,7 @@ Useful modes:
 ./build/skibidi --cache-stats --db mydata
 ```
 
-## ContextQL: relational context management
+## Relational context management
 
 Create a context database namespace:
 
@@ -154,8 +154,8 @@ receipts on;
 ```
 
 Agents can use the binary as their context DB instead of dragging the whole
-conversation into every prompt. See [.agents/contextql-agent.md](.agents/contextql-agent.md)
-for the short runtime playbook.
+conversation into every prompt. See [.agents/README.md](.agents/README.md)
+for the runtime contract.
 
 ## Tiny language taste
 
@@ -306,6 +306,20 @@ summary model is used. Policy-safe active recall counts a needed fact only if
 the rendered context contains the active fact in an allowed form; for ACL
 cases, the redaction receipt counts and the raw secret does not.
 
+Real Mem0 comparison is optional because it uses external LLM/embedding calls.
+Install the actual package and set an API key:
+
+```bash
+python -m pip install mem0ai openai
+OPENAI_API_KEY=... python benchmarks/mem0_quality_suite.py \
+  --scenarios 11 --scenario-messages 40
+```
+
+The script uses real `mem0ai` with local Qdrant storage under `.mem0/`. It
+skips cleanly when `OPENAI_API_KEY` is missing. This keeps the default benchmark
+free, deterministic, and CI-safe while still letting us compare against the
+actual Mem0 stack when credentials are available.
+
 Local Release result:
 
 > On 50 synthetic long-running assistant conversations with contradictions,
@@ -319,35 +333,12 @@ Local Release result:
 | Method | What it simulates | Policy-safe active recall | Avg tokens | Invalidated excluded | ACL raw excluded |
 |---|---|---:|---:|---:|---:|
 | SkibidiQL | relational context DB | 100.0% | 33.9 | 100.0% | 100.0% |
+| Mem0 | Using mem0 | 62.5% | 33.7 | 0.0% | 66.7% |
 | full_history | paste every message | 87.5% | 1794.5 | 0.0% | 0.0% |
 | recency_window | last messages until budget | 0.0% | 183.3 | 100.0% | 100.0% |
 | keyword_scan | query term scan | 73.4% | 46.8 | 33.3% | 66.7% |
 | lexical_rag | BM25-ish dependency-free RAG | 87.5% | 95.9 | 0.0% | 0.0% |
 | extractive_summary | rule/extractive summary proxy | 81.2% | 33.8 | 0.0% | 0.0% |
-
-Challenge split, by policy-safe active recall:
-
-| Challenge flavor | SkibidiQL | Recency | RAG | Extractive summary |
-|---|---:|---:|---:|---:|
-| ACL-restricted facts | 100.0% | 0.0% | 0.0% | 0.0% |
-| contradictions + stale location | 100.0% | 0.0% | 100.0% | 100.0% |
-| contradictions inside a topic tab | 100.0% | 0.0% | 100.0% | 100.0% |
-| debug/task continuity | 100.0% | 0.0% | 100.0% | 100.0% |
-| long-running task state | 100.0% | 0.0% | 100.0% | 100.0% |
-| open questions + decisions | 100.0% | 0.0% | 100.0% | 100.0% |
-| stable preferences + topic switches | 100.0% | 0.0% | 100.0% | 100.0% |
-| stale preferences | 100.0% | 0.0% | 100.0% | 100.0% |
-| summary compression loss | 100.0% | 0.0% | 100.0% | 0.0% |
-| topic switches + tab retrieval | 100.0% | 0.0% | 100.0% | 100.0% |
-
-The RAG and extractive-summary baselines can find many easy non-ACL facts, but
-they do not know which facts were invalidated and they leak raw restricted
-values. The extractive summary also misses the dedicated summary-compression
-challenge, where durable-looking but irrelevant notes fill the summary budget
-before the needed fact appears. Recency looks safe on invalidation/ACL only
-because it misses the relevant facts. That is exactly the gap SkibidiQL is
-targeting: context should have schemas, provenance, validity, and policy, not
-just retrieval.
 
 ### Context strategy microbenchmark
 
@@ -374,14 +365,9 @@ Sample local result for query `Find restaurants near me`:
 | ContextQL varied | 43.319 ms | 185 | 0.185 | 100% | 1000 |
 | ContextQL cached | 0.921 ms | 185 | 0.185 | 100% | 0 |
 
-Raw speed alone is not the flex; recency is cheap because it does almost no
-context management. The useful metric is quality per token. ContextQL returns
-the needed facts in fewer prompt tokens while preserving invalidation,
-provenance, ACL receipts, and cacheable relational context semantics.
-
 ### Native / SQLite comparison
 
-SQLite comparison is optional:
+SQLite comparison is optional and requires sqlite (obviously):
 
 ```bash
 cmake -S . -B build-sqlite \
@@ -429,11 +415,5 @@ test/                 unit and integration tests
 examples/             runnable SkibidiQL scripts
 benchmarks/           native, context, and SQLite comparison benchmarks
 python/tensorql/      tiny PyTorch dataset reader
-.agents/              ContextQL agent-memory playbook
+.agents/              agent integration guide, helper, and first-turn example
 ```
-
-## The one-line pitch
-
-SkibidiQL is a relational database for agent context management: context gets
-schemas, indexes, invalidation, provenance, token budgets, benchmarks, and just
-enough brainrot syntax to stay emotionally survivable.
