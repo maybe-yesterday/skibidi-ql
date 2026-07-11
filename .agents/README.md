@@ -1,133 +1,162 @@
-# SkibidiQL agent integration guide
+# SkibidiQL agent runtime guide
 
-Read this if you are an AI agent using this repository.
+Read this if you are an AI agent using this repo.
 
-SkibidiQL is the context database. The model prompt is only the compiled
-context pack that SkibidiQL returns.
+SkibidiQL is the context database. Your model prompt should receive only the
+active context SkibidiQL selects for the current user turn. Do not replay the
+whole chat history and pray. Context is data; the prompt is just a view.
 
-Do not paste the whole conversation into the model. Store useful context as
-rows, query the active rows, then pass only the `current_context` result to the
-LLM. Context is data; the prompt is just a view.
+## The blessed runtime loop
 
-## Fast path
+For every non-trivial model call:
 
-From the repo root, run the demo request against a fresh DB:
+1. Append durable facts, decisions, corrections, tasks, and tool traces as
+   SkibidiQL context rows.
+2. Run active recall for the latest user message.
+3. Send only the returned context pack plus the current user message to the
+   LLM API.
+4. After answering, write back any new durable state.
 
-```powershell
-python .agents\skibidi_context.py --fresh --db build\agent_quickstart_db --file .agents\examples\first-turn.skql --prompt
-```
-
-Expected shape:
-
-```text
-constraint user_constraint=[redacted:CONFIDENTIAL_CUSTOMER_DATA] @message_5 ...
-decision decision=SkibidiQL central message is context is data @message_2 ...
-fact user_location=NYC @message_4 ...
-preference user_preference=concise benchmark summaries @message_1 ...
-```
-
-That output is the model-facing memory pack wrapped in the recommended prompt
-section. Put it into the LLM prompt. Keep raw rows, receipts, and invalidated
-facts in the controller/debug layer.
-
-To dogfood against this actual project instead of the tiny example:
+The helper does steps 2 and 3 for API callers:
 
 ```powershell
-python .agents\skibidi_context.py --fresh --db build\skibidi_project_agent_db --file .agents\examples\skibidi-project-context.skql --prompt
+.\.venv\Scripts\python.exe -B .agents\skibidi_context.py `
+  --fresh `
+  --db build\agent_quickstart_db `
+  --file .agents\examples\first-turn.skql `
+  --query 'where am I and what should I not reveal?' `
+  --format openai-messages
 ```
 
-## The contract
+Output shape:
 
-For each agent turn:
-
-1. Write durable context events into SkibidiQL.
-2. Query SkibidiQL for task-relevant active context.
-3. Put only the rendered context pack into the LLM prompt.
-4. After the answer, write back durable new facts, decisions, corrections,
-   unresolved tasks, and debug follow-ups.
-
-The LLM never needs raw tables. It needs a small, policy-safe pack like:
-
-```text
-Active context from SkibidiQL:
-- preference user_preference=concise benchmark summaries @message_1001
-- decision decision=README central message is context is data @message_1009
-- constraint user_constraint=never expose api key tokens @message_1010
-
-Do not treat invalidated receipt rows as active facts.
+```json
+[
+  {"role": "system", "content": "You are a helpful coding agent."},
+  {"role": "system", "content": "SkibidiQL active context:\n..."},
+  {"role": "user", "content": "where am I and what should I not reveal?"}
+]
 ```
 
-## Run SkibidiQL as the context tool
+Pass that JSON as the `messages` array to an LLM API. Raw rows, invalidation
+receipts, and redaction counts stay in the controller/debug layer unless you
+are explicitly debugging retrieval.
 
-Use one DB directory per workspace, agent, or conversation family:
+## Active recall as a tool call
+
+If your agent has a tool interface, call SkibidiQL as `active_recall`:
 
 ```powershell
-python .agents\skibidi_context.py --db .skibidi_agent_ctx --file agent_context.skql
+.\.venv\Scripts\python.exe -B .agents\skibidi_context.py `
+  --fresh `
+  --db build\agent_quickstart_db `
+  --file .agents\examples\first-turn.skql `
+  --query 'where am I and what should I not reveal?' `
+  --format active-recall
 ```
 
-For direct binary integration:
+Tool result shape:
 
-```bash
-build/skibidi --db .skibidi_agent_ctx --file agent_context.skql
+```json
+{
+  "tool": "skibidiql.active_recall",
+  "context_name": "agent_memory",
+  "query": "where am I and what should I not reveal?",
+  "context": "fact user_location=NYC @message_4 ...",
+  "view_atoms": ["fact user_location=NYC @message_4"],
+  "invalidated_receipts": ["user_location=Seattle @message_3 invalidated_by=message_4"],
+  "token_cost": 42,
+  "redacted_atoms": 1,
+  "access_policy": "..."
+}
 ```
 
-Windows binaries may be named one of:
+Only `context` belongs in the normal LLM prompt. `invalidated_receipts` are
+receipts, not facts. Treat them like provenance logs with a tiny “do not eat”
+sticker.
+
+## Seed/update files versus user-turn queries
+
+`.skql` files under `.agents/examples/` are seed/update files. They create a
+context and append memory rows. They intentionally do not contain a baked-in
+`spill-context` query.
+
+When you pass both `--file` and `--query`, the helper runs the seed/update file
+and appends a fresh `spill-context` for the current user message. If `--context`
+is omitted, it uses the first `manifest-context` in the file.
 
 ```powershell
-build\codex_skibidi.exe --db .skibidi_agent_ctx --file agent_context.skql
-build\skibidi.exe --db .skibidi_agent_ctx --file agent_context.skql
-build\Release\skibidi.exe --db .skibidi_agent_ctx --file agent_context.skql
+.\.venv\Scripts\python.exe -B .agents\skibidi_context.py `
+  --fresh `
+  --db build\skibidi_project_agent_db `
+  --file .agents\examples\skibidi-project-context.skql `
+  --query 'polish agent integration using actual project facts' `
+  --format openai-messages
+```
+
+For persistent memory, drop `--fresh` and reuse the same `--db` directory:
+
+```powershell
+.\.venv\Scripts\python.exe -B .agents\skibidi_context.py `
+  --db .skibidi_agent_ctx `
+  --query 'latest user task' `
+  --format active-recall
+```
+
+Use `--format raw` only for debugging rows:
+
+```powershell
+.\.venv\Scripts\python.exe -B .agents\skibidi_context.py `
+  --db .skibidi_agent_ctx `
+  --file request.skql `
+  --format raw
+```
+
+## Windows and Python commands
+
+Preferred from repo root:
+
+```powershell
+.\.venv\Scripts\python.exe -B .agents\skibidi_context.py --help
+```
+
+Fallbacks:
+
+```powershell
+py -3 -B .agents\skibidi_context.py --help
+python -B .agents\skibidi_context.py --help
+```
+
+If Python is unavailable, call the binary directly and parse
+`field=current_context | value=...`:
+
+```powershell
+build\codex_skibidi_agent.exe --db build\scratch_ctx --file .agents\examples\first-turn.skql
+build\codex_skibidi.exe --db build\scratch_ctx --file .agents\examples\first-turn.skql
+build\skibidi.exe --db build\scratch_ctx --file .agents\examples\first-turn.skql
 ```
 
 Prefer the newest ContextQL-capable binary. If a binary fails on
-`manifest-context` with `Expected statement keyword`, it is stale; use
-`build\codex_skibidi.exe` or rebuild before continuing.
+`manifest-context` with `Expected statement keyword`, it is stale; rebuild or
+use `build\codex_skibidi_agent.exe`.
 
-If you are generating one-off requests, write a small `.skql` file with the
-commands below, run the binary, parse the table rows, and discard the request
-file if it was temporary.
+## Write memories that retrieve well
 
-The helper supports:
-
-```powershell
-python .agents\skibidi_context.py --db .skibidi_agent_ctx --file request.skql --prompt
-python .agents\skibidi_context.py --db .skibidi_agent_ctx --file request.skql --prompt --last
-python .agents\skibidi_context.py --db .skibidi_agent_ctx --file request.skql --context-only
-python .agents\skibidi_context.py --db .skibidi_agent_ctx --file request.skql --context-only --field view_atom
-python .agents\skibidi_context.py --fresh --db build\scratch_ctx --file request.skql --prompt
-```
-
-`--prompt` wraps `current_context` in the recommended LLM prompt block.
-`--context-only` prints only selected field values. `--last` uses only the last
-matching row, which is handy when a request file contains multiple
-`spill-context` calls. `--fresh` deletes the DB path first, but only for DB
-paths inside this repository; use it for demos and repeatable dogfood runs, not
-persistent memory.
-
-## Initialize a context once
+Initialize a context once:
 
 ```skql
 manifest-context agent_memory;
-show-context-schemas;
 ```
 
-Use a stable context name. For example:
-
-- `agent_memory` for one long-running local agent
-- `convo_123` for one conversation
-- `workspace_wireless` for one project workspace
-
-## Append memory events
-
-Use monotonically increasing message IDs. Duplicate IDs are rejected.
+Append durable events with stable message IDs:
 
 ```skql
 yeet-memory agent_memory drip
     (1001, 'user', 'I prefer concise benchmark summaries.')
-vibe-tab auto;
+vibe-tab 'preferences';
 ```
 
-Use `vibe-tab auto` when unsure. Use an explicit tab when the topic is known:
+Use explicit tabs when the topic matters:
 
 ```skql
 yeet-memory agent_memory drip
@@ -135,197 +164,70 @@ yeet-memory agent_memory drip
 vibe-tab 'project roadmap';
 ```
 
-The auto-tab classifier is intentionally lightweight. For important agent
-writebacks, prefer explicit tabs; words like `benchmark`, `perf`, or
-`dogfood` can otherwise route to a nearby demo-flavored tab.
-
-When the user corrects something, append the correction. Do not delete or
-rewrite old memory:
+When the user corrects a fact, append the correction. Do not rewrite history:
 
 ```skql
 yeet-memory agent_memory drip
-    (1003, 'user', 'I live in Seattle.');
+    (1003, 'user', 'I live in Seattle.')
+vibe-tab 'user facts';
 
 yeet-memory agent_memory drip
-    (1004, 'user', 'Actually I moved to NYC.');
+    (1004, 'user', 'Actually I moved to NYC.')
+vibe-tab 'user facts';
 ```
 
-SkibidiQL will keep `user_location=NYC` active and mark the Seattle fact as
-invalidated within the same tab.
+SkibidiQL keeps the NYC location active and emits Seattle as an invalidated
+receipt.
 
-## Write extractor-friendly memories
-
-Current ContextQL recognizes these useful shapes. If a fact matters, write it
-back in one of these forms instead of vague prose.
+Extractor-friendly memory shapes:
 
 ```text
 I live in ...
 I moved to ...
-I am in ...
-my location is ...
-
 I prefer ...
-I like ...
-
 remember that ...
 always ...
 never ...
 do not ...
-don't ...
-
 I need ...
-I want ...
 todo: ...
 debug this later: ...
-investigate ...
-look into ...
-
 decision: ...
 we decided ...
-final call: ...
-
-Any message ending in ? becomes an open_question atom.
 ```
 
-Messages containing credential-shaped phrases such as `password`, `secret`,
-`api key`, `api token`, `access token`, `bearer token`, `ssn`, `credit card`,
-`confidential`, or `private key` are labeled `CONFIDENTIAL_CUSTOMER_DATA` and
-redacted in rendered context. Generic project metrics like "average tokens"
-should stay visible.
+Credential-shaped facts such as `password`, `secret`, `api key`, `access
+token`, `bearer token`, `ssn`, `credit card`, `confidential`, and `private key`
+are labeled and redacted in rendered context.
 
-## Query before every model call
+## Topic tabs
 
-Use `spill-context` immediately before asking the LLM to answer. The
-`only-if` string should be the current user task, not a generic query.
-
-```skql
-spill-context agent_memory
-only-if 'explain how an actual AI model uses SkibidiQL context'
-token-budget 800
-receipts on;
-```
-
-If the task is clearly about one topic, add a tab filter:
-
-```skql
-spill-context agent_memory
-vibe-tab 'project roadmap'
-only-if 'update the README positioning'
-token-budget 800
-receipts on;
-```
-
-Interpret the output like this:
-
-- `current_context`: put this in the model prompt.
-- `view_atom`: same selected context, split into individual rows for parsing.
-- `invalidated`: receipts only. Never use these as true facts.
-- `redacted_atoms`: count of facts hidden by access policy.
-- `token_cost`: approximate size of the pack.
-- `access_policy`: labels and redaction mode used for this render.
-
-If `current_context` is empty, tell the model that no durable context was
-retrieved. Do not hallucinate memory.
-
-Raw output rows use this stable shape:
-
-```text
-field=current_context | value=...
-field=view_atom | value=...
-field=invalidated | value=...
-```
-
-If you are not using `.agents/skibidi_context.py`, parse only rows whose field
-is `current_context` for ordinary prompt construction.
-
-## Prompt the LLM with a context pack
-
-Recommended prompt section:
-
-```text
-SkibidiQL active context:
-{current_context}
-
-Rules:
-- Treat this as the durable active memory for this turn.
-- Ignore any stale fact not present here.
-- Do not reveal redacted values.
-- If the context is insufficient, ask or proceed from the current user message.
-```
-
-Keep receipts out of the normal model prompt unless you need provenance or
-debugging. Receipts are for the agent controller; `current_context` is for the
-LLM.
-
-## Write back after the model answers
-
-Write only durable state. Good writebacks:
-
-- user preferences
-- user constraints
-- decisions
-- corrections
-- open questions
-- active tasks
-- debug follow-ups
-- source/provenance summaries worth retrieving later
-
-Avoid writing:
-
-- throwaway chit-chat
-- the whole assistant response when no durable fact changed
-- hidden chain-of-thought
-- raw secrets that do not need to be retrieved
-
-Example:
-
-```skql
-yeet-memory agent_memory drip
-    (1005, 'assistant', 'decision: agents should pass only current_context to the LLM.')
-vibe-tab 'agent integration';
-```
-
-## Manage topic tabs
-
-Tabs are explicit topic namespaces. They make retrieval smaller and keep
-corrections local to a topic.
+Tabs are explicit topic namespaces. They keep retrieval smaller and make
+corrections local to the right topic.
 
 ```skql
 show-tabs agent_memory;
 alias-tab agent_memory 'perf' to 'debugging sqlite perf';
 merge-tabs agent_memory 'sqlite' into 'debugging sqlite perf';
 vibe-tab agent_memory message 1002 'project roadmap';
-show-context-objects agent_memory;
 ```
 
-Use tabs for long-running threads that switch topics. Example tabs:
+Good long-running-agent tabs:
 
-- `project roadmap`
-- `debugging sqlite perf`
+- `project identity`
 - `agent integration`
+- `debugging sqlite perf`
 - `benchmarks`
 - `docs`
 - `open questions`
+- `user preferences`
 
-Invalidation is currently key + tab scoped. That is great for corrections:
-`I live in Seattle` followed by `Actually I moved to NYC` in the same tab
-replaces the stale location. It also means broad atom types like `decision`
-can supersede earlier decisions in the same tab. Use precise tabs when facts
-should coexist:
+Use broad tabs for routing and specific atom keys inside the memory text. That
+combo makes multi-label retrieval less cursed.
 
-```skql
-yeet-memory agent_memory drip
-    (2001, 'assistant', 'decision: SkibidiQL is a relational context DB.')
-vibe-tab 'project identity';
+## Debug retrieval
 
-yeet-memory agent_memory drip
-    (2002, 'assistant', 'decision: README headline benchmark is policy-safe recall.')
-vibe-tab 'benchmark headline';
-```
-
-## Debug context selection
-
-When context looks missing, stale, too large, or sus, run:
+When context looks missing, stale, or too spicy, run an explanation request:
 
 ```skql
 explain-context agent_memory
@@ -336,24 +238,23 @@ receipts on;
 
 Check:
 
-- `ranked_atom`: what the optimizer considered important
+- `ranked_atom`: what the optimizer considered
 - `pruned_invalidated_atoms`: stale facts removed before prompting
 - `redacted_atoms`: facts hidden by access policy
 - `optimizer_saved_tokens`: avoided prompt bloat
 - `context_indexes`: fields used for selection
 - `provenance_model`: source tracking behavior
 
-## Hard rules for agents
+## Hard rules
 
 - Use SkibidiQL before every non-trivial model call.
-- Pass `current_context`, not full conversation history, as durable memory.
-- Never treat `invalidated` rows as active facts.
+- Pass active `context`, not full conversation history, as durable memory.
+- Never treat `invalidated_receipts` as active facts.
 - Never reveal redacted raw values.
 - Append corrections instead of mutating old facts.
 - Use stable message IDs.
 - Use tabs for topic switches.
-- Prefer extractor-friendly writebacks.
-- If the context pack is empty, say the DB had no relevant active memory.
+- If the context pack is empty, say no relevant durable memory was retrieved.
 
 Tiny vibe check: SkibidiQL stores the lore; `spill-context` hands the model the
 canon. Do not make the model dig through ancient cursed scrolls.

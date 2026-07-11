@@ -39,15 +39,3 @@ vibe-tab 'agent integration';
 yeet-memory skibidi_project drip
     (1010, 'user', 'I want to polish the agent integration by using the actual project and then report dogfood experience.')
 vibe-tab 'agent integration';
-
-spill-context skibidi_project
-only-if 'polish the agent integration using actual SkibidiQL project facts, benchmark claims, and report dogfood experience'
-token-budget 1000
-receipts on;
-
-explain-context skibidi_project
-only-if 'polish the agent integration using actual SkibidiQL project facts, benchmark claims, and report dogfood experience'
-token-budget 1000
-receipts on;
-
-show-tabs skibidi_project;

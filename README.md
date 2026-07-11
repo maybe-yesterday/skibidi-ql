@@ -14,9 +14,9 @@ Agents can append context, query context, explain context, invalidate stale
 context, and render only the relevant token-budgeted slice for the next model
 call.
 
-We decided into include a lot of modern lingo in this project to make this more exciting
-to younger folks, appeal to general audience, and to appreciate the evolution
-of language instead of avoiding change. 
+We deliberately include modern lingo to make the project more exciting to
+younger folks, appeal to a general audience, and appreciate language evolving
+instead of pretending it does not.
 
 Under the hood, SkibidiQL also ships a native C++17 storage/execution engine:
 persistent slotted pages, heap files, B+ tree primary-key indexes, LRU buffer
@@ -86,6 +86,38 @@ Useful modes:
 ./build/skibidi --cache-stats --db mydata
 ```
 
+## Agent API quickstart
+
+The main integration is not "paste all previous messages." It is:
+
+```text
+latest user message -> SkibidiQL active recall -> small messages[] payload -> LLM API
+```
+
+Build an OpenAI/ChatGPT-style `messages` payload from durable context:
+
+```bash
+python -B .agents/skibidi_context.py \
+  --fresh \
+  --db build/agent_quickstart_db \
+  --file .agents/examples/first-turn.skql \
+  --query "where am I and what should I not reveal?" \
+  --format openai-messages
+```
+
+Or call active recall as a tool:
+
+```bash
+python -B .agents/skibidi_context.py \
+  --db .skibidi_agent_ctx \
+  --query "latest user task" \
+  --format active-recall
+```
+
+The helper returns only policy-safe active context for the current turn, plus
+debug receipts for invalidated/redacted facts. See [.agents/README.md](.agents/README.md)
+for the agent contract, Windows commands, and dogfood examples.
+
 ## Relational context management
 
 Create a context database namespace:
@@ -153,9 +185,8 @@ token-budget 200
 receipts on;
 ```
 
-Agents can use the binary as their context DB instead of dragging the whole
-conversation into every prompt. See [.agents/README.md](.agents/README.md)
-for the runtime contract.
+Agents can use SkibidiQL as their context DB instead of dragging the whole
+conversation into every prompt.
 
 ## Tiny language taste
 
@@ -305,6 +336,127 @@ rule/extractive proxy that keeps durable-looking lines; no GPT/Claude/etc.
 summary model is used. Policy-safe active recall counts a needed fact only if
 the rendered context contains the active fact in an allowed form; for ACL
 cases, the redaction receipt counts and the raw secret does not.
+
+Optional real-LLM dogfood compares whether an actual model answers better from
+SkibidiQL active recall than from lexical RAG, full-history, or recency-window
+prompts. The default methods are stdlib-only and skip when `OPENAI_API_KEY` is
+missing. Start with dry-run mode to inspect prompt sizes without making API
+calls:
+
+```bash
+python benchmarks/llm_context_quality.py --dry-run
+```
+
+Then run the tiny live suite. The default is capped at 9 calls, temperature 0,
+and short JSON answers. Put the key in the process env or an ignored
+`.env.local` file as `OPENAI_API_KEY=...`:
+
+```bash
+python benchmarks/llm_context_quality.py \
+  --methods skibidiql,lexical_rag,full_history,recency_window \
+  --scenarios 3 \
+  --max-calls 12 \
+  --show-examples 6 \
+  --jsonl build/llm_context_quality/results.jsonl
+```
+
+Use the printed `Example real-LLM answers` section as README receipts: it shows
+the compact context each method gave the model and the JSON answer the model
+returned.
+
+The scorer uses deterministic semantic equivalence sets, not an LLM judge:
+`NYC`, `New York City`, and `the Big Apple` count as the same location;
+`vegan`, `plant-based`, and `meat-free` count as the same preference; and
+redaction language like `do not reveal` counts for secret-safety answers. The
+scenario set also includes noisy prompts such as "where's the user posted up
+rn?", "food recs should lean which way?", and "pupper noms??".
+
+To include all noisy/synonym scenarios in a live run, raise the scenario/call
+caps:
+
+```bash
+python benchmarks/llm_context_quality.py \
+  --methods skibidiql,lexical_rag,full_history,recency_window \
+  --scenarios 7 \
+  --max-calls 28 \
+  --show-examples 12 \
+  --jsonl build/llm_context_quality/results-noisy.jsonl
+```
+
+For the fuller competitor run, add real Mem0. This is opt-in because Mem0 does
+its own LLM and embedding calls while building/searching memory:
+
+```bash
+python -m pip install mem0ai openai
+python benchmarks/llm_context_quality.py \
+  --methods skibidiql,lexical_rag,mem0ai,full_history,recency_window \
+  --scenarios 2 \
+  --max-calls 10 \
+  --show-examples 10 \
+  --jsonl build/llm_context_quality/results-with-mem0.jsonl
+```
+
+Sample semantic/noisy real-LLM runs over the same seven scenarios. Mem0 is
+shown from a separate opt-in run because it performs extra LLM/embedding work
+while building/searching memory:
+
+| Method | Exact answer pass | Required fact recall | Invalidated excluded | Secrets excluded | Avg input toks | Avg output toks | Avg latency |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| skibidiql | 7/7 | 100.0% | 100.0% | 100.0% | 207.7 | 48.3 | 1.14s |
+| mem0ai | 5/7 | 90.9% | 50.0% | 100.0% | 97.4 | 58.9 | 1.30s |
+| lexical_rag | 4/7 | 63.6% | 100.0% | 0.0% | 281.0 | 52.1 | 1.21s |
+| full_history | 6/7 | 90.9% | 100.0% | 0.0% | 451.3 | 53.1 | 1.28s |
+| recency_window | 1/7 | 27.3% | 100.0% | 100.0% | 218.9 | 48.9 | 1.16s |
+
+Example real-LLM receipts from that run:
+
+- `location_correction` / `skibidiql` (pass)
+  - context: SkibidiQL active context selected `user_location=NYC` and `user_preference=quiet restaurants`, while keeping stale Seattle as an invalidated receipt.
+  - answer: `{ "answer": "The user is in NYC and prefers quiet restaurants.", "used_facts": ["user_location=NYC", "user_preference=quiet restaurants"], "safety_notes": "" }`
+
+- `location_correction` / `lexical_rag` (pass)
+  - context: Lexical RAG retrieved both `Actually I moved to NYC` and the older `I live in Seattle`, plus `I prefer quiet restaurants`.
+  - answer: `{ "answer": "The user has moved to NYC and prefers quiet restaurants.", "used_facts": ["User moved to NYC.", "User prefers quiet restaurants."], "safety_notes": "No sensitive information is disclosed." }`
+
+- `location_correction` / `mem0ai` (fail)
+  - context: Mem0 retrieved `User prefers quiet restaurants`, `User lives in Seattle`, and `User moved to New York City around July 11, 2026.`
+  - answer: `{ "answer": "You should assume the user is in New York City and prefers quiet restaurants.", "used_facts": ["User lives in Seattle", "User moved to New York City around July 11, 2026.", "User prefers quiet restaurants"], "safety_notes": "Ensure to respect the user's privacy and preferences." }`
+
+- `location_correction` / `recency_window` (fail)
+  - context: Last 8 messages contained the move to NYC but missed the older quiet-restaurant preference.
+  - answer: `{ "answer": "You should assume the user is in NYC, and their restaurant preferences are not specified in the context.", "used_facts": ["User moved to NYC."], "safety_notes": "No sensitive information is disclosed." }`
+
+- `stable_preference_buried` / `skibidiql` (pass)
+  - context: SkibidiQL active context selected `user_preference=vegan restaurants` despite later unrelated topic switches.
+  - answer: `{ "answer": "You prefer vegan restaurants.", "used_facts": ["user_preference=vegan restaurants"], "safety_notes": "" }`
+
+- `stable_preference_buried` / `mem0ai` (pass)
+  - context: Mem0 retrieved `User prefers vegan restaurants.`
+  - answer: `{ "answer": "You should remember that the user prefers vegan restaurants.", "used_facts": ["User prefers vegan restaurants."], "safety_notes": "No sensitive information was disclosed." }`
+
+- `stable_preference_buried` / `recency_window` (fail)
+  - context: Last 8 messages were filler and did not include the buried preference.
+  - answer: `{ "answer": "There is no specific restaurant preference mentioned in the context.", "used_facts": [], "safety_notes": "No sensitive information is included." }`
+
+- `dog_topic_switch` / `mem0ai` (pass)
+  - context: Mem0 retrieved `User's dog Nori likes salmon` and `User has a dog named Nori`.
+  - answer: `{ "answer": "Your dog is named Nori and she likes salmon.", "used_facts": ["User has a dog named Nori.", "User's dog Nori likes salmon."], "safety_notes": "No sensitive information was disclosed." }`
+
+- `redacted_secret` / `skibidiql` (pass)
+  - context: SkibidiQL selected a redacted `CONFIDENTIAL_CUSTOMER_DATA` security constraint and did not expose the raw secret.
+  - answer: `{ "answer": "You should follow the security constraint labeled as CONFIDENTIAL_CUSTOMER_DATA.", "used_facts": ["constraint user_constraint.security=[redacted:CONFIDENTIAL_CUSTOMER_DATA]"], "safety_notes": "No raw secrets were revealed." }`
+
+- `redacted_secret` / `mem0ai` (fail)
+  - context: Mem0 retrieved unrelated CSS-polish memory instead of the security constraint.
+  - answer: `{ "answer": "Follow best practices for data protection, such as using strong encryption, implementing access controls, and regularly updating your security protocols.", "used_facts": [], "safety_notes": "Ensure that sensitive information is not disclosed." }`
+
+- `sloppy_location_synonym` / `mem0ai` (pass)
+  - context: Mem0 retrieved current New York City location, calm low-noise dinner preference, and the older Seattle location.
+  - answer: `{ "answer": "The user is currently in New York City and prefers calm, low-noise spots for dinner.", "used_facts": ["User is currently in New York City as of July 11, 2026.", "User prefers calm, low-noise spots for dinner."], "safety_notes": "" }`
+
+- `plant_based_sloppy_prompt` / `mem0ai` (pass)
+  - context: Mem0 retrieved the plant-based preference and meat-heavy negative preference.
+  - answer: `{ "answer": "Food recommendations should lean towards plant-based options.", "used_facts": ["User prefers plant-based dining options.", "User is not trying to eat meat-heavy meals lately."], "safety_notes": "Ensure recommendations align with the user's dietary preferences." }`
 
 Real Mem0 comparison is optional because it uses external LLM/embedding calls.
 Install the actual package and set an API key:

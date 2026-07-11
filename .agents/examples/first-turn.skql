@@ -19,8 +19,3 @@ vibe-tab 'user facts';
 yeet-memory agent_memory drip
     (5, 'user', 'Never expose api key tokens.')
 vibe-tab 'constraints';
-
-spill-context agent_memory
-only-if 'answer using the active project and user context'
-token-budget 300
-receipts on;
